@@ -102,6 +102,7 @@ list of paths.
 | [`index.py`](index.py) | random-access-by-event index (scans SMD only) + multi-chunk roll | US-003 / US-004 |
 | [`run.py`](run.py) | public `open()` / `Run` surface | US-005 |
 | [`calib/snapshot.py`](calib/snapshot.py) | **separate** layer: one-time calibration-constant snapshot + pinning | US-006 |
+| [`hdr/`](hdr) | **separate** layer: standalone offline calibrated 2-D HDR image render | US-007 |
 
 ## Optional: calibration-constant snapshot (`psdata.calib`)
 
@@ -140,6 +141,57 @@ a snapshot outside a constant's validity range gives wrong-but-silent results.
 `snap.validity(ctype)` and `snap.is_valid_for_run(run)` expose the ranges for an
 opt-in check; the package never refuses a stale reload.
 
+## Optional: standalone calibrated 2-D HDR image (`psdata.hdr`)
+
+Like `psdata.calib`, the calibrated-image render is a *separate, optional*
+layer — **not** part of the reader, and **not** imported by `import psdata`.
+`psdata.hdr` turns a raw detector stack into the calibrated 2-D HDR image
+**fully offline at render time** (only numpy — no web calib DB, no MPI, no psana
+framework), building on a `psdata.calib` snapshot.
+
+```python
+# --- one-time prep (needs psana; run under psconda.sh) ---
+from psdata.calib import snapshot_calib
+from psdata.hdr.geometry import cache_pixel_indexes_for_snapshot
+snap_dir = snapshot_calib(exp="mfx100848724", run=51,
+                          dir="/sdf/data/lcls/ds/prj/public01/xtc",
+                          detname="jungfrau", out_dir="/some/cache")
+cache_pixel_indexes_for_snapshot(snap_dir)   # derive ix/iy from geometry.txt
+# (GeometryAccess; written as pixel_index_ix.npy / pixel_index_iy.npy)
+
+# --- offline render (pure numpy, NO psana) ---
+from psdata.calib import load_snapshot
+from psdata.hdr import HDRImager
+imager = HDRImager(load_snapshot(snap_dir))
+calib  = imager.calib(raw_stack)             # (32,512,1024) f32 == det.raw.calib
+image  = imager.image(calib)                 # (4216,4432)   f32 == det.raw.image
+# or in one step:
+calib, image = imager.render(raw_stack)
+```
+
+The pipeline is **byte-exact** versus psana for the reference Jungfrau dataset:
+`calib` matches `det.raw.calib(evt)` and `image` matches `det.raw.image(evt)`
+with `max|diff| == 0`. Internals are vendored framework-free numpy:
+
+* **gain decode** ([`hdr/jungfrau.py`](hdr/jungfrau.py)) — psana
+  `UtilsJungfrau.calib_jungfrau`: gain bits = `raw >> 14` (stage map
+  `{0→0, 1→1, 3→2}`, code `2` is bad → 0); `adc = raw & 0x3fff`;
+  `calib = (adc − (pedestals+pixel_offset)[stage]) / pixel_gain[stage] · mask`.
+* **image remap** ([`hdr/image.py`](hdr/image.py)) — psana
+  `UtilsAreaDetector` (`mapmode=2`, `fillholes=True`): scatter into the
+  `(image_row, image_col)` grid, take max on overlapping bins, fill single-bin
+  holes with the min of four neighbours.
+* **geometry** ([`hdr/geometry.py`](hdr/geometry.py)) — the per-pixel
+  `(ix, iy)` index maps are derived once from the snapshot's geometry text via
+  psana's pure-numpy `GeometryAccess.get_pixel_coord_indexes` (byte-identical
+  to `det.raw._pixel_coord_indexes()`) and cached into the snapshot, so the
+  render *apply* needs no `GeometryAccess` — that one psana touch is lazy and
+  snapshot-time only.
+
+The render is **per-detector-type** (gain decode + geometry differ by
+detector); today Jungfrau is wired in. The raw reader (US-001…US-005), by
+contrast, is detector-universal.
+
 ## Environment
 
 Work runs on host **`sdfiana025`**. The reader itself needs **only numpy** — no
@@ -147,16 +199,18 @@ psana, no special environment.
 
 The acceptance tests that cross-check against psana
 ([`tests/test_regression_us005.py`](tests/test_regression_us005.py) and the
-optional [`tests/test_calib_us006.py`](tests/test_calib_us006.py)) are the
-*only* parts that need a working **psana**, which they use purely to generate
-ground truth to compare against (and, for US-006, to take the one-time
-snapshot). Use the production install:
+optional [`tests/test_calib_us006.py`](tests/test_calib_us006.py) /
+[`tests/test_hdr_us007.py`](tests/test_hdr_us007.py)) are the *only* parts that
+need a working **psana**, which they use purely to generate ground truth to
+compare against (and, for US-006/US-007, to take the one-time snapshot + derive
+the geometry index maps). Use the production install:
 
 ```bash
 source /sdf/group/lcls/ds/ana/sw/conda2/manage/bin/psconda.sh
 bash psdata/run_tests.sh                       # run the full acceptance suite
 bash psdata/run_tests.sh psdata/tests/test_regression_us005.py   # just US-005
 bash psdata/run_tests.sh psdata/tests/test_calib_us006.py        # calib snapshot
+bash psdata/run_tests.sh psdata/tests/test_hdr_us007.py          # offline HDR render
 ```
 
 `run_tests.sh` prepends an isolated package-parent dir to `PYTHONPATH` so
