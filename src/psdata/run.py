@@ -167,6 +167,20 @@ class Run:
         :class:`~psdata.stream.Event`."""
         return self.build_index().read_event_at(k)
 
+    def read_events(self, ks):
+        """Batch random-access the events at positions ``ks`` in one coalesced
+        call (builds the index on first use).  Equivalent to
+        ``[read_event_at(k) for k in ks]`` but issues its ``pread``s grouped per
+        chunk file in ascending-offset order; returns the events in ``ks``
+        order.  See :meth:`psdata.index.RunIndex.read_events`."""
+        return self.build_index().read_events(ks)
+
+    def read_stack(self, ks, det, field="raw", alg="raw"):
+        """Batch-read events ``ks`` and stack one detector into a single
+        preallocated ``(len(ks), n_seg, *seg_shape)`` ndarray (builds the index
+        on first use).  See :meth:`psdata.index.RunIndex.read_stack`."""
+        return self.build_index().read_stack(ks, det, field=field, alg=alg)
+
     # -- introspection -----------------------------------------------------
     def detector_names(self, include_bookkeeping=False):
         """Sorted detector names discovered from the Configure Names tables.  By

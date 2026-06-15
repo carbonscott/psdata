@@ -289,26 +289,190 @@ class RunIndex:
             chunk_path, offset, size = entry[stream]
             fd = self._bd_fd(chunk_path)
             raw = os.pread(fd, size, offset)
-            if len(raw) != size:
-                raise RuntimeError(
-                    f"stream {stream}: short read at offset {offset} of "
-                    f"{os.path.basename(chunk_path)} (wanted {size}, "
-                    f"got {len(raw)})")
-            buf = bytearray(raw)
-            h = _f.parse_dgram_header(buf, 0)
-            if h["ts"] != ts:
-                raise RuntimeError(
-                    f"stream {stream}: bigdata dgram ts {h['ts']} != indexed "
-                    f"ts {ts} (offset {offset} of "
-                    f"{os.path.basename(chunk_path)}); chunk roll mismatch")
-            service = h["service"]
-            snap_h = dict(h)
-            snap_h["_off"] = 0
-            snap_h["_total"] = size
-            tables = self.run_config.raw_tables[stream]
-            _s._index_dgram(buf, 0, snap_h, tables, seg_index)
+            service = self._assemble_stream_dgram(
+                stream, chunk_path, offset, size, raw, ts, seg_index)
 
         return _s.Event(ts, service, self.run_config, seg_index)
+
+    def _assemble_stream_dgram(self, stream, chunk_path, offset, size, raw, ts,
+                               seg_index):
+        """Validate one stream's ``pread``-ed bigdata dgram bytes for event
+        ``ts`` and index its ShapesData into ``seg_index`` (in place).  Returns
+        the dgram's service.
+
+        Shared by :meth:`read_event_at` (which ``pread``s inline) and
+        :meth:`read_events` (which ``pread``s in a coalesced batch first) so a
+        batched read is **byte-identical** to a serial one -- the only thing
+        that differs between the two is the *order* the ``pread``s are issued,
+        never the bytes that are parsed.
+        """
+        if len(raw) != size:
+            raise RuntimeError(
+                f"stream {stream}: short read at offset {offset} of "
+                f"{os.path.basename(chunk_path)} (wanted {size}, "
+                f"got {len(raw)})")
+        buf = bytearray(raw)
+        h = _f.parse_dgram_header(buf, 0)
+        if h["ts"] != ts:
+            raise RuntimeError(
+                f"stream {stream}: bigdata dgram ts {h['ts']} != indexed "
+                f"ts {ts} (offset {offset} of "
+                f"{os.path.basename(chunk_path)}); chunk roll mismatch")
+        snap_h = dict(h)
+        snap_h["_off"] = 0
+        snap_h["_total"] = size
+        tables = self.run_config.raw_tables[stream]
+        _s._index_dgram(buf, 0, snap_h, tables, seg_index)
+        return h["service"]
+
+    # -- batch random read (US-009) ---------------------------------------
+    def read_events(self, ks):
+        """Read many events by position in ONE coalesced call.
+
+        Equivalent to ``[self.read_event_at(k) for k in ks]`` but issues its
+        ``os.pread``s grouped by bigdata chunk file and in **ascending offset
+        order within each file**, so the reads walk each chunk forward (a
+        kernel-readahead-friendly, seek-minimising pattern) instead of jumping
+        around per event.  Returns the assembled events in the **same order as
+        ``ks``** (which may be arbitrary / shuffled / repeated).
+
+        I/O accounting is unchanged from the serial path: exactly one
+        ``os.pread`` per (event, contributing-stream) pair -- no extra scan, no
+        per-call SMD rescan -- and the lazy :meth:`_bd_fd` cache opens each
+        chunk file at most once (one ``os.open`` per distinct chunk path,
+        reused across the whole batch).
+
+        Missing-segment policy: identical to :meth:`read_event_at`.  The
+        per-event missing-segment rule (a detector whose received segment set
+        does not match its declared set) is applied lazily inside
+        :class:`psdata.stream.Event` on field access, so an incomplete event is
+        returned here as an :class:`~psdata.stream.Event` exactly as
+        ``read_event_at`` would return it -- never dropped or raised here.
+
+        Parameters
+        ----------
+        ks : sequence[int]
+            Event positions (0-based).  Each is validated against the index
+            range; an out-of-range position raises ``IndexError``.
+
+        Returns
+        -------
+        list[psdata.stream.Event]
+            One per requested ``k``, in ``ks`` order.
+        """
+        ks = [int(k) for k in ks]
+        n = len(self.timestamps)
+        for k in ks:
+            if not (0 <= k < n):
+                raise IndexError(
+                    f"event position {k} out of range [0, {n})")
+
+        # Collect every required read as (chunk_path, offset, size, k, stream),
+        # then group by chunk file and read each file's dgrams in ascending
+        # offset order.  Distinct positions in `ks` are de-duplicated for the
+        # actual reads (a repeated k is read once and reused) while the returned
+        # list still honours every entry in `ks`.
+        order = {}                       # k -> position-in-output (first seen)
+        reads_by_chunk = {}              # chunk_path -> list[(offset, size, k, stream)]
+        for k in ks:
+            if k in order:
+                continue
+            order[k] = len(order)
+            for stream in sorted(self.entries[k]):
+                chunk_path, offset, size = self.entries[k][stream]
+                reads_by_chunk.setdefault(chunk_path, []).append(
+                    (offset, size, k, stream))
+
+        # Per-event accumulators, filled as the coalesced reads complete.
+        seg_indexes = {k: {} for k in order}
+        services = {k: _s.SERVICE_L1ACCEPT for k in order}
+
+        for chunk_path in sorted(reads_by_chunk):
+            fd = self._bd_fd(chunk_path)
+            for offset, size, k, stream in sorted(reads_by_chunk[chunk_path]):
+                raw = os.pread(fd, size, offset)
+                services[k] = self._assemble_stream_dgram(
+                    stream, chunk_path, offset, size, raw,
+                    self.timestamps[k], seg_indexes[k])
+
+        built = {
+            k: _s.Event(self.timestamps[k], services[k], self.run_config,
+                        seg_indexes[k])
+            for k in order
+        }
+        return [built[k] for k in ks]
+
+    def read_stack(self, ks, det, field="raw", alg="raw"):
+        """Batch-read events ``ks`` and stack one detector's segment arrays into
+        ONE preallocated buffer of shape ``(len(ks), n_seg, *seg_shape)``.
+
+        Reads are coalesced exactly as in :meth:`read_events` (grouped by chunk
+        file, ascending offset, one ``pread`` per event/stream, fds reused).
+        The per-event stack is ``Event.stack(det, field, alg)`` -- so a single
+        row ``out[i]`` is byte-identical to ``read_event_at(ks[i]).stack(det)``.
+
+        The output dtype, segment count ``n_seg``, and per-segment shape are
+        taken from the **first requested event's** stack (the segment shape is
+        only known at event time -- it is not in the run config), then the whole
+        buffer is allocated once and every row written in place.
+
+        Missing-segment policy (justification): a numeric stacked buffer has no
+        natural sentinel for "this event was missing a segment" -- you cannot
+        put ``None`` in a row of a uniform ndarray.  ``read_stack`` therefore
+        **raises** ``ValueError`` if any requested event is incomplete for
+        ``det`` (i.e. ``Event.stack`` returns ``None``, the existing
+        missing-segment rule), naming the offending position.  This applies the
+        same rule as everywhere else (incomplete -> not valid data) but surfaces
+        it eagerly, because the caller asked for a dense array.  Callers who
+        want to tolerate gaps should use :meth:`read_events` and handle the
+        ``None`` rows themselves.
+
+        Parameters
+        ----------
+        ks : sequence[int]
+            Event positions (0-based); arbitrary order is fine.
+        det : str
+            Detector name (e.g. ``"jungfrau"``).
+        field, alg : str
+            Field / algorithm to stack (default ``raw`` / ``raw``).
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape ``(len(ks), n_seg, *seg_shape)``, ``out[i]`` the stack for
+            ``ks[i]``.
+
+        Raises
+        ------
+        ValueError
+            If ``ks`` is empty, or any requested event is missing a segment for
+            ``det`` (so a dense stack cannot represent it).
+        """
+        ks = [int(k) for k in ks]
+        if not ks:
+            raise ValueError("read_stack requires at least one event position")
+
+        events = self.read_events(ks)
+
+        # Shape/dtype come from the first event's stack (segment shape is only
+        # known at event time).  Allocate ONE buffer and fill it row by row.
+        out = None
+        for i, evt in enumerate(events):
+            st = evt.stack(det, field=field, alg=alg)
+            if st is None:
+                raise ValueError(
+                    f"event position {ks[i]} is missing a segment for "
+                    f"detector {det!r} (alg={alg!r}, field={field!r}); a dense "
+                    f"read_stack cannot represent it -- use read_events to "
+                    f"handle incomplete events")
+            if out is None:
+                out = np.empty((len(events),) + st.shape, dtype=st.dtype)
+            elif st.shape != out.shape[1:]:
+                raise ValueError(
+                    f"event position {ks[i]}: {det!r} stack shape {st.shape} "
+                    f"!= first event's {out.shape[1:]}")
+            out[i] = st
+        return out
 
     # -- resource management ----------------------------------------------
     def close(self):

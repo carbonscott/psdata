@@ -47,6 +47,8 @@ if [[ ${#TESTS[@]} -eq 0 ]]; then
     "$REPO/tests/test_regression_us005.py"
     "$REPO/tests/test_calib_us006.py"
     "$REPO/tests/test_hdr_us007.py"
+    "$REPO/tests/test_persist_us008.py"
+    "$REPO/tests/test_batch_us009.py"
   )
 fi
 
