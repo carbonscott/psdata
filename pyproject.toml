@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "psdata"
+version = "0.1.0"
+description = "Minimal clean-room, numpy-only reader for LCLS-II xtc2 detector data"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Cong Wang", email = "cwang31@stanford.edu" }]
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+# Dev/test tooling only. The acceptance tests that cross-check against psana
+# need a working psana, which is the SLAC production conda build (sourced via
+# psconda.sh) -- NOT a pip/uv-installable package. There is deliberately no
+# [psana] extra; see the "Environment" section of the README.
+test = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/psdata"]

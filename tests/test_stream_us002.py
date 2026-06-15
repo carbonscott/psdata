@@ -31,7 +31,7 @@ import numpy as np
 
 # --- locate the package (parent of this tests dir) --------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PKG_PARENT = os.path.dirname(os.path.dirname(_HERE))  # .../<repo> (holds psdata/)
+_PKG_PARENT = os.path.join(os.path.dirname(_HERE), "src")  # .../<repo>/src (holds psdata/)
 if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
 

@@ -11,6 +11,27 @@ numpy** (no `psana`, no `mpi4py`, no `h5py`).
 Calibration / geometry (turning raw frames into a calibrated 2-D HDR image) is
 deliberately a *separate, optional* layer and is **not** part of this reader.
 
+## Install
+
+Standalone and [uv](https://docs.astral.sh/uv/)-runnable. The reader needs only
+numpy:
+
+```bash
+git clone <this-repo> psdata && cd psdata
+uv venv
+uv pip install -e .             # core reader (numpy only)
+uv pip install -e ".[test]"     # + pytest for the acceptance suite (optional)
+```
+
+```python
+import psdata
+r = psdata.open(exp="mfx100848724", run=51,
+                dir="/sdf/data/lcls/ds/prj/public01/xtc")
+```
+
+psana is needed only by the cross-check tests and is deliberately **not** a
+pip/uv dependency — see [Environment](#environment).
+
 ## Public API
 
 Open a run, then stream it, random-access it by timestamp, or introspect it.
@@ -49,7 +70,7 @@ evt = r.read_event_at(1000)        # ... or by event position (0-based, ts order
 r.close()                          # release index file descriptors
 ```
 
-`psdata.open(...)` returns a [`Run`](run.py). A `Run` is a thin facade over the
+`psdata.open(...)` returns a [`Run`](src/psdata/run.py). A `Run` is a thin facade over the
 three layers below; use it as a context manager (`with psdata.open(...) as r:`)
 to auto-release the random-access index's file descriptors.
 
@@ -97,12 +118,12 @@ list of paths.
 
 | module | layer | story |
 | --- | --- | --- |
-| [`format.py`](format.py) | xtc2 parse core + generic detector/segment discovery | US-001 |
-| [`stream.py`](stream.py) | multi-stream event assembly (exact 64-bit-ts k-way merge) | US-002 |
-| [`index.py`](index.py) | random-access-by-event index (scans SMD only) + multi-chunk roll | US-003 / US-004 |
-| [`run.py`](run.py) | public `open()` / `Run` surface | US-005 |
-| [`calib/snapshot.py`](calib/snapshot.py) | **separate** layer: one-time calibration-constant snapshot + pinning | US-006 |
-| [`hdr/`](hdr) | **separate** layer: standalone offline calibrated 2-D HDR image render | US-007 |
+| [`format.py`](src/psdata/format.py) | xtc2 parse core + generic detector/segment discovery | US-001 |
+| [`stream.py`](src/psdata/stream.py) | multi-stream event assembly (exact 64-bit-ts k-way merge) | US-002 |
+| [`index.py`](src/psdata/index.py) | random-access-by-event index (scans SMD only) + multi-chunk roll | US-003 / US-004 |
+| [`run.py`](src/psdata/run.py) | public `open()` / `Run` surface | US-005 |
+| [`calib/snapshot.py`](src/psdata/calib/snapshot.py) | **separate** layer: one-time calibration-constant snapshot + pinning | US-006 |
+| [`hdr/`](src/psdata/hdr) | **separate** layer: standalone offline calibrated 2-D HDR image render | US-007 |
 
 ## Optional: calibration-constant snapshot (`psdata.calib`)
 
@@ -173,15 +194,15 @@ The pipeline is **byte-exact** versus psana for the reference Jungfrau dataset:
 `calib` matches `det.raw.calib(evt)` and `image` matches `det.raw.image(evt)`
 with `max|diff| == 0`. Internals are vendored framework-free numpy:
 
-* **gain decode** ([`hdr/jungfrau.py`](hdr/jungfrau.py)) — psana
+* **gain decode** ([`hdr/jungfrau.py`](src/psdata/hdr/jungfrau.py)) — psana
   `UtilsJungfrau.calib_jungfrau`: gain bits = `raw >> 14` (stage map
   `{0→0, 1→1, 3→2}`, code `2` is bad → 0); `adc = raw & 0x3fff`;
   `calib = (adc − (pedestals+pixel_offset)[stage]) / pixel_gain[stage] · mask`.
-* **image remap** ([`hdr/image.py`](hdr/image.py)) — psana
+* **image remap** ([`hdr/image.py`](src/psdata/hdr/image.py)) — psana
   `UtilsAreaDetector` (`mapmode=2`, `fillholes=True`): scatter into the
   `(image_row, image_col)` grid, take max on overlapping bins, fill single-bin
   holes with the min of four neighbours.
-* **geometry** ([`hdr/geometry.py`](hdr/geometry.py)) — the per-pixel
+* **geometry** ([`hdr/geometry.py`](src/psdata/hdr/geometry.py)) — the per-pixel
   `(ix, iy)` index maps are derived once from the snapshot's geometry text via
   psana's pure-numpy `GeometryAccess.get_pixel_coord_indexes` (byte-identical
   to `det.raw._pixel_coord_indexes()`) and cached into the snapshot, so the
@@ -195,7 +216,7 @@ contrast, is detector-universal.
 ## Environment
 
 Work runs on host **`sdfiana025`**. The reader itself needs **only numpy** — no
-psana, no special environment.
+psana, no special environment; a plain `uv pip install -e .` is enough.
 
 The acceptance tests that cross-check against psana
 ([`tests/test_regression_us005.py`](tests/test_regression_us005.py) and the
@@ -203,20 +224,25 @@ optional [`tests/test_calib_us006.py`](tests/test_calib_us006.py) /
 [`tests/test_hdr_us007.py`](tests/test_hdr_us007.py)) are the *only* parts that
 need a working **psana**, which they use purely to generate ground truth to
 compare against (and, for US-006/US-007, to take the one-time snapshot + derive
-the geometry index maps). Use the production install:
+the geometry index maps).
+
+**psana is the SLAC production conda build, not a pip/uv package** — so this
+project intentionally has no `[psana]` extra. Source it from the production
+install, which enters via `PYTHONPATH` (prepend, never replace):
 
 ```bash
 source /sdf/group/lcls/ds/ana/sw/conda2/manage/bin/psconda.sh
-bash psdata/run_tests.sh                       # run the full acceptance suite
-bash psdata/run_tests.sh psdata/tests/test_regression_us005.py   # just US-005
-bash psdata/run_tests.sh psdata/tests/test_calib_us006.py        # calib snapshot
-bash psdata/run_tests.sh psdata/tests/test_hdr_us007.py          # offline HDR render
+bash run_tests.sh                                   # full acceptance suite
+bash run_tests.sh tests/test_regression_us005.py    # just US-005 (byte-exact)
+bash run_tests.sh tests/test_calib_us006.py         # calib snapshot
+bash run_tests.sh tests/test_hdr_us007.py           # offline HDR render
 ```
 
-`run_tests.sh` prepends an isolated package-parent dir to `PYTHONPATH` so
-`import psdata` resolves to this package while `import psana` resolves to the
-production env (the repo root holds a single-file `psdata.py` reference and an
-unbuilt `psana/` clone, both of which would otherwise shadow the real ones).
+`run_tests.sh` prepends this project's `src/` dir to `PYTHONPATH` so
+`import psdata` resolves to the package here while `import psana` resolves to the
+production env. Because the package now lives under `src/`, the project root no
+longer shadows either import, so the old `.pkgroot`/`.rundir` symlink workaround
+is gone.
 
 ## Reference dataset
 
