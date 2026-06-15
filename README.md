@@ -101,20 +101,62 @@ list of paths.
 | [`stream.py`](stream.py) | multi-stream event assembly (exact 64-bit-ts k-way merge) | US-002 |
 | [`index.py`](index.py) | random-access-by-event index (scans SMD only) + multi-chunk roll | US-003 / US-004 |
 | [`run.py`](run.py) | public `open()` / `Run` surface | US-005 |
+| [`calib/snapshot.py`](calib/snapshot.py) | **separate** layer: one-time calibration-constant snapshot + pinning | US-006 |
+
+## Optional: calibration-constant snapshot (`psdata.calib`)
+
+Calibration is **not** part of the reader. `psdata.calib` is a *separate*
+sub-package: a one-time step that snapshots a detector's calibration constants
+(the only network/DB dependency) so a later calibrated-image render can run
+fully offline. Importing the reader (`import psdata`) does **not** import it, so
+the reader stays numpy-only.
+
+```python
+# --- one-time snapshot (needs psana; run under psconda.sh) ---
+from psdata.calib import snapshot_calib
+snap_dir = snapshot_calib(exp="mfx100848724", run=51,
+                          dir="/sdf/data/lcls/ds/prj/public01/xtc",
+                          detname="jungfrau", out_dir="/some/cache")
+# writes {out_dir}/jungfrau_r0051/ : pedestals/pixel_gain/pixel_offset/...npy,
+# mask.npy, geometry.txt, manifest.json
+
+# --- reload offline (pure numpy, NO psana) ---
+from psdata.calib import load_snapshot
+snap = load_snapshot(snap_dir)
+snap.pedestals          # (3,32,512,1024) f32  -- leading axis = 3 gain stages
+snap.pixel_gain         # (3,32,512,1024) f32
+snap.pixel_offset       # (3,32,512,1024) f32  (None if absent -> treat as 0)
+snap.mask               # (32,512,1024)   u8   -- det.raw._mask(status=True)
+snap.geometry           # ~5-8 KB geometry text
+snap.calibconst()       # rebuilds psana's {ctype: (array, meta)} dict
+```
+
+Snapshots are **pinned by `(detector_uniqueid, run)`** and retain each
+constant's validity metadata (`run` / `run_end` / `version`). A reload
+reproduces the exact arrays psana's `det.raw._calibconst` returns
+(`np.array_equal`). **Staleness is silent:** a constant's validity *run* can
+differ from the pin run (e.g. pedestals valid from run 49, pin run 51); reusing
+a snapshot outside a constant's validity range gives wrong-but-silent results.
+`snap.validity(ctype)` and `snap.is_valid_for_run(run)` expose the ranges for an
+opt-in check; the package never refuses a stale reload.
 
 ## Environment
 
 Work runs on host **`sdfiana025`**. The reader itself needs **only numpy** — no
 psana, no special environment.
 
-The regression test ([`tests/test_regression_us005.py`](tests/test_regression_us005.py))
-is the *only* part that needs a working **psana**, which it uses purely to
-generate ground truth to compare against. Use the production install:
+The acceptance tests that cross-check against psana
+([`tests/test_regression_us005.py`](tests/test_regression_us005.py) and the
+optional [`tests/test_calib_us006.py`](tests/test_calib_us006.py)) are the
+*only* parts that need a working **psana**, which they use purely to generate
+ground truth to compare against (and, for US-006, to take the one-time
+snapshot). Use the production install:
 
 ```bash
 source /sdf/group/lcls/ds/ana/sw/conda2/manage/bin/psconda.sh
 bash psdata/run_tests.sh                       # run the full acceptance suite
 bash psdata/run_tests.sh psdata/tests/test_regression_us005.py   # just US-005
+bash psdata/run_tests.sh psdata/tests/test_calib_us006.py        # calib snapshot
 ```
 
 `run_tests.sh` prepends an isolated package-parent dir to `PYTHONPATH` so

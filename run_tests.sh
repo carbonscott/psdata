@@ -40,6 +40,7 @@ if [[ ${#TESTS[@]} -eq 0 ]]; then
     "$PKG_DIR/tests/test_index_us003.py"
     "$PKG_DIR/tests/test_robust_us004.py"
     "$PKG_DIR/tests/test_regression_us005.py"
+    "$PKG_DIR/tests/test_calib_us006.py"
   )
 fi
 

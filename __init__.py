@@ -43,6 +43,12 @@ The lower-level functional API used internally is still available::
     ridx = psdata.build_index(stream_files, run_config=rc)   # scans SMD only
 
 Importing psdata pulls in only numpy -- no psana / mpi4py / h5py.
+
+Calibration is a deliberately SEPARATE, optional layer: ``psdata.calib`` (US-006)
+snapshots a detector's calibration constants once (the only DB dependency) and
+reloads them offline with numpy only.  It is NOT imported here, so importing the
+reader never pulls it (or psana) in; ``import psdata.calib`` explicitly when you
+want it.
 """
 
 from . import format  # noqa: F401  (re-export the parse core)
