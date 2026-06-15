@@ -17,11 +17,24 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # project root
 SRC="$REPO/src"                                        # holds only psdata/
 
+# psdata's calib/ + hdr/ are now a RE-EXPORT SHIM of the standalone pscalib
+# package (US-000: one canonical implementation, no drift). Put pscalib's src/
+# on PYTHONPATH too (sibling repo) so the shim resolves. `import pscalib` is
+# numpy-only, so this does not affect the reader's framework-free contract.
+PSCALIB_SRC="$(cd "$REPO/.." && pwd)/pscalib/src"
+
+PYPARTS="$SRC"
+if [[ -d "$PSCALIB_SRC" ]]; then
+  PYPARTS="$SRC:$PSCALIB_SRC"
+else
+  echo "WARNING: pscalib src not found at $PSCALIB_SRC -- psdata.calib/hdr are a re-export shim of pscalib and need it" >&2
+fi
+
 if [[ -z "${PYTHONPATH:-}" ]]; then
   echo "WARNING: PYTHONPATH is empty -- did you source psconda.sh first?" >&2
-  export PYTHONPATH="$SRC"
+  export PYTHONPATH="$PYPARTS"
 else
-  export PYTHONPATH="$SRC:$PYTHONPATH"
+  export PYTHONPATH="$PYPARTS:$PYTHONPATH"
 fi
 
 TESTS=("$@")

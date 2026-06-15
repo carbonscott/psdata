@@ -100,7 +100,11 @@ def test_reload_import_purity_subprocess(snapshot_dir=None):
         "assert 'numpy' in sys.modules, 'numpy should be imported'; "
         "print('CLEAN')"
     )
-    env = dict(os.environ, PYTHONPATH=_PKG_PARENT)
+    # Preserve the launcher PYTHONPATH (run_tests.sh adds pscalib src so the
+    # psdata.calib/hdr re-export shim of pscalib resolves); prepend psdata src.
+    _pp = os.environ.get("PYTHONPATH", "")
+    env = dict(os.environ,
+               PYTHONPATH=(_PKG_PARENT + os.pathsep + _pp) if _pp else _PKG_PARENT)
     out = subprocess.run([sys.executable, "-c", code], capture_output=True,
                          text=True, env=env)
     assert out.returncode == 0, out.stderr
