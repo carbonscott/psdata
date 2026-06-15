@@ -30,9 +30,10 @@ single ``os.pread`` per stream -- no sequential bigdata scan.
 from . import format  # noqa: F401  (re-export the parse core)
 from . import stream   # noqa: F401  (re-export the streaming layer)
 from . import index    # noqa: F401  (re-export the random-access layer)
-from .format import discover
+from .format import discover, filter_c000, stream_index_of, decode_damage
 from .stream import Event, events
 from .index import RunIndex, build_index, smd_files_for
 
 __all__ = ["format", "stream", "index", "discover", "events", "Event",
-           "RunIndex", "build_index", "smd_files_for"]
+           "RunIndex", "build_index", "smd_files_for",
+           "filter_c000", "stream_index_of", "decode_damage"]

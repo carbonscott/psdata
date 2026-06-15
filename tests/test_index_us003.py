@@ -161,7 +161,9 @@ def test_random_read_uses_pread_no_scan():
 
     k = 1000
     entry = ridx.entries[k]
-    expected_sizes = sorted(size for (_off, size) in entry.values())
+    # entries[k][stream] = (chunk_path, offset, size) since US-004 (the chunk
+    # path is recorded so multi-chunk runs read from the right file).
+    expected_sizes = sorted(size for (_path, _off, size) in entry.values())
 
     preads = []
     real_pread = os.pread
@@ -186,7 +188,8 @@ def test_random_read_uses_pread_no_scan():
     assert got_sizes == expected_sizes, \
         f"pread sizes {got_sizes} != indexed dgram sizes {expected_sizes}"
     # the (offset, size) pairs preaded must be exactly the indexed pairs
-    indexed_pairs = sorted((off, size) for (off, size) in entry.values())
+    # (entries[k][stream] = (chunk_path, offset, size) since US-004)
+    indexed_pairs = sorted((off, size) for (_path, off, size) in entry.values())
     pread_pairs = sorted((off, n) for (n, off) in preads)
     assert pread_pairs == indexed_pairs, \
         f"pread (offset,size) {pread_pairs} != indexed {indexed_pairs}"

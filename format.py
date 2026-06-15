@@ -26,6 +26,7 @@ The format constants and the five functions named in the acceptance criteria
 """
 
 import os
+import re
 import struct
 import sys
 
@@ -41,8 +42,21 @@ DGRAM_HDR = 24          # transition(12) + xtc(12)
 XTC_HDR = 12
 
 SERVICE_CONFIGURE = 2
+SERVICE_BEGINRUN = 4
+SERVICE_BEGINSTEP = 6
+SERVICE_ENABLE = 8
 SERVICE_SLOWUPDATE = 10
+SERVICE_L1ACCEPT_EOB = 11
 SERVICE_L1ACCEPT = 12
+
+# xtc.damage is a 16-bit field: the low 12 bits are the damage id (a
+# DamageBitmask), and the high 4 bits are user-defined "userbits".  Matches
+# psana/psana/detector/damage.py (DAMAGE_USERBITSHIFT=12,
+# DAMAGE_VALUEBITMASK=0x0FFF).  psana does NOT auto-drop damaged data; it
+# surfaces the per-segment damage value -- so does psdata (see
+# :func:`decode_damage` and :meth:`psdata.stream.Event.damage`).
+DAMAGE_USERBITSHIFT = 12
+DAMAGE_VALUEBITMASK = 0x0FFF
 
 # TypeId.type values (value & 0x0fff)
 TID_PARENT = 0
@@ -99,6 +113,16 @@ def typeid_version(typeid):
 def namesid_of(src):
     """(nodeId, namesId) packed in Xtc.src."""
     return (src >> 8) & 0xfff, src & 0xff
+
+
+def decode_damage(damage):
+    """Split a 16-bit ``Xtc.damage`` into ``(damage_id, userbits)``.
+
+    ``damage_id = damage & 0x0FFF`` is the low-12-bit damage code (a
+    ``DamageBitmask`` value; 0 means undamaged); ``userbits = damage >> 12`` is
+    the high-4-bit user field.  Mirrors ``psana/psana/detector/damage.py``.
+    """
+    return damage & DAMAGE_VALUEBITMASK, damage >> DAMAGE_USERBITSHIFT
 
 
 def iter_xtc_children(buf, parent_payload_off, parent_payload_end):
@@ -207,6 +231,45 @@ def extract_field(buf, shapesdata_off, shapesdata_hdr, table, field_name):
             return arr.reshape(shape) if shape else arr[0], shape, nm
         offset += field_bytes
     raise KeyError(f"field {field_name!r} not found in Names table")
+
+
+def iter_shapesdata(buf, dg_off, dg_hdr):
+    """Yield ``(shapesdata_off, shapesdata_hdr)`` for every ShapesData Xtc in
+    the dgram whose Transition starts at ``dg_off`` (recursing through Parent
+    containers).  Works for any dgram -- L1Accept *or* a transition such as
+    Enable (whose ``chunkinfo`` arrives as a ShapesData).
+    """
+    top_payload = dg_off + DGRAM_HDR
+    top_end = dg_off + XTC_HDR + dg_hdr["extent"]
+    stack = [(top_payload, top_end)]
+    while stack:
+        po, pe = stack.pop()
+        for xoff, xh in iter_xtc_children(buf, po, pe):
+            t = typeid_type(xh["typeid"])
+            if t == TID_SHAPESDATA:
+                yield xoff, xh
+            elif t == TID_PARENT:
+                stack.append((xoff + XTC_HDR, xoff + xh["extent"]))
+
+
+def read_dgram_field(buf, dg_off, dg_hdr, tables, det_name, alg, field):
+    """Walk one dgram and return ``field`` of the ``(det_name, alg)`` table the
+    first time its ShapesData is found, or ``None`` if absent.
+
+    ``tables`` is the stream's ``{(nodeId,namesId): names_table}`` Configure
+    map.  Returns the extracted value (scalar for rank-0, ndarray otherwise),
+    as :func:`extract_field` does.  Used to read the ``chunkinfo`` carried on an
+    Enable transition (see :mod:`psdata.index`).
+    """
+    for xoff, xh in iter_shapesdata(buf, dg_off, dg_hdr):
+        key = namesid_of(xh["src"])
+        table = tables.get(key)
+        if table is None:
+            continue
+        if table["det_name"] == det_name and table["alg_name"] == alg:
+            arr, _shape, _meta = extract_field(buf, xoff, xh, table, field)
+            return arr
+    return None
 
 
 # ==========================================================================
@@ -414,6 +477,37 @@ def _normalize_stream_files(stream_files):
             items = list(enumerate(items))
     # coerce indices to int and sort
     return sorted(((int(i), p) for i, p in items), key=lambda kv: kv[0])
+
+
+# Stream/chunk file name pattern: ``<exp>-r<run>-s<stream>-c<chunk>.xtc2``.
+# psana opens only the first chunk (``c000``) of each stream and rolls forward
+# from there (``ds_base.py`` filters with ``re.search(r"-c000\.", ...)``,
+# ~line 393); the later chunks are reached by following ``chunkinfo`` on each
+# Enable.  :func:`filter_c000` reproduces that initial filter so a directory
+# listing of all chunks collapses to the one file per stream that the reader
+# opens first.
+_C000_RE = re.compile(r"-c000\.")
+_STREAM_RE = re.compile(r"-s(\d+)-c000\.")
+
+
+def filter_c000(paths):
+    """Keep only the first-chunk (``c000``) files from a list of xtc2 paths.
+
+    Mirrors psana's ``ds_base.py`` initial file filter: a run directory holds
+    ``...-s###-c000.xtc2`` plus later chunks ``-c001``, ``-c002``, ... for the
+    streams that rolled; the reader opens only ``c000`` and follows the
+    ``chunkinfo`` roll from there (see :mod:`psdata.index`).  Returns the
+    surviving paths in their input order.
+    """
+    return [p for p in paths if _C000_RE.search(os.path.basename(p))]
+
+
+def stream_index_of(path):
+    """Extract the integer stream index from a ``...-s###-c000.xtc2`` path, or
+    ``None`` if the name does not match.  Lets a plain c000 file list be keyed
+    by its real ``s###`` stream id rather than positionally."""
+    m = _STREAM_RE.search(os.path.basename(path))
+    return int(m.group(1)) if m else None
 
 
 # ==========================================================================

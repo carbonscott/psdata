@@ -29,10 +29,20 @@ machinery as the streaming path (:func:`psdata.stream._index_dgram` +
 :class:`psdata.stream.Event`), so a randomly-read event is byte-identical to
 the same event obtained by streaming.
 
-Scope (US-003): single-chunk runs (``c000`` only).  Multi-chunk roll (offsets
-reset at chunk boundaries) is US-004; an ``intOffset`` that decreases relative
-to the running maximum within a stream is detected and reported here, but
-following the roll is deferred.
+Multi-chunk runs (US-004)
+-------------------------
+A long run's bigdata is split into chunk files ``...-s###-c000.xtc2``,
+``-c001``, ``-c002``, ...; each chunk file's ``intOffset`` values restart at 0,
+so an offset is meaningful only *relative to the chunk file it indexes*.  psana
+opens ``c000`` and, on every ``Enable`` transition, reads a ``chunkinfo``
+container (``det_name='chunkinfo'``, ``alg='chunkinfo'``; fields ``filename``
+and ``chunkid``) and, when ``chunkid`` advances, reopens the bigdata fd on the
+new file (``event_manager.py`` ~208-254, ``_open_new_bd_file``).
+
+This module replicates that roll while scanning the SMD: each per-event index
+entry records not just ``(offset, size)`` but the **bigdata chunk path** the
+offset indexes, so :meth:`RunIndex.read_event` ``os.pread`` reads the correct
+chunk file -- byte-identical to psana across the boundary.
 
 Like the rest of ``psdata``, this module imports **no** psana / mpi4py / h5py
 -- only the standard library and numpy.
@@ -52,6 +62,20 @@ _SMDINFO_DET = "smdinfo"
 _SMDINFO_ALG = "offsetAlg"
 _OFFSET_FIELD = "intOffset"
 _SIZE_FIELD = "intDgramSize"
+
+# The bookkeeping detector that carries the chunk-roll info on Enable dgrams.
+_CHUNKINFO_DET = "chunkinfo"
+_CHUNKINFO_ALG = "chunkinfo"
+_CHUNK_FILENAME_FIELD = "filename"
+_CHUNK_ID_FIELD = "chunkid"
+
+
+def _decode_chunk_filename(arr):
+    """``chunkinfo.filename`` is a rank-1 CHARSTR (uint8) field, null-padded.
+    Return it as a ``str`` (the bare basename of the next bigdata chunk)."""
+    raw = bytes(np.asarray(arr).tobytes())
+    z = raw.find(b"\x00")
+    return raw[:z if z >= 0 else len(raw)].decode("latin-1")
 
 
 # ==========================================================================
@@ -112,13 +136,21 @@ class RunIndex:
         L1Accept event timestamps in ascending order (the index of an event in
         this list is its event number / position ``k``).
     entries : list[dict]
-        ``entries[k]`` is ``{stream: (offset, size)}`` -- which bigdata streams
-        carry event ``k`` and where their dgram lives.  Only streams that
-        contributed a segment to event ``k`` are present (a stream missing for
-        an event is simply absent, so the US-002 missing-segment rule applies).
+        ``entries[k]`` is ``{stream: (chunk_path, offset, size)}`` -- which
+        bigdata streams carry event ``k``, the **chunk file** that event's
+        dgram lives in (``c000``/``c001``/... after the roll), and the offset
+        and size within it.  Only streams that contributed a segment to event
+        ``k`` are present (a stream missing for an event is simply absent, so
+        the US-002 missing-segment rule applies).
     bd_files : dict
-        ``{stream: bigdata_path}`` -- the bigdata file each stream reads from
-        (from the run config, same stream index as the SMD file).
+        ``{stream: bigdata_c000_path}`` -- the first (``c000``) bigdata file of
+        each stream (from the run config, same stream index as the SMD file).
+        Later chunks are recorded per-event in ``entries`` and in
+        ``chunk_files``.
+    chunk_files : dict
+        ``{stream: [chunk_path, ...]}`` -- the ordered bigdata chunk files each
+        stream rolls through (``[c000]`` for a single-chunk stream, ``[c000,
+        c001, ...]`` for a multi-chunk one).
     run_config : psdata.format.RunConfig
         The run's discovered detector / segment configuration (shared with the
         streaming path so assembled events are identical).
@@ -127,20 +159,20 @@ class RunIndex:
     smd_bytes_read : int
         Total bytes read from the SMD files during the build.
     multichunk_streams : set[int]
-        Streams whose ``intOffset`` was observed to *decrease* (a chunk-roll
-        signature).  Empty for a clean single-chunk run; following the roll is
-        US-004.
+        Streams that rolled through more than one chunk file (followed the
+        ``chunkinfo`` roll).  Empty for a clean single-chunk run.
     """
 
     def __init__(self, run_config):
         self.run_config = run_config
         self.timestamps = []          # ascending L1Accept ts
-        self.entries = []             # entries[k] = {stream: (offset, size)}
+        self.entries = []             # entries[k] = {stream:(path,offset,size)}
         self.bd_files = dict(run_config.stream_files)
+        self.chunk_files = {s: [p] for s, p in run_config.stream_files.items()}
         self.build_seconds = 0.0
         self.smd_bytes_read = 0
         self.multichunk_streams = set()
-        # private: open bigdata fds, lazily, cached for repeated reads
+        # private: open bigdata fds, lazily, cached per chunk path
         self._bd_fds = {}
         self._ts_to_k = None          # built lazily for read_event(ts)
 
@@ -171,13 +203,18 @@ class RunIndex:
         idx = cls(run_config)
 
         t0 = time.monotonic()
-        # per-stream ordered lists of (ts, offset, size)
+        # per-stream ordered lists of (ts, chunk_path, offset, size)
         per_stream = {}
-        for stream, path in items:
-            recs, nbytes, rolled = _scan_smd_stream(path, smd_read_chunk)
+        for stream, smd_path in items:
+            # the bigdata c000 path this SMD stream indexes into (chunkinfo
+            # filenames on Enable name the later chunks, in the same directory).
+            bd_c000 = run_config.stream_files.get(stream)
+            recs, nbytes, chunks = _scan_smd_stream(
+                smd_path, bd_c000, smd_read_chunk)
             per_stream[stream] = recs
             idx.smd_bytes_read += nbytes
-            if rolled:
+            idx.chunk_files[stream] = chunks
+            if len(chunks) > 1:
                 idx.multichunk_streams.add(stream)
 
         idx._merge_streams(per_stream)
@@ -185,14 +222,15 @@ class RunIndex:
         return idx
 
     def _merge_streams(self, per_stream):
-        """Combine the per-stream ``(ts, off, size)`` records into the unified
-        ascending ``timestamps`` / ``entries`` index by exact-timestamp merge
-        (an event's identity is its 64-bit ts, shared across streams)."""
+        """Combine the per-stream ``(ts, chunk_path, off, size)`` records into
+        the unified ascending ``timestamps`` / ``entries`` index by
+        exact-timestamp merge (an event's identity is its 64-bit ts, shared
+        across streams)."""
         # gather the union of timestamps, then for each ts collect the streams
-        merged = {}   # ts -> {stream: (off, size)}
+        merged = {}   # ts -> {stream: (chunk_path, off, size)}
         for stream, recs in per_stream.items():
-            for ts, off, size in recs:
-                merged.setdefault(ts, {})[stream] = (off, size)
+            for ts, chunk_path, off, size in recs:
+                merged.setdefault(ts, {})[stream] = (chunk_path, off, size)
         for ts in sorted(merged):
             self.timestamps.append(ts)
             self.entries.append(merged[ts])
@@ -210,11 +248,16 @@ class RunIndex:
             return i
         raise KeyError(f"no indexed event with timestamp {ts}")
 
-    def _bd_fd(self, stream):
-        fd = self._bd_fds.get(stream)
+    def _bd_fd(self, chunk_path):
+        """Return an open read fd for ``chunk_path``, cached across reads.
+
+        Keyed by path (not stream) so multi-chunk reads keep one fd per chunk
+        file the run rolls through.
+        """
+        fd = self._bd_fds.get(chunk_path)
         if fd is None:
-            fd = os.open(self.bd_files[stream], os.O_RDONLY)
-            self._bd_fds[stream] = fd
+            fd = os.open(chunk_path, os.O_RDONLY)
+            self._bd_fds[chunk_path] = fd
         return fd
 
     def read_event(self, ts):
@@ -242,19 +285,21 @@ class RunIndex:
         seg_index = {}
         service = _s.SERVICE_L1ACCEPT
         for stream in sorted(entry):
-            offset, size = entry[stream]
-            fd = self._bd_fd(stream)
+            chunk_path, offset, size = entry[stream]
+            fd = self._bd_fd(chunk_path)
             raw = os.pread(fd, size, offset)
             if len(raw) != size:
                 raise RuntimeError(
-                    f"stream {stream}: short read at offset {offset} "
-                    f"(wanted {size}, got {len(raw)})")
+                    f"stream {stream}: short read at offset {offset} of "
+                    f"{os.path.basename(chunk_path)} (wanted {size}, "
+                    f"got {len(raw)})")
             buf = bytearray(raw)
             h = _f.parse_dgram_header(buf, 0)
             if h["ts"] != ts:
                 raise RuntimeError(
                     f"stream {stream}: bigdata dgram ts {h['ts']} != indexed "
-                    f"ts {ts} (offset {offset}); chunk boundary? (US-004)")
+                    f"ts {ts} (offset {offset} of "
+                    f"{os.path.basename(chunk_path)}); chunk roll mismatch")
             service = h["service"]
             snap_h = dict(h)
             snap_h["_off"] = 0
@@ -293,18 +338,33 @@ class RunIndex:
 
 
 # ==========================================================================
-# SMD scan: read one SMD file's L1Accept (ts, intOffset, intDgramSize) records
+# SMD scan: read one SMD file's L1Accept records, following the chunk roll
 # ==========================================================================
-def _scan_smd_stream(path, read_chunk):
-    """Scan one SMD file and return ``(records, bytes_read, rolled)`` where
-    ``records`` is a list of ``(ts, intOffset, intDgramSize)`` for every
-    ``L1Accept`` and ``rolled`` flags a decrease in ``intOffset`` (the
-    chunk-roll signature; following it is US-004).
+def _scan_smd_stream(path, bd_c000_path, read_chunk):
+    """Scan one SMD file and return ``(records, bytes_read, chunk_paths)``.
+
+    ``records`` is a list of ``(ts, chunk_path, intOffset, intDgramSize)`` for
+    every ``L1Accept``: ``chunk_path`` is the bigdata chunk file the offset
+    indexes into -- ``bd_c000_path`` until an ``Enable`` rolls the chunk, then
+    the next chunk file (resolved from the ``chunkinfo`` carried on that
+    Enable).  ``chunk_paths`` is the ordered list of distinct chunk files this
+    stream rolled through (``[c000]`` if it never rolled).
+
+    Chunk-roll rule (mirrors ``event_manager.py`` ~208-227 / ``_open_new_bd_file``
+    ~248): on each Enable dgram that carries a ``chunkinfo`` whose ``chunkid``
+    exceeds the current one, the active bigdata file becomes
+    ``<dir of c000>/<chunkinfo.filename>`` and subsequent ``intOffset`` values
+    (which restart at 0 in the new chunk) index that file.
 
     Reads the SMD file in a growing ``os.pread`` window -- the SMD files are
     small (a few MB), so this is the only I/O the index build does; the bigdata
     files are never opened here.
     """
+    bd_dir = os.path.dirname(bd_c000_path) if bd_c000_path else None
+    cur_chunk_id = 0
+    cur_chunk_path = bd_c000_path
+    chunk_paths = [bd_c000_path] if bd_c000_path is not None else []
+
     fd = os.open(path, os.O_RDONLY)
     try:
         # Configure sits at offset 0; read enough to parse it, then grow.
@@ -318,10 +378,11 @@ def _scan_smd_stream(path, read_chunk):
                 f"{os.path.basename(path)} has no smdinfo table -- is it an "
                 f"SMD (smalldata) file?")
         table = tables[smdinfo_key]
+        has_chunkinfo = any(
+            t["det_name"] == _CHUNKINFO_DET and t["alg_name"] == _CHUNKINFO_ALG
+            for t in tables.values())
 
         records = []
-        rolled = False
-        max_off = -1
         off = cfg_end
         while True:
             if off + _f.DGRAM_HDR > len(buf):
@@ -345,14 +406,37 @@ def _scan_smd_stream(path, read_chunk):
                 info = _read_smdinfo(buf, off, h, smdinfo_key, table)
                 if info is not None:
                     intoff, intsize = info
-                    if intoff < max_off:
-                        rolled = True
-                    max_off = max(max_off, intoff)
-                    records.append((h["ts"], intoff, intsize))
+                    records.append((h["ts"], cur_chunk_path, intoff, intsize))
+            elif (h["service"] == _f.SERVICE_ENABLE and has_chunkinfo
+                  and bd_dir is not None):
+                # Follow the chunk roll: a new chunkid names the next bigdata
+                # file; offsets after this Enable index into it.
+                roll = _read_chunkinfo(buf, off, h, tables)
+                if roll is not None:
+                    new_id, new_name = roll
+                    if new_id > cur_chunk_id:
+                        cur_chunk_id = new_id
+                        cur_chunk_path = os.path.join(bd_dir, new_name)
+                        chunk_paths.append(cur_chunk_path)
             off += total
-        return records, bytes_read, rolled
+        return records, bytes_read, chunk_paths
     finally:
         os.close(fd)
+
+
+def _read_chunkinfo(buf, dg_off, dg_hdr, tables):
+    """Read the ``chunkinfo`` (``chunkid``, ``filename``) from one Enable
+    dgram, or ``None`` if this Enable carries none (the run-start Enable does
+    not).  ``filename`` is decoded to a ``str`` (the next chunk's basename)."""
+    cid = _f.read_dgram_field(buf, dg_off, dg_hdr, tables,
+                              _CHUNKINFO_DET, _CHUNKINFO_ALG, _CHUNK_ID_FIELD)
+    if cid is None:
+        return None
+    fn = _f.read_dgram_field(buf, dg_off, dg_hdr, tables, _CHUNKINFO_DET,
+                             _CHUNKINFO_ALG, _CHUNK_FILENAME_FIELD)
+    if fn is None:
+        return None
+    return int(cid), _decode_chunk_filename(fn)
 
 
 # ==========================================================================

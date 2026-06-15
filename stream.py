@@ -298,6 +298,40 @@ class Event:
             out[k] = segs[s]
         return out
 
+    def damage(self, det_name, alg="raw"):
+        """Return ``{segment: (damage_id, userbits)}`` for ``(det_name, alg)``
+        this event, decoded from each segment's ShapesData ``Xtc.damage``.
+
+        ``damage_id`` is the low-12-bit damage code (0 == undamaged; nonzero is
+        a :class:`DamageBitmask` value) and ``userbits`` the high-4-bit user
+        field -- the same split psana applies (``DAMAGE_USERBITSHIFT=12``,
+        ``detector/damage.py``).  psana does **not** drop damaged data, and
+        neither does ``psdata``: the raw array is still returned by
+        :meth:`raw`/:meth:`stack`; damage is surfaced here, not silently
+        dropped.  ``None`` if the detector/alg did not contribute this event.
+
+        Note the per-segment damage is read from the ShapesData (alg-level) Xtc,
+        matching psana's ``segment._xtc.damage`` (it exposes damage only at the
+        alg level -- ``detector/damage.py`` docstring).
+        """
+        key = (det_name, alg)
+        captured = self._seg_index.get(key)
+        if not captured:
+            return None
+        out = {}
+        for seg, (_buf, _off, hdr, _table) in captured.items():
+            out[seg] = _f.decode_damage(hdr["damage"])
+        return out
+
+    def is_damaged(self, det_name, alg="raw"):
+        """True if any contributing segment of ``(det_name, alg)`` has a nonzero
+        damage id this event.  ``False`` if undamaged; ``None`` if the
+        detector/alg is absent this event."""
+        dmg = self.damage(det_name, alg=alg)
+        if dmg is None:
+            return None
+        return any(did != 0 for (did, _ub) in dmg.values())
+
     def as_dict(self, field="raw", alg="raw", include_bookkeeping=False):
         """``{det_name: {segment: ndarray}}`` for every detector that declares
         ``alg``/``field`` and contributed this event.  A detector missing a
