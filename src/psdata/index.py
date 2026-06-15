@@ -50,6 +50,7 @@ Like the rest of ``psdata``, this module imports **no** psana / mpi4py / h5py
 
 import bisect
 import os
+import pickle
 import time
 
 import numpy as np
@@ -335,6 +336,102 @@ class RunIndex:
                 f"streams={sorted(self.bd_files)}, "
                 f"build_seconds={self.build_seconds:.3f}, "
                 f"smd_MB={self.smd_bytes_read / 1e6:.1f})")
+
+    # -- serialization & disk persistence (US-008) ------------------------
+    #
+    # The once-built index can be (a) saved to a single file and reloaded
+    # instantly with NO SMD rescan (a single-process benefit), and (b) shipped
+    # to parallel workers in-memory via pickle / ``to_dict``.  Both paths share
+    # ONE state-stripping helper so they cannot drift.
+    #
+    # THE gotcha (load-bearing): ``_bd_fds`` caches raw OS file-descriptor
+    # integers from ``os.open``.  ``pickle`` does NOT refuse a bare int, so an
+    # index serialized *after any read* would otherwise carry stale fds; loading
+    # it elsewhere and reading raises ``OSError(9, 'Bad file descriptor')`` or --
+    # if those fd numbers were reused -- ``pread``s the WRONG file and returns
+    # silent garbage.  ``_ts_to_k`` is likewise a per-process cache.  Both are
+    # therefore EXCLUDED from the persisted state and re-initialised empty on
+    # reconstruction, so fds reopen lazily on the first read in the new process.
+    #
+    # The persisted state is exactly: timestamps, entries, bd_files,
+    # chunk_files, multichunk_streams, run_config, build_seconds,
+    # smd_bytes_read -- all plain-Python / numpy-dtype values (no fds, no live
+    # C objects), so plain ``pickle.dumps(idx)`` is safe once these two caches
+    # are stripped.
+
+    _PERSIST_FIELDS = (
+        "timestamps",
+        "entries",
+        "bd_files",
+        "chunk_files",
+        "multichunk_streams",
+        "run_config",
+        "build_seconds",
+        "smd_bytes_read",
+    )
+
+    def _persist_state(self):
+        """Return the picklable state dict -- the single source of truth for
+        what is persisted/serialized.  Deliberately OMITS ``_bd_fds`` and
+        ``_ts_to_k`` (per-process caches; see the class note above)."""
+        return {name: getattr(self, name) for name in self._PERSIST_FIELDS}
+
+    def _restore_state(self, state):
+        """Populate ``self`` from a ``_persist_state`` dict and re-init the
+        per-process caches empty so fds reopen lazily on the first read."""
+        for name in self._PERSIST_FIELDS:
+            setattr(self, name, state[name])
+        self._bd_fds = {}        # MUST be a fresh empty cache -- never the
+        self._ts_to_k = None     # serialized one (would carry stale fds)
+        return self
+
+    # in-memory facet: ship to workers --------------------------------------
+    def to_dict(self):
+        """Return a plain ``dict`` of the index's persisted state (ship this to
+        workers via e.g. Ray's object store; reconstruct with
+        :meth:`from_dict`).  Shares the state-stripping helper with
+        ``save``/pickle, so it is fd-safe by construction."""
+        return self._persist_state()
+
+    @classmethod
+    def from_dict(cls, state):
+        """Reconstruct a :class:`RunIndex` from a :meth:`to_dict` payload
+        WITHOUT rescanning SMD.  Fds reopen lazily on the first read."""
+        idx = cls.__new__(cls)
+        return idx._restore_state(state)
+
+    # pickle protocol: plain ``pickle.dumps(idx)`` is fd-safe -------------
+    def __getstate__(self):
+        return self._persist_state()
+
+    def __setstate__(self, state):
+        self._restore_state(state)
+
+    # disk persistence ------------------------------------------------------
+    def save(self, path):
+        """Write the built index to a single file at ``path`` so it can be
+        reloaded later (or in another process) WITHOUT rescanning SMD.
+
+        On-disk format is **pickle** (protocol 4): the state is nested
+        plain-Python containers plus a :class:`psdata.format.RunConfig` (itself
+        only strings / ints / dicts / ``numpy.dtype``) -- pickle gives full
+        fidelity for the 64-bit ints and the nested config with no bespoke
+        schema, and the blob (entries dominate) is smaller than the SMD bytes it
+        replaces.  Only the fd-safe ``_persist_state`` is written.
+        """
+        with open(path, "wb") as fh:
+            pickle.dump(self._persist_state(), fh, protocol=4)
+
+    @classmethod
+    def load(cls, path):
+        """Reload an index written by :meth:`save`.  Opens ONLY the index file
+        (no SMD files, no rescan): ``smd_bytes_read`` is whatever the original
+        build measured, but no new SMD I/O happens here.  Fds into the bigdata
+        files reopen lazily on the first :meth:`read_event_at`."""
+        with open(path, "rb") as fh:
+            state = pickle.load(fh)
+        idx = cls.__new__(cls)
+        return idx._restore_state(state)
 
 
 # ==========================================================================
