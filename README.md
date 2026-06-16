@@ -120,10 +120,35 @@ list of paths.
 | --- | --- | --- |
 | [`format.py`](src/psdata/format.py) | xtc2 parse core + generic detector/segment discovery | US-001 |
 | [`stream.py`](src/psdata/stream.py) | multi-stream event assembly (exact 64-bit-ts k-way merge) | US-002 |
-| [`index.py`](src/psdata/index.py) | random-access-by-event index (scans SMD only) + multi-chunk roll | US-003 / US-004 |
+| [`index.py`](src/psdata/index.py) | random-access-by-event index (scans SMD only) + multi-chunk roll; serializable / disk-persisted (`save`/`load`, `to_dict`/`from_dict`) + batch read (`read_events`/`read_stack`) | US-003 / US-004 / US-008 / US-009 |
 | [`run.py`](src/psdata/run.py) | public `open()` / `Run` surface | US-005 |
 | [`calib/snapshot.py`](src/psdata/calib/snapshot.py) | **separate** layer: one-time calibration-constant snapshot + pinning | US-006 |
 | [`hdr/`](src/psdata/hdr) | **separate** layer: standalone offline calibrated 2-D HDR image render | US-007 |
+
+## Examples
+
+Runnable demonstrators live in [`examples/`](examples). They import `psdata`
+and nothing heavier unless a demonstrator's own optional dependency is declared.
+
+| example | what it shows |
+| --- | --- |
+| [`fetch_raw_adu.py`](examples/fetch_raw_adu.py) | walk a run, pull raw ADU + event identity (numpy-only) |
+| [`cube_ray_shared_index.py`](examples/cube_ray_shared_index.py) | a GroupBy-Aggregate **cube** parallelized with **Ray**: the driver builds the `RunIndex` **once** and ships it to the workers via Ray's object store (`to_dict()`/`from_dict()`, US-008); each worker **batch-reads** its slice (`read_events`, US-009) and bins by a **real** per-event key (`pulseId`) — **no per-worker SMD rescan**, in contrast to a psana `DataSource`+`build_table` per worker |
+
+The cube demonstrator needs Ray (the `demo` extra, `pip install -e .[demo]`),
+which is **not** a core dependency — `import psdata` stays numpy-only. Ray is
+imported only by the example. Run it via the env-setup wrapper:
+
+```bash
+examples/run_cube_ray.sh                      # 800 evt, workers 1/4/16, +rescan contrast
+examples/run_cube_ray.sh --check              # assert parallel cube == serial cube, exit
+```
+
+Because the jungfrau frame is ~33.6 MB/event, the cube is **I/O-bandwidth-bound**
+on this detector, so its absolute `evt/s` is gated by shared-filesystem read
+bandwidth, not by the index; the index's payoff is the **rescan tax** the run
+reports — the per-worker SMD scan (~one index build) the shared index removes,
+which is what capped the psana prototype's scaling.
 
 ## Optional: calibration-constant snapshot (`psdata.calib`)
 
