@@ -8,7 +8,7 @@ serializable and US-009 made batchable.  This suite checks three things:
   1. **Import purity** (always runs, no torch needed): a fresh subprocess
      asserts ``import psdata`` does NOT pull torch into ``sys.modules`` -- only
      ``import psdata.torch`` does.  Mirrors ``test_persist_us008``'s purity check
-     and the lazy-import discipline of ``psdata.calib.snapshot``.
+     and the lazy-import discipline of ``pscalib.providers.snapshot``.
 
   2. **Correctness** (needs torch): ``ds[k]`` is byte-identical to
      ``read_event_at(k).stack(detector)``, returned as a ``torch`` tensor.

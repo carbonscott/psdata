@@ -9,7 +9,7 @@ primitives, alongside the Ray cube (US-010).
 
 This module is **NOT** imported by ``import psdata`` -- only ``import
 psdata.torch`` pulls torch in -- and ``torch`` is imported **lazily inside the
-functions/methods** that need it, exactly mirroring ``psdata.calib.snapshot``'s
+functions/methods** that need it, exactly mirroring ``pscalib.providers.snapshot``'s
 lazy-psana discipline.  So ``import psdata`` stays numpy-only; install the
 optional dependency with ``pip install psdata[torch]``.
 

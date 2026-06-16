@@ -151,93 +151,14 @@ bandwidth, not by the index; the index's payoff is the **rescan tax** the run
 reports — the per-worker SMD scan (~one index build) the shared index removes,
 which is what capped the psana prototype's scaling.
 
-## Optional: calibration-constant snapshot (`psdata.calib`)
+## Calibration lives in `pscalib`
 
-Calibration is **not** part of the reader. `psdata.calib` is a *separate*
-sub-package: a one-time step that snapshots a detector's calibration constants
-(the only network/DB dependency) so a later calibrated-image render can run
-fully offline. Importing the reader (`import psdata`) does **not** import it, so
-the reader stays numpy-only.
-
-```python
-# --- one-time snapshot (needs psana; run under psconda.sh) ---
-from psdata.calib import snapshot_calib
-snap_dir = snapshot_calib(exp="mfx100848724", run=51,
-                          dir="/sdf/data/lcls/ds/prj/public01/xtc",
-                          detname="jungfrau", out_dir="/some/cache")
-# writes {out_dir}/jungfrau_r0051/ : pedestals/pixel_gain/pixel_offset/...npy,
-# mask.npy, geometry.txt, manifest.json
-
-# --- reload offline (pure numpy, NO psana) ---
-from psdata.calib import load_snapshot
-snap = load_snapshot(snap_dir)
-snap.pedestals          # (3,32,512,1024) f32  -- leading axis = 3 gain stages
-snap.pixel_gain         # (3,32,512,1024) f32
-snap.pixel_offset       # (3,32,512,1024) f32  (None if absent -> treat as 0)
-snap.mask               # (32,512,1024)   u8   -- det.raw._mask(status=True)
-snap.geometry           # ~5-8 KB geometry text
-snap.calibconst()       # rebuilds psana's {ctype: (array, meta)} dict
-```
-
-Snapshots are **pinned by `(detector_uniqueid, run)`** and retain each
-constant's validity metadata (`run` / `run_end` / `version`). A reload
-reproduces the exact arrays psana's `det.raw._calibconst` returns
-(`np.array_equal`). **Staleness is silent:** a constant's validity *run* can
-differ from the pin run (e.g. pedestals valid from run 49, pin run 51); reusing
-a snapshot outside a constant's validity range gives wrong-but-silent results.
-`snap.validity(ctype)` and `snap.is_valid_for_run(run)` expose the ranges for an
-opt-in check; the package never refuses a stale reload.
-
-## Optional: standalone calibrated 2-D HDR image (`psdata.hdr`)
-
-Like `psdata.calib`, the calibrated-image render is a *separate, optional*
-layer — **not** part of the reader, and **not** imported by `import psdata`.
-`psdata.hdr` turns a raw detector stack into the calibrated 2-D HDR image
-**fully offline at render time** (only numpy — no web calib DB, no MPI, no psana
-framework), building on a `psdata.calib` snapshot.
-
-```python
-# --- one-time prep (needs psana; run under psconda.sh) ---
-from psdata.calib import snapshot_calib
-from psdata.hdr.geometry import cache_pixel_indexes_for_snapshot
-snap_dir = snapshot_calib(exp="mfx100848724", run=51,
-                          dir="/sdf/data/lcls/ds/prj/public01/xtc",
-                          detname="jungfrau", out_dir="/some/cache")
-cache_pixel_indexes_for_snapshot(snap_dir)   # derive ix/iy from geometry.txt
-# (GeometryAccess; written as pixel_index_ix.npy / pixel_index_iy.npy)
-
-# --- offline render (pure numpy, NO psana) ---
-from psdata.calib import load_snapshot
-from psdata.hdr import HDRImager
-imager = HDRImager(load_snapshot(snap_dir))
-calib  = imager.calib(raw_stack)             # (32,512,1024) f32 == det.raw.calib
-image  = imager.image(calib)                 # (4216,4432)   f32 == det.raw.image
-# or in one step:
-calib, image = imager.render(raw_stack)
-```
-
-The pipeline is **byte-exact** versus psana for the reference Jungfrau dataset:
-`calib` matches `det.raw.calib(evt)` and `image` matches `det.raw.image(evt)`
-with `max|diff| == 0`. Internals are vendored framework-free numpy:
-
-* **gain decode** ([`hdr/jungfrau.py`](src/psdata/hdr/jungfrau.py)) — psana
-  `UtilsJungfrau.calib_jungfrau`: gain bits = `raw >> 14` (stage map
-  `{0→0, 1→1, 3→2}`, code `2` is bad → 0); `adc = raw & 0x3fff`;
-  `calib = (adc − (pedestals+pixel_offset)[stage]) / pixel_gain[stage] · mask`.
-* **image remap** ([`hdr/image.py`](src/psdata/hdr/image.py)) — psana
-  `UtilsAreaDetector` (`mapmode=2`, `fillholes=True`): scatter into the
-  `(image_row, image_col)` grid, take max on overlapping bins, fill single-bin
-  holes with the min of four neighbours.
-* **geometry** ([`hdr/geometry.py`](src/psdata/hdr/geometry.py)) — the per-pixel
-  `(ix, iy)` index maps are derived once from the snapshot's geometry text via
-  psana's pure-numpy `GeometryAccess.get_pixel_coord_indexes` (byte-identical
-  to `det.raw._pixel_coord_indexes()`) and cached into the snapshot, so the
-  render *apply* needs no `GeometryAccess` — that one psana touch is lazy and
-  snapshot-time only.
-
-The render is **per-detector-type** (gain decode + geometry differ by
-detector); today Jungfrau is wired in. The raw reader (US-001…US-005), by
-contrast, is detector-universal.
+Calibration is **not** part of the reader; it lives in the sibling package
+[`pscalib`](../pscalib), which builds on psdata. For byte-exact per-pixel
+calibration, `from pscalib import calib` (or `calib_jungfrau`). For an assembled
+2-D image, the optional `HDRImager` bundles calib + geometry remap
+(`from pscalib import load_snapshot, HDRImager`; `imager.render(raw_stack)`
+returns `(calib, image)`, numpy-only and byte-exact vs psana).
 
 ## Environment
 
