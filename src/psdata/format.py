@@ -273,6 +273,91 @@ def read_dgram_field(buf, dg_off, dg_hdr, tables, det_name, alg, field):
 
 
 # ==========================================================================
+# Configure-object accessor -- per-segment CONFIGURE-block fields (US-010)
+# ==========================================================================
+# The L1Accept dgrams carry a detector's *event* data (the ``raw`` alg).  A
+# detector's static *settings* -- e.g. epix10ka's per-ASIC ``trbit`` /
+# ``asicPixelConfig`` that the gain-range decode needs -- live in the
+# ``config`` alg, written once into the **Configure** dgram (offset 0 of every
+# stream), not into any L1Accept.  This reads them back per segment, reusing the
+# same generic DescData decoder (:func:`extract_field`) that reads event fields,
+# so it is byte-exact vs psana's ``det.raw._seg_configs()`` for any detector
+# whose Names tables declare a ``config`` alg (proven for epix10ka and jungfrau).
+def read_config_object(run_config, det_name, alg="config", fields=None):
+    """Read the per-segment CONFIGURE-block fields of ``(det_name, alg)``.
+
+    For every segment of ``(det_name, alg)``, opens the Configure dgram (which
+    sits at offset 0 of the segment's stream), locates that segment's
+    ``config``-alg ShapesData, and extracts each requested field with the
+    generic DescData decoder.  Returns the raw field values exactly as the
+    decoder reads them (scalar for rank-0 fields, ndarray otherwise) -- the
+    same arrays psana surfaces through ``det.raw._seg_configs()[seg].config``.
+
+    Parameters
+    ----------
+    run_config : RunConfig
+        The run's discovered config (from :func:`discover`).
+    det_name : str
+        Detector name (e.g. ``'epixquad'``).
+    alg : str, optional
+        Algorithm holding the configure-block fields (default ``'config'``).
+    fields : sequence of str, optional
+        Which fields to extract; defaults to every field discovered for
+        ``(det_name, alg)``.
+
+    Returns
+    -------
+    dict
+        ``{segment_id: {field_name: value}}`` -- one entry per segment, sorted
+        by segment id.  Each inner dict maps every requested field name to its
+        extracted value.
+
+    Raises
+    ------
+    KeyError
+        If ``det_name`` is unknown or has no ``alg`` algorithm.
+    """
+    det = run_config.detector(det_name)
+    if alg not in det.algs:
+        raise KeyError(f"detector {det_name!r} has no alg {alg!r} "
+                       f"(have {det.alg_names()})")
+    want_fields = list(det.field_names(alg) if fields is None else fields)
+
+    # Group the segments we need by the stream whose Configure carries them, so
+    # each stream's Configure front is read with a single pread.
+    by_stream = {}                              # stream -> {names_key: segment}
+    for seg in det.segment_ids(alg):
+        stream = det.seg_to_stream[(alg, seg)]
+        names_key = det.names_id[(alg, seg)]
+        by_stream.setdefault(stream, {})[names_key] = seg
+
+    out = {}
+    for stream, key_to_seg in by_stream.items():
+        path = run_config.stream_files[stream]
+        tables = run_config.raw_tables[stream]
+        _cfg, cfg_end = run_config.stream_configs[stream]
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            # The Configure dgram spans [0, cfg_end); read exactly that front.
+            buf = bytearray(os.pread(fd, cfg_end, 0))
+        finally:
+            os.close(fd)
+        cfg_hdr = parse_dgram_header(buf, 0)
+        for xoff, xh in iter_shapesdata(buf, 0, cfg_hdr):
+            names_key = namesid_of(xh["src"])
+            seg = key_to_seg.get(names_key)
+            if seg is None:
+                continue
+            table = tables[names_key]
+            seg_fields = {}
+            for fld in want_fields:
+                arr, _shape, _meta = extract_field(buf, xoff, xh, table, fld)
+                seg_fields[fld] = arr
+            out[seg] = seg_fields
+    return {seg: out[seg] for seg in sorted(out)}
+
+
+# ==========================================================================
 # Generic discovery -- the US-001 deliverable, layered on the machinery above
 # ==========================================================================
 # Names tables whose alg is one of these are container bookkeeping, not a

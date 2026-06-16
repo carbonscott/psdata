@@ -48,6 +48,62 @@ from . import format as _f
 from . import stream as _s
 from . import index as _i
 
+
+class _AlgNamespace:
+    """Attribute view over one algorithm's CONFIGURE-block fields of a segment.
+
+    Mirrors the leaf of psana's ``det.raw._seg_configs()[seg].config`` object:
+    each field is reachable as an attribute (``cfg.config.trbit``).  Field names
+    that are not valid Python identifiers (e.g. jungfrau's dotted
+    ``user.bias_voltage_v`` or enum-suffixed ``DYNAMIC:gainModeEnum``) cannot be
+    reached by attribute syntax -- read those from the :attr:`fields` dict or
+    via ``getattr(cfg.config, name)`` with the literal name.
+    """
+
+    __slots__ = ("fields",)
+
+    def __init__(self, fields):
+        self.fields = dict(fields)
+
+    def __getattr__(self, name):
+        try:
+            return self.fields[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def field_names(self):
+        return sorted(self.fields)
+
+    def __repr__(self):
+        return f"_AlgNamespace(fields={self.field_names()})"
+
+
+class _SegConfig:
+    """One segment's CONFIGURE object: ``seg_cfg.<alg>.<field>``.
+
+    The segment-level namespace returned per segment by
+    :meth:`Run.seg_configs`.  Exposes one attribute per algorithm (today only
+    ``config``), matching psana's ``det.raw._seg_configs()[seg].config.<field>``
+    access pattern.
+    """
+
+    __slots__ = ("_algs",)
+
+    def __init__(self, algs):
+        self._algs = dict(algs)            # alg name -> _AlgNamespace
+
+    def __getattr__(self, name):
+        try:
+            return object.__getattribute__(self, "_algs")[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def alg_names(self):
+        return sorted(self._algs)
+
+    def __repr__(self):
+        return f"_SegConfig(algs={self.alg_names()})"
+
 # Stream/chunk file-name pattern: ``<exp>-r<run4>-s<stream3>-c<chunk3>.xtc2``.
 # psana opens only the first chunk (``c000``) of each stream and rolls forward
 # from there; :func:`psdata.format.filter_c000` reproduces that filter.
@@ -198,6 +254,38 @@ class Run:
         """Sorted names of detectors whose ``det_type`` matches (e.g. ``'ts'``
         for the timing detector that carries ``pulseId``)."""
         return self.config.find_detector_by_type(det_type)
+
+    # -- CONFIGURE-block accessor -----------------------------------------
+    def seg_configs(self, detname, alg="config"):
+        """Per-segment CONFIGURE-block object for ``detname``.
+
+        Returns ``{segment_id: seg_cfg}`` where ``seg_cfg.<alg>.<field>`` reads
+        a static settings field written into the Configure dgram (not an
+        L1Accept event field) -- e.g. for epix10ka::
+
+            scfg = run.seg_configs("epixquad")          # {0: ..., 1: ..., ...}
+            trbit = scfg[0].config.trbit                # (4,)   uint8
+            apc   = scfg[0].config.asicPixelConfig      # (4,176,192) uint8
+
+        These per-ASIC fields are exactly what the epix gain-range decode needs
+        and are byte-identical to psana's
+        ``det.raw._seg_configs()[seg].config.{trbit,asicPixelConfig}``.  The
+        accessor is generic -- it works for any detector whose Names tables
+        declare a ``config`` algorithm (jungfrau, epix10ka, ...), reading the
+        fields with the same DescData decoder used for event data.
+
+        Field names that are not valid Python identifiers (jungfrau's dotted /
+        enum-suffixed config fields) are reachable from
+        ``seg_cfg.<alg>.fields[name]`` rather than by attribute syntax.
+        """
+        per_seg = _f.read_config_object(self.config, detname, alg=alg)
+        return {seg: _SegConfig({alg: _AlgNamespace(fld_map)})
+                for seg, fld_map in per_seg.items()}
+
+    def config_object(self, detname, alg="config"):
+        """Alias for :meth:`seg_configs` -- the per-segment CONFIGURE object
+        ``{segment_id: seg_cfg}`` (``seg_cfg.<alg>.<field>``)."""
+        return self.seg_configs(detname, alg=alg)
 
     # -- resource management ----------------------------------------------
     def close(self):
