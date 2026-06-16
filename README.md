@@ -124,6 +124,7 @@ list of paths.
 | [`run.py`](src/psdata/run.py) | public `open()` / `Run` surface | US-005 |
 | [`calib/snapshot.py`](src/psdata/calib/snapshot.py) | **separate** layer: one-time calibration-constant snapshot + pinning | US-006 |
 | [`hdr/`](src/psdata/hdr) | **separate** layer: standalone offline calibrated 2-D HDR image render | US-007 |
+| [`torch.py`](src/psdata/torch.py) | **separate, optional** layer: torch `Dataset` adapter (`XTCDataset`) — random access as `__getitem__`, fork-safe (per-worker fd reopen); torch lazy-imported, `import psdata` stays numpy-only | US-011 |
 
 ## Examples
 
