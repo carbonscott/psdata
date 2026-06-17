@@ -215,8 +215,10 @@ class Run:
 
         Pass ``gate=False`` for the ungated, SMD-independent merge straight over
         the bigdata (the same as the low-level :func:`psdata.events`); it may
-        surface unindexed shutdown-tail events on a truncated run.  If no index
-        can be built (SMD sidecars absent) the gate degrades to ungated.
+        surface unindexed shutdown-tail events on a truncated run.  If the SMD
+        sidecars are absent, ``build_index`` transparently falls back to a
+        bigdata scan, so gating still applies; only a genuine index-build
+        failure degrades to ungated (with a ``RuntimeWarning``).
         """
         merged = _s.events(self.files, run_config=self.config)
         if not gate:
