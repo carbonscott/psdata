@@ -417,11 +417,12 @@ class DetectorInfo:
     def __init__(self, name, det_type, det_id):
         self.name = name
         self.det_type = det_type
-        self.det_id = det_id
+        self.det_id = det_id      # first segment's id (back-compat); see seg_detids
         self.algs = {}            # alg -> {field: FieldInfo}
         self.segments = {}        # alg -> set(segment)
         self.seg_to_stream = {}   # (alg, segment) -> stream
         self.names_id = {}        # (alg, segment) -> (nodeId, namesId)
+        self.seg_detids = {}      # segment -> det_id (serial), alg-independent
 
     # -- discovery-time population -----------------------------------------
     def _add_table(self, alg, table, stream, names_key):
@@ -434,6 +435,10 @@ class DetectorInfo:
         self.segments.setdefault(alg, set()).add(seg)
         self.seg_to_stream[(alg, seg)] = stream
         self.names_id[(alg, seg)] = names_key
+        # A segment's det_id (hardware serial) is alg-independent; record it
+        # once per segment so the composite uniqueid can be reassembled exactly
+        # as psana does (dgrammanager._set_configinfo).
+        self.seg_detids.setdefault(seg, table["det_id"])
 
     # -- convenience views --------------------------------------------------
     @property
@@ -453,6 +458,38 @@ class DetectorInfo:
         """Sorted unique stream indices that carry this (detector, alg)."""
         return sorted({self.seg_to_stream[(alg, s)]
                        for s in self.segments[alg]})
+
+    def uniqueid(self):
+        """Long hardware unique-id string -- byte-identical to psana's
+        ``det.raw._uniqueid`` / ``configinfo.uniqueid`` for any real detector.
+
+        Reproduces psana's composition exactly (dgrammanager.py
+        ``_set_configinfo``): the detector ``det_type`` followed by each
+        segment's ``det_id`` (hardware serial), in ascending segment order,
+        joined by ``'_'``::
+
+            uniqueid = det_type
+            for seg in sorted(segments):
+                uniqueid += '_' + det_id[seg]
+
+        For a multi-segment detector (e.g. an epix10ka quad or a 32-module
+        jungfrau) this is the full composite id used to address calibration
+        constants -- the same string a caller would otherwise pin as a literal.
+
+        Note: psana sources the per-segment serial from the ``config.software``
+        block, which it populates only for detectors with a real software
+        definition.  For every imaging detector that exposes
+        ``det.raw._uniqueid`` (jungfrau, epix10ka, ...) the Names-table serial
+        used here equals psana's software-block serial, so the result is
+        byte-exact.  Bookkeeping/pseudo detectors that psana omits from
+        ``config.software`` (e.g. the timing detector, whose ``_uniqueid`` psana
+        reports as just ``'ts_'``) are not addressable for calibration and are
+        not the intended use of this accessor.
+        """
+        uid = self.det_type
+        for seg in sorted(self.seg_detids):
+            uid += "_" + self.seg_detids[seg]
+        return uid
 
     def __repr__(self):
         parts = []
@@ -492,6 +529,11 @@ class RunConfig:
 
     def detector(self, name):
         return self.detectors[name]
+
+    def uniqueid(self, name):
+        """Long hardware unique-id of detector ``name`` -- byte-identical to
+        psana's ``det.raw._uniqueid`` (see :meth:`DetectorInfo.uniqueid`)."""
+        return self.detectors[name].uniqueid()
 
     def find_detector_by_type(self, det_type):
         """Return the sorted names of detectors whose det_type matches.

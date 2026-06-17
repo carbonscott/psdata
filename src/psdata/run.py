@@ -269,6 +269,21 @@ class Run:
         for the timing detector that carries ``pulseId``)."""
         return self.config.find_detector_by_type(det_type)
 
+    def uniqueid(self, detname):
+        """Long hardware unique-id of ``detname`` -- byte-identical to psana's
+        ``det.raw._uniqueid``.
+
+        Built purely from the Configure Names tables (det_type + each
+        segment's serial, in segment order) -- no event read, no psana.  This
+        is the long composite id used to address a detector's calibration
+        constants, so callers (e.g. a web-DB constant fetch) can derive it
+        from the data instead of pinning it as a literal::
+
+            uid = run.uniqueid("jungfrau")
+            cons = webdb.get_constants(uid, exp=..., run=...)
+        """
+        return self.config.uniqueid(detname)
+
     # -- CONFIGURE-block accessor -----------------------------------------
     def seg_configs(self, detname, alg="config"):
         """Per-segment CONFIGURE-block object for ``detname``.
