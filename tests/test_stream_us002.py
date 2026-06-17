@@ -221,6 +221,44 @@ def test_byte_exact_first_20_vs_psana():
           f"{sorted(raw_dets)} all byte-identical to psana (np.array_equal)")
 
 
+# --------------------------------------------------------------------------
+# 6. regression (stress campaign 2026-06): forward streaming is gated to the
+#    SMD/psana event set.  On a run with a ragged DAQ-shutdown tail, some bigdata
+#    streams carry trailing L1Accepts the SMD writer never indexed; the ungated
+#    k-way merge surfaces them, so r.events() would yield MORE events than the
+#    index and psana.  mfx100848724/r51 exercises this exactly: 17982 ungated vs
+#    17872 indexed.  Run.events() now filters the merge to the indexed
+#    timestamps.  SLOW (one full forward pass over a 10-stream Jungfrau run);
+#    set PSDATA_SKIP_SLOW=1 to skip.
+# --------------------------------------------------------------------------
+def test_forward_gated_to_index_event_set():
+    if os.environ.get("PSDATA_SKIP_SLOW"):
+        print("SKIP gated-forward regression (PSDATA_SKIP_SLOW set)")
+        return
+    import psdata
+    r = psdata.open(exp=EXP, run=RUN, dir=DIR)
+    valid = set(r.build_index().timestamps)
+    nidx = len(valid)
+    n = 0
+    last = None
+    for evt in r.events():                       # default gate=True
+        assert evt.timestamp in valid, (
+            f"gated forward yielded unindexed ts {evt.timestamp} -- a "
+            "shutdown-tail straggler leaked past the gate")
+        if last is not None:
+            assert evt.timestamp > last, "gated forward not strictly ascending"
+        last = evt.timestamp
+        n += 1
+    # If the gate were removed, Run.events() would yield the raw bigdata count
+    # (17982 on this run) instead of the indexed 17872 -- so this single equality
+    # decisively catches a gate regression without a second (slow) ungated pass.
+    assert n == nidx, (
+        f"gated forward yielded {n} events but the SMD index has {nidx} -- "
+        "Run.events() is no longer gated to the SMD/psana event set")
+    print(f"gated forward == index event set ({n} events); "
+          "shutdown-tail stragglers excluded")
+
+
 def main():
     print("=" * 72)
     print("US-002 acceptance: psdata.stream multi-stream event assembly")
@@ -233,6 +271,8 @@ def main():
     print("[ok] missing-segment -> detector None")
     test_byte_exact_first_20_vs_psana()
     print("[ok] byte-exact vs psana (ts + pulseId + raw, first 20)")
+    test_forward_gated_to_index_event_set()
+    print("[ok] forward streaming gated to SMD/psana event set")
     print("\nALL US-002 ACCEPTANCE CHECKS PASSED")
 
 

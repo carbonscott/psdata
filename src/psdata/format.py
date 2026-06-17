@@ -316,6 +316,15 @@ def read_config_object(run_config, det_name, alg="config", fields=None):
     ------
     KeyError
         If ``det_name`` is unknown or has no ``alg`` algorithm.
+
+    Notes
+    -----
+    Scope is the most recent config declared at/before the first L1Accept (the
+    front transitions, last-wins).  A config re-emitted on a transition that
+    occurs AFTER events have begun (a mid-run reconfigure) is out of scope and
+    NOT reflected -- unlike psana's stateful ``_seg_configs()``.  This matches
+    the common case: config is set at Configure/BeginStep and constants are
+    per-run keyed.
     """
     det = run_config.detector(det_name)
     if alg not in det.algs:
@@ -323,37 +332,71 @@ def read_config_object(run_config, det_name, alg="config", fields=None):
                        f"(have {det.alg_names()})")
     want_fields = list(det.field_names(alg) if fields is None else fields)
 
-    # Group the segments we need by the stream whose Configure carries them, so
-    # each stream's Configure front is read with a single pread.
-    by_stream = {}                              # stream -> {names_key: segment}
-    for seg in det.segment_ids(alg):
-        stream = det.seg_to_stream[(alg, seg)]
-        names_key = det.names_id[(alg, seg)]
-        by_stream.setdefault(stream, {})[names_key] = seg
+    # A segment's config can be declared under MORE THAN ONE Names id: the DAQ
+    # may re-emit it on a later transition with a fresh namesId.  E.g.
+    # uedcom103/r7 declares epixquad seg 0's config under (2,1) -- data in the
+    # Configure dgram, trbit=[0,0,0,0] -- AND under (2,21) -- different data on
+    # BeginStep, trbit=[1,1,1,1].  The config that is ACTIVE for the run's
+    # L1Accept events (and that psana's det.raw.calib uses, and that
+    # det.raw._seg_configs() reports once the DataSource has advanced past the
+    # transitions) is the MOST RECENT one before the first L1Accept -- here the
+    # BeginStep override, not the Configure default.  So map every config Names
+    # id -> its segment and walk ALL the front transition dgrams, letting a later
+    # transition's value overwrite an earlier one (last-wins == active config).
+    # (psana's _seg_configs() is stateful: read before iterating it returns the
+    # Configure default; we expose the active config so the gain decode is
+    # byte-exact vs psana's per-event calib.)
+    streams_needed = sorted({det.seg_to_stream[(alg, seg)]
+                             for seg in det.segment_ids(alg)})
 
     out = {}
-    for stream, key_to_seg in by_stream.items():
+    for stream in streams_needed:
         path = run_config.stream_files[stream]
         tables = run_config.raw_tables[stream]
-        _cfg, cfg_end = run_config.stream_configs[stream]
+        nkey_to_seg = {nkey: tbl["segment"]
+                       for nkey, tbl in tables.items()
+                       if tbl["det_name"] == det_name and tbl["alg_name"] == alg}
         fd = os.open(path, os.O_RDONLY)
         try:
-            # The Configure dgram spans [0, cfg_end); read exactly that front.
-            buf = bytearray(os.pread(fd, cfg_end, 0))
+            # The config ShapesData may ride on the Configure dgram OR a later
+            # transition (BeginRun / BeginStep / Enable / SlowUpdate).  Walk the
+            # front transition dgrams in order up to the first L1Accept (config
+            # never lives on an event dgram), overwriting each segment so the
+            # last (active) value wins.  Grow the read window on demand for a
+            # transition dgram that runs past it.
+            buf = bytearray(os.pread(fd, _CONFIG_READ, 0))
+            off = 0
+            while True:
+                if off + DGRAM_HDR > len(buf):
+                    grown = bytearray(os.pread(fd, len(buf) + _CONFIG_READ, 0))
+                    if len(grown) == len(buf):
+                        break                   # EOF: no more dgrams
+                    buf = grown
+                    continue
+                hdr = parse_dgram_header(buf, off)
+                if hdr["service"] in (SERVICE_L1ACCEPT, SERVICE_L1ACCEPT_EOB):
+                    break                       # reached event data
+                dg_size = XTC_HDR + hdr["extent"]
+                if off + dg_size > len(buf):
+                    grown = bytearray(os.pread(fd, off + dg_size, 0))
+                    if len(grown) < off + dg_size:
+                        break                   # truncated / EOF
+                    buf = grown
+                for xoff, xh in iter_shapesdata(buf, off, hdr):
+                    nkey = namesid_of(xh["src"])
+                    seg = nkey_to_seg.get(nkey)
+                    if seg is None:
+                        continue                # not this detector's config
+                    table = tables[nkey]
+                    seg_fields = {}
+                    for fld in want_fields:
+                        arr, _shape, _meta = extract_field(buf, xoff, xh,
+                                                           table, fld)
+                        seg_fields[fld] = arr
+                    out[seg] = seg_fields        # last-wins: active config
+                off += dg_size
         finally:
             os.close(fd)
-        cfg_hdr = parse_dgram_header(buf, 0)
-        for xoff, xh in iter_shapesdata(buf, 0, cfg_hdr):
-            names_key = namesid_of(xh["src"])
-            seg = key_to_seg.get(names_key)
-            if seg is None:
-                continue
-            table = tables[names_key]
-            seg_fields = {}
-            for fld in want_fields:
-                arr, _shape, _meta = extract_field(buf, xoff, xh, table, fld)
-                seg_fields[fld] = arr
-            out[seg] = seg_fields
     return {seg: out[seg] for seg in sorted(out)}
 
 
@@ -417,11 +460,12 @@ class DetectorInfo:
     def __init__(self, name, det_type, det_id):
         self.name = name
         self.det_type = det_type
-        self.det_id = det_id
+        self.det_id = det_id      # first segment's id (back-compat); see seg_detids
         self.algs = {}            # alg -> {field: FieldInfo}
         self.segments = {}        # alg -> set(segment)
         self.seg_to_stream = {}   # (alg, segment) -> stream
         self.names_id = {}        # (alg, segment) -> (nodeId, namesId)
+        self.seg_detids = {}      # segment -> det_id (serial), alg-independent
 
     # -- discovery-time population -----------------------------------------
     def _add_table(self, alg, table, stream, names_key):
@@ -434,6 +478,10 @@ class DetectorInfo:
         self.segments.setdefault(alg, set()).add(seg)
         self.seg_to_stream[(alg, seg)] = stream
         self.names_id[(alg, seg)] = names_key
+        # A segment's det_id (hardware serial) is alg-independent; record it
+        # once per segment so the composite uniqueid can be reassembled exactly
+        # as psana does (dgrammanager._set_configinfo).
+        self.seg_detids.setdefault(seg, table["det_id"])
 
     # -- convenience views --------------------------------------------------
     @property
@@ -453,6 +501,38 @@ class DetectorInfo:
         """Sorted unique stream indices that carry this (detector, alg)."""
         return sorted({self.seg_to_stream[(alg, s)]
                        for s in self.segments[alg]})
+
+    def uniqueid(self):
+        """Long hardware unique-id string -- byte-identical to psana's
+        ``det.raw._uniqueid`` / ``configinfo.uniqueid`` for any real detector.
+
+        Reproduces psana's composition exactly (dgrammanager.py
+        ``_set_configinfo``): the detector ``det_type`` followed by each
+        segment's ``det_id`` (hardware serial), in ascending segment order,
+        joined by ``'_'``::
+
+            uniqueid = det_type
+            for seg in sorted(segments):
+                uniqueid += '_' + det_id[seg]
+
+        For a multi-segment detector (e.g. an epix10ka quad or a 32-module
+        jungfrau) this is the full composite id used to address calibration
+        constants -- the same string a caller would otherwise pin as a literal.
+
+        Note: psana sources the per-segment serial from the ``config.software``
+        block, which it populates only for detectors with a real software
+        definition.  For every imaging detector that exposes
+        ``det.raw._uniqueid`` (jungfrau, epix10ka, ...) the Names-table serial
+        used here equals psana's software-block serial, so the result is
+        byte-exact.  Bookkeeping/pseudo detectors that psana omits from
+        ``config.software`` (e.g. the timing detector, whose ``_uniqueid`` psana
+        reports as just ``'ts_'``) are not addressable for calibration and are
+        not the intended use of this accessor.
+        """
+        uid = self.det_type
+        for seg in sorted(self.seg_detids):
+            uid += "_" + self.seg_detids[seg]
+        return uid
 
     def __repr__(self):
         parts = []
@@ -492,6 +572,11 @@ class RunConfig:
 
     def detector(self, name):
         return self.detectors[name]
+
+    def uniqueid(self, name):
+        """Long hardware unique-id of detector ``name`` -- byte-identical to
+        psana's ``det.raw._uniqueid`` (see :meth:`DetectorInfo.uniqueid`)."""
+        return self.detectors[name].uniqueid()
 
     def find_detector_by_type(self, det_type):
         """Return the sorted names of detectors whose det_type matches.

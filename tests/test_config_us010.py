@@ -59,6 +59,21 @@ JF_DIR = "/sdf/data/lcls/ds/prj/public01/xtc"
 JF_DET = "jungfrau"
 JF_NSEG = 32
 
+# Regression dataset (stress campaign 2026-06): an epixquad run whose config is
+# OVERRIDDEN on a later transition.  The config-alg ShapesData has two emissions
+# in the stream front -- a Configure default (trbit=[0,0,0,0]) and a BeginStep
+# override (trbit=[1,1,1,1], service=6) under a different namesId.  Before the
+# fix, read_config_object scanned only the Configure dgram and returned {} here
+# (the override's namesId has no data there) -> seg_configs empty -> the epix10ka
+# gain decode crashed (np.stack of an empty list).  It now walks the front
+# transition dgrams last-wins, exposing the ACTIVE (BeginStep) config that
+# psana's per-event calib uses.
+EPIX_BS_EXP = "uedcom103"
+EPIX_BS_RUN = 7
+EPIX_BS_DIR = "/sdf/data/lcls/ds/prj/public01/xtc"
+EPIX_BS_DET = "epixquad"
+EPIX_BS_SEGS = [0, 1, 2, 3]
+
 
 def _have_psana():
     try:
@@ -179,6 +194,68 @@ def test_epix_seg_configs_byte_exact():
     assert np.array_equal(np.asarray(scfg2[0].config.trbit),
                           np.asarray(scfg[0].config.trbit))
     print("epix10ka byte-exact gate PASS (all 4 segments)")
+
+
+# --------------------------------------------------------------------------
+# 1b. regression: config-alg ShapesData that rides on a LATER transition
+#     (BeginStep) must still be read byte-exact -- guards read_config_object's
+#     transition-dgram scan (uedcom103/r7 returned {} before the fix).
+# --------------------------------------------------------------------------
+def test_epix_seg_configs_config_on_later_transition_byte_exact():
+    """epixquad whose config is OVERRIDDEN on a later transition (BeginStep) is
+    read byte-exact vs psana's ACTIVE config.
+
+    Two coupled bugs this guards:
+      * Before the transition-dgram scan, read_config_object only looked in the
+        Configure dgram, so seg_configs returned {} for this run (the config's
+        ShapesData rides on BeginStep) -> epix10ka calib crashed downstream.
+      * The config here exists in TWO emissions: a Configure default
+        (trbit=[0,0,0,0]) and a BeginStep override (trbit=[1,1,1,1]).  psana's
+        det.raw.calib uses the ACTIVE (override) config, and _seg_configs()
+        reports it once the DataSource has advanced past the transitions.  So
+        psdata must expose the last-wins/active config, not the Configure
+        default -- otherwise the gain decode diverges from psana's calib.
+    """
+    if not _have_psana():
+        print("SKIP later-transition regression: psana not importable "
+              "(source psconda.sh)")
+        return
+
+    # psdata accessor (numpy only) -- the bug made this return {}.
+    r = _open(EPIX_BS_EXP, EPIX_BS_RUN, EPIX_BS_DIR)
+    scfg = r.seg_configs(EPIX_BS_DET)
+    assert sorted(scfg) == EPIX_BS_SEGS, (
+        f"config-on-later-transition regression: segments {sorted(scfg)} != "
+        f"{EPIX_BS_SEGS} -- read_config_object missed the BeginStep dgram")
+
+    # psana ground truth in the ACTIVE state.  _seg_configs() is stateful: read
+    # before iterating it returns the Configure default; advancing to the first
+    # event (the state in which det.raw.calib runs) exposes the BeginStep
+    # override that psdata's last-wins read also returns.
+    from psana import DataSource
+    ds = DataSource(exp=EPIX_BS_EXP, run=EPIX_BS_RUN, dir=EPIX_BS_DIR)
+    prun = next(ds.runs())
+    det = prun.Detector(EPIX_BS_DET)
+    pre_apc = int(np.asarray(det.raw._seg_configs()[0].config.asicPixelConfig).sum())
+    evt = next(prun.events())
+    _ = det.raw.calib(evt)              # advance config to the event-active state
+    psana_sc = det.raw._seg_configs()
+    post_apc = int(np.asarray(psana_sc[0].config.asicPixelConfig).sum())
+    assert pre_apc != post_apc, (
+        "this run no longer exercises a BeginStep config override "
+        f"(pre==post asicPixelConfig sum={pre_apc}); regression is toothless")
+    assert sorted(psana_sc) == EPIX_BS_SEGS, f"psana segs {sorted(psana_sc)}"
+
+    for seg in EPIX_BS_SEGS:
+        cob = psana_sc[seg].config
+        my_trbit = np.asarray(scfg[seg].config.trbit)
+        my_apc = np.asarray(scfg[seg].config.asicPixelConfig)
+        assert np.array_equal(my_trbit, np.asarray(cob.trbit)), \
+            f"seg {seg} trbit differs from psana active config"
+        assert np.array_equal(my_apc, np.asarray(cob.asicPixelConfig)), \
+            f"seg {seg} asicPixelConfig differs from psana active config"
+    print("epix10ka config-on-later-transition (active config) byte-exact "
+          "regression PASS (all 4 segments)")
 
 
 # --------------------------------------------------------------------------

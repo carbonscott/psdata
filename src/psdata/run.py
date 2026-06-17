@@ -197,12 +197,49 @@ class Run:
         self._index = None                     # lazily built RunIndex
 
     # -- streaming ---------------------------------------------------------
-    def events(self):
+    def events(self, gate=True):
         """Yield assembled :class:`~psdata.stream.Event` objects in ascending
         timestamp order (forward streaming).  Each event exposes ``timestamp``,
         ``pulseId``, and lazy raw detector arrays (``evt.stack(name)`` /
-        ``evt.raw(name)`` / ``evt.as_dict()``)."""
-        return _s.events(self.files, run_config=self.config)
+        ``evt.raw(name)`` / ``evt.as_dict()``).
+
+        By default the event set is **gated to the SMD-defined index**, so
+        forward streaming yields exactly the events psana and
+        :meth:`read_event_at` do.  Why: on a run with a ragged DAQ-shutdown tail,
+        some bigdata streams carry trailing L1Accepts the SMD writer never
+        indexed (it stopped first); the raw k-way merge over the bigdata would
+        surface those extras, making ``events()`` disagree with the index and
+        with psana (observed: jungfrau mfx100848724/r51 -> 17982 raw vs 17872
+        indexed).  Gating filters the merge to the indexed timestamps so the
+        forward, random-access, and psana event sets coincide.
+
+        Pass ``gate=False`` for the ungated, SMD-independent merge straight over
+        the bigdata (the same as the low-level :func:`psdata.events`); it may
+        surface unindexed shutdown-tail events on a truncated run.  If the SMD
+        sidecars are absent, ``build_index`` transparently falls back to a
+        bigdata scan, so gating still applies; only a genuine index-build
+        failure degrades to ungated (with a ``RuntimeWarning``).
+        """
+        merged = _s.events(self.files, run_config=self.config)
+        if not gate:
+            return merged
+        try:
+            valid = frozenset(self.build_index().timestamps)
+        except Exception as exc:
+            # build_index(source="auto") already falls back to a bigdata scan
+            # when the SMD sidecars are absent, so a *legitimate* SMD-absence
+            # does NOT land here -- anything caught here is a real index-build
+            # failure.  Preserve the ungated degrade (don't break iteration),
+            # but warn so the failure is surfaced rather than silently masked.
+            import warnings
+            warnings.warn(
+                f"Run.events(): could not build the SMD index "
+                f"({type(exc).__name__}: {exc}); degrading to the ungated "
+                f"bigdata merge, which may surface unindexed shutdown-tail "
+                f"events. Pass gate=False to silence, or fix the index build.",
+                RuntimeWarning, stacklevel=2)
+            return merged
+        return (evt for evt in merged if evt.timestamp in valid)
 
     # -- random access -----------------------------------------------------
     def build_index(self, rebuild=False, source="auto"):
@@ -268,6 +305,21 @@ class Run:
         """Sorted names of detectors whose ``det_type`` matches (e.g. ``'ts'``
         for the timing detector that carries ``pulseId``)."""
         return self.config.find_detector_by_type(det_type)
+
+    def uniqueid(self, detname):
+        """Long hardware unique-id of ``detname`` -- byte-identical to psana's
+        ``det.raw._uniqueid``.
+
+        Built purely from the Configure Names tables (det_type + each
+        segment's serial, in segment order) -- no event read, no psana.  This
+        is the long composite id used to address a detector's calibration
+        constants, so callers (e.g. a web-DB constant fetch) can derive it
+        from the data instead of pinning it as a literal::
+
+            uid = run.uniqueid("jungfrau")
+            cons = webdb.get_constants(uid, exp=..., run=...)
+        """
+        return self.config.uniqueid(detname)
 
     # -- CONFIGURE-block accessor -----------------------------------------
     def seg_configs(self, detname, alg="config"):
