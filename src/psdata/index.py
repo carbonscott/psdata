@@ -44,6 +44,20 @@ entry records not just ``(offset, size)`` but the **bigdata chunk path** the
 offset indexes, so :meth:`RunIndex.read_event` ``os.pread`` reads the correct
 chunk file -- byte-identical to psana across the boundary.
 
+Building the index WITHOUT SMD
+------------------------------
+The SMD sidecars are only an *index artifact*: every ``(intOffset,
+intDgramSize)`` they record is just the running byte cursor and on-disk size of
+the matching bigdata dgram (the DAQ/`smdwriter` write them in lockstep with the
+bigdata).  So they are not *required* -- :meth:`RunIndex.build_from_bigdata`
+rebuilds the identical index by walking the bigdata dgram **headers** directly
+(reading each 24-byte header and seeking past the GB-scale payloads), the
+``smdwriter`` algorithm in pure Python.  An index built this way is
+byte-identical to one built from SMD, so :func:`build_index` defaults to
+``source="auto"``: it uses the SMD sidecars as a fast cache *when present*, and
+falls back to the bigdata scan when they are absent -- the random-access
+capability never *depends* on an artifact owned by the psana/xtcdata toolchain.
+
 Like the rest of ``psdata``, this module imports **no** psana / mpi4py / h5py
 -- only the standard library and numpy.
 """
@@ -51,6 +65,7 @@ Like the rest of ``psdata``, this module imports **no** psana / mpi4py / h5py
 import bisect
 import os
 import pickle
+import re
 import time
 
 import numpy as np
@@ -173,6 +188,8 @@ class RunIndex:
         self.build_seconds = 0.0
         self.smd_bytes_read = 0
         self.multichunk_streams = set()
+        self.scan_source = "smd"      # "smd" (sidecar cache) | "bigdata" (no SMD)
+        self.scan_bytes_read = 0      # bytes the index scan read (smd OR bigdata)
         # private: open bigdata fds, lazily, cached per chunk path
         self._bd_fds = {}
         self._ts_to_k = None          # built lazily for read_event(ts)
@@ -214,6 +231,50 @@ class RunIndex:
                 smd_path, bd_c000, smd_read_chunk)
             per_stream[stream] = recs
             idx.smd_bytes_read += nbytes
+            idx.chunk_files[stream] = chunks
+            if len(chunks) > 1:
+                idx.multichunk_streams.add(stream)
+
+        idx._merge_streams(per_stream)
+        idx.build_seconds = time.monotonic() - t0
+        idx.scan_source = "smd"
+        idx.scan_bytes_read = idx.smd_bytes_read
+        return idx
+
+    @classmethod
+    def build_from_bigdata(cls, run_config):
+        """Build a :class:`RunIndex` WITHOUT any SMD file, by walking the
+        bigdata chunk files' dgram headers directly.
+
+        This is the offline ``smdwriter`` algorithm reimplemented in psdata's
+        own pure-Python parser: for each stream, walk its bigdata chunk files
+        (``c000``, ``c001``, ...) from offset 0, record the running byte cursor
+        at every ``L1Accept`` (the same ``intOffset`` the SMD file would store)
+        and its on-disk size ``XTC_HDR + extent`` (the same ``intDgramSize``),
+        advancing the cursor across every dgram (transitions included).  The
+        resulting index is byte-for-byte identical to one :meth:`build` produces
+        from the SMD sidecars -- but needs no ``.smd.xtc2`` artifact, so the run
+        can be randomly accessed from the bigdata files alone.
+
+        Only each dgram's 24-byte header is read; the (GB-scale) payloads are
+        seeked past, so the cost is one ``pread`` per dgram (~thousands per
+        stream for large-dgram detectors), not the file size.  Persist the built
+        index with :meth:`save` so this one-time scan is never repeated.
+
+        The returned index sets ``scan_source = "bigdata"`` and
+        ``smd_bytes_read = 0`` (no SMD I/O); ``scan_bytes_read`` is the total of
+        the 24-byte headers walked.
+        """
+        idx = cls(run_config)
+        idx.scan_source = "bigdata"
+        t0 = time.monotonic()
+        # per-stream ordered lists of (ts, chunk_path, offset, size)
+        per_stream = {}
+        for stream, bd_c000 in _f._normalize_stream_files(
+                run_config.stream_files):
+            recs, nbytes, chunks = _scan_bigdata_stream(bd_c000)
+            per_stream[stream] = recs
+            idx.scan_bytes_read += nbytes
             idx.chunk_files[stream] = chunks
             if len(chunks) > 1:
                 idx.multichunk_streams.add(stream)
@@ -498,8 +559,9 @@ class RunIndex:
     def __repr__(self):
         return (f"RunIndex(n_events={self.n_events}, "
                 f"streams={sorted(self.bd_files)}, "
+                f"source={self.scan_source!r}, "
                 f"build_seconds={self.build_seconds:.3f}, "
-                f"smd_MB={self.smd_bytes_read / 1e6:.1f})")
+                f"scan_MB={self.scan_bytes_read / 1e6:.1f})")
 
     # -- serialization & disk persistence (US-008) ------------------------
     #
@@ -532,7 +594,17 @@ class RunIndex:
         "run_config",
         "build_seconds",
         "smd_bytes_read",
+        "scan_source",
+        "scan_bytes_read",
     )
+
+    # Defaults for fields absent from an older persisted blob (back-compat:
+    # indexes pickled before the bigdata-scan source existed have no
+    # ``scan_source``/``scan_bytes_read`` -- treat them as SMD-built).
+    _PERSIST_DEFAULTS = {
+        "scan_source": "smd",
+        "scan_bytes_read": 0,
+    }
 
     def _persist_state(self):
         """Return the picklable state dict -- the single source of truth for
@@ -544,7 +616,13 @@ class RunIndex:
         """Populate ``self`` from a ``_persist_state`` dict and re-init the
         per-process caches empty so fds reopen lazily on the first read."""
         for name in self._PERSIST_FIELDS:
-            setattr(self, name, state[name])
+            if name in state:
+                setattr(self, name, state[name])
+            else:
+                setattr(self, name, self._PERSIST_DEFAULTS[name])
+        # back-fill: an SMD-built old blob's scan_bytes_read == its smd bytes
+        if "scan_bytes_read" not in state:
+            self.scan_bytes_read = self.smd_bytes_read
         self._bd_fds = {}        # MUST be a fresh empty cache -- never the
         self._ts_to_k = None     # serialized one (would carry stale fds)
         return self
@@ -701,6 +779,85 @@ def _read_chunkinfo(buf, dg_off, dg_hdr, tables):
 
 
 # ==========================================================================
+# Bigdata scan: rebuild one stream's records from the bigdata files alone
+# (the smdwriter algorithm in pure Python -- no SMD artifact needed)
+# ==========================================================================
+def _enumerate_bd_chunks(bd_c000_path):
+    """Ordered bigdata chunk files for a stream, from its ``c000`` path, by the
+    ``-c000``/``-c001``/... filename convention (stops at the first missing
+    chunk id).  A single-chunk stream returns ``[c000]``.
+
+    Enumerating by the on-disk filename convention -- rather than following the
+    ``chunkinfo`` carried on each Enable (the SMD path's mechanism) -- keeps the
+    bigdata scan self-contained: it needs only the bigdata files themselves, no
+    chunkinfo and no SMD.  The chunk filenames ``chunkinfo`` would name are
+    exactly these ``-c00N`` siblings in the same directory, so the set walked is
+    identical to the one the SMD-following path rolls through.
+    """
+    d = os.path.dirname(bd_c000_path)
+    base = os.path.basename(bd_c000_path)
+    m = re.search(r"-c(\d+)\.xtc2$", base)
+    if not m:
+        return [bd_c000_path]
+    prefix = base[:m.start()]            # '<exp>-rNNNN-sMMM'
+    width = len(m.group(1))              # zero-pad width (3 -> c000)
+    chunks = []
+    cid = 0
+    while True:
+        cand = os.path.join(d, f"{prefix}-c{cid:0{width}d}.xtc2")
+        if not os.path.exists(cand):
+            break
+        chunks.append(cand)
+        cid += 1
+    return chunks if chunks else [bd_c000_path]
+
+
+def _scan_bigdata_stream(bd_c000_path):
+    """Build one stream's L1Accept ``(ts, chunk_path, intOffset, intDgramSize)``
+    records by walking the BIGDATA chunk files directly -- no SMD file needed.
+
+    The ``smdwriter`` algorithm in pure Python: within each chunk file the dgram
+    offsets restart at 0, so walk from 0 reading each dgram's 24-byte header,
+    record the running cursor at every ``L1Accept`` (which equals the SMD's
+    ``intOffset``) and its on-disk size ``XTC_HDR + extent`` (the SMD's
+    ``intDgramSize``), and advance the cursor by that size across EVERY dgram
+    -- Configure / BeginRun / Enable / SlowUpdate included, because they occupy
+    bigdata space and shift every later offset.  Payloads are seeked past
+    (only the header is ``pread``), so the cost is one ``pread`` per dgram, not
+    the file size.
+
+    Returns ``(records, bytes_read, chunk_paths)`` in the SAME shape as
+    :func:`_scan_smd_stream`, so :meth:`RunIndex.build_from_bigdata` and
+    :meth:`RunIndex.build` feed :meth:`RunIndex._merge_streams` identically and
+    produce byte-for-byte identical indexes.
+    """
+    records = []
+    chunk_paths = []
+    bytes_read = 0
+    for chunk_path in _enumerate_bd_chunks(bd_c000_path):
+        chunk_paths.append(chunk_path)
+        fd = os.open(chunk_path, os.O_RDONLY)
+        try:
+            filesize = os.fstat(fd).st_size
+            cursor = 0
+            while cursor + _f.DGRAM_HDR <= filesize:
+                hdr = os.pread(fd, _f.DGRAM_HDR, cursor)
+                bytes_read += len(hdr)
+                if len(hdr) < _f.DGRAM_HDR:
+                    break                       # truncated tail -> clean stop
+                h = _f.parse_dgram_header(hdr, 0)
+                total = _f.XTC_HDR + h["extent"]
+                if cursor + total > filesize:
+                    break                       # truncated final dgram
+                if h["service"] == _f.SERVICE_L1ACCEPT:
+                    records.append((h["ts"], chunk_path, cursor, total))
+                cursor += total
+        finally:
+            os.close(fd)
+    return records, bytes_read, chunk_paths
+
+
+# ==========================================================================
 # Convenience: discover SMD files & build the index from a run directory
 # ==========================================================================
 def smd_files_for(stream_files):
@@ -724,7 +881,7 @@ def smd_files_for(stream_files):
     return out
 
 
-def build_index(stream_files, run_config=None, smd_files=None):
+def build_index(stream_files, run_config=None, smd_files=None, source="auto"):
     """Build a :class:`RunIndex` for a run.
 
     Parameters
@@ -735,7 +892,19 @@ def build_index(stream_files, run_config=None, smd_files=None):
         Pre-discovered config for ``stream_files``; discovered here if omitted.
     smd_files : optional
         Explicit SMD-file mapping.  If omitted, resolved from ``stream_files``
-        via :func:`smd_files_for` (the standard ``smalldata/`` layout).
+        via :func:`smd_files_for` (the standard ``smalldata/`` layout).  Ignored
+        when ``source="bigdata"``.
+    source : {"auto", "smd", "bigdata"}
+        Where the random-access index comes from:
+
+        * ``"smd"``     -- scan the small ``.smd.xtc2`` sidecars
+          (:meth:`RunIndex.build`).  Fast, but requires the SMD artifact;
+          raises if a sidecar is missing.
+        * ``"bigdata"`` -- scan the bigdata dgram headers directly
+          (:meth:`RunIndex.build_from_bigdata`), needing NO SMD artifact.
+        * ``"auto"`` (default) -- use the SMD sidecars when *all* are present
+          (fast path), else fall back to the bigdata scan.  This keeps the fast
+          path when SMD exists while removing the hard *dependency* on it.
 
     Returns
     -------
@@ -743,9 +912,21 @@ def build_index(stream_files, run_config=None, smd_files=None):
     """
     if run_config is None:
         run_config = _f.discover(stream_files)
+    if source == "bigdata":
+        return RunIndex.build_from_bigdata(run_config)
+    if source not in ("auto", "smd"):
+        raise ValueError(
+            f"source must be 'auto', 'smd', or 'bigdata' (got {source!r})")
     if smd_files is None:
         smd_files = smd_files_for(stream_files)
-    return RunIndex.build(smd_files, run_config)
+    if source == "smd":
+        return RunIndex.build(smd_files, run_config)
+    # source == "auto": SMD fast path iff every sidecar is present on disk,
+    # else build the identical index from the bigdata files alone.
+    items = _f._normalize_stream_files(smd_files)
+    if items and all(os.path.exists(p) for _stream, p in items):
+        return RunIndex.build(smd_files, run_config)
+    return RunIndex.build_from_bigdata(run_config)
 
 
 # ==========================================================================
