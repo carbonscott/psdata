@@ -114,6 +114,13 @@ evt  = ridx.read_event(ts)
 `stream_files` accepts a `{index: path}` dict, `(index, path)` pairs, or a plain
 list of paths.
 
+`build_index(..., source="auto")` (the default) scans the small SMD sidecars
+when all are present, else falls back to scanning the bigdata dgram headers
+directly — so the index has **no hard dependency** on the SMD artifact. Force
+either path with `source="smd"` or `source="bigdata"`; the resulting index is
+identical. This fallback is cross-checked by
+[`tests/test_bigdata_scan_us012.py`](tests/test_bigdata_scan_us012.py).
+
 ## Modules
 
 | module | layer | story |
@@ -122,9 +129,10 @@ list of paths.
 | [`stream.py`](src/psdata/stream.py) | multi-stream event assembly (exact 64-bit-ts k-way merge) | US-002 |
 | [`index.py`](src/psdata/index.py) | random-access-by-event index (scans SMD only) + multi-chunk roll; serializable / disk-persisted (`save`/`load`, `to_dict`/`from_dict`) + batch read (`read_events`/`read_stack`) | US-003 / US-004 / US-008 / US-009 |
 | [`run.py`](src/psdata/run.py) | public `open()` / `Run` surface | US-005 |
-| [`calib/snapshot.py`](src/psdata/calib/snapshot.py) | **separate** layer: one-time calibration-constant snapshot + pinning | US-006 |
-| [`hdr/`](src/psdata/hdr) | **separate** layer: standalone offline calibrated 2-D HDR image render | US-007 |
 | [`torch.py`](src/psdata/torch.py) | **separate, optional** layer: torch `Dataset` adapter (`XTCDataset`) — random access as `__getitem__`, fork-safe (per-worker fd reopen); torch lazy-imported, `import psdata` stays numpy-only | US-011 |
+
+Calibration / geometry is **not** part of this reader; it lives in the sibling
+[`pscalib`](../pscalib) package — see [Calibration lives in `pscalib`](#calibration-lives-in-pscalib).
 
 ## Examples
 
@@ -165,13 +173,10 @@ returns `(calib, image)`, numpy-only and byte-exact vs psana).
 Work runs on host **`sdfiana025`**. The reader itself needs **only numpy** — no
 psana, no special environment; a plain `uv pip install -e .` is enough.
 
-The acceptance tests that cross-check against psana
-([`tests/test_regression_us005.py`](tests/test_regression_us005.py) and the
-optional [`tests/test_calib_us006.py`](tests/test_calib_us006.py) /
-[`tests/test_hdr_us007.py`](tests/test_hdr_us007.py)) are the *only* parts that
-need a working **psana**, which they use purely to generate ground truth to
-compare against (and, for US-006/US-007, to take the one-time snapshot + derive
-the geometry index maps).
+The acceptance test that cross-checks against psana
+([`tests/test_regression_us005.py`](tests/test_regression_us005.py)) is the
+*only* part that needs a working **psana**, which it uses purely to generate
+ground truth (byte-exact raw frames) to compare against.
 
 **psana is the SLAC production conda build, not a pip/uv package** — so this
 project intentionally has no `[psana]` extra. Source it from the production
@@ -181,8 +186,6 @@ install, which enters via `PYTHONPATH` (prepend, never replace):
 source /sdf/group/lcls/ds/ana/sw/conda2/manage/bin/psconda.sh
 bash run_tests.sh                                   # full acceptance suite
 bash run_tests.sh tests/test_regression_us005.py    # just US-005 (byte-exact)
-bash run_tests.sh tests/test_calib_us006.py         # calib snapshot
-bash run_tests.sh tests/test_hdr_us007.py           # offline HDR render
 ```
 
 `run_tests.sh` prepends this project's `src/` dir to `PYTHONPATH` so

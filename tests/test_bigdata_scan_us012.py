@@ -26,6 +26,7 @@ streams (tens-to-hundreds of GB) are validated at scale outside the suite.
 """
 import os
 import sys
+import tempfile
 
 import numpy as np
 
@@ -36,6 +37,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 import psdata
+import psdata.format  # noqa: F401  (DGRAM_HDR / parse_dgram_header for the oracle)
 import psdata.index as _ix
 
 # Reference dataset -- single-chunk run; SMALL streams only, for a fast scan.
@@ -70,7 +72,6 @@ def test_bigdata_index_byte_exact_against_smd():
     # on THIS run the small streams have no smdwriter tail gap -> exact match.
     assert idx_smd.timestamps == idx_bd.timestamps, \
         "expected exact equality on the small streams of run 51"
-    return len(idx_smd.timestamps)
 
 
 _BOOKKEEPING = {"smdinfo", "chunkinfo", "runinfo", "epicsinfo"}
@@ -155,6 +156,144 @@ def test_build_index_source_routing():
         raise AssertionError("invalid source must raise ValueError")
 
 
+def test_build_index_auto_partial_sidecar():
+    """``source="auto"`` must fall back to the bigdata scan when even ONE
+    sidecar is missing -- not just when all are absent.  The routing test
+    above covers the all-present (SMD) and all-bogus (fallback) extremes; this
+    pins the in-between case: the real sidecars resolved by
+    :func:`psdata.index.smd_files_for`, with exactly one entry swapped for a
+    nonexistent path."""
+    smd = _ix.smd_files_for(FILES)
+    assert smd, "smd_files_for must resolve the sidecar mapping"
+    # sanity: with the genuine (all-present) sidecars, auto picks the SMD cache.
+    assert psdata.build_index(FILES, smd_files=smd, source="auto").scan_source \
+        == "smd"
+    # break exactly ONE sidecar -> a single miss must trigger bigdata fallback.
+    partial = dict(smd)
+    a_stream = sorted(partial)[0]
+    partial[a_stream] = f"/nonexistent/smalldata/missing-s{a_stream:03d}.smd.xtc2"
+    n_present = sum(1 for p in partial.values() if os.path.exists(p))
+    assert n_present == len(partial) - 1, \
+        "exactly one sidecar should be missing for this case"
+    idx = psdata.build_index(FILES, smd_files=partial, source="auto")
+    assert idx.scan_source == "bigdata", \
+        "a single missing sidecar must trigger the bigdata fallback"
+
+
+def _walk_l1accepts(buf):
+    """Walk every dgram of a single bigdata chunk's bytes from offset 0 (the
+    same cursor algorithm as :func:`psdata.index._scan_bigdata_stream`), and
+    return two parallel lists: ``boundaries`` -- the start offset of every
+    dgram (a valid split point) -- and ``l1`` -- the ``(ts, offset, size)`` of
+    every L1Accept.  Pure local re-implementation, used as the oracle."""
+    boundaries = []
+    l1 = []
+    cursor = 0
+    n = len(buf)
+    while cursor + psdata.format.DGRAM_HDR <= n:
+        h = psdata.format.parse_dgram_header(buf, cursor)
+        total = psdata.format.XTC_HDR + h["extent"]
+        if cursor + total > n:
+            break
+        boundaries.append(cursor)
+        if h["service"] == psdata.format.SERVICE_L1ACCEPT:
+            l1.append((h["ts"], cursor, total))
+        cursor += total
+    return boundaries, l1
+
+
+def test_bigdata_scan_multichunk_synthetic():
+    """The bigdata chunk-roll + per-chunk offset RESET, exercised on a
+    SYNTHETIC two-chunk fixture cut from a real small bigdata file.
+
+    Run 51 is single-chunk and real multichunk runs are far too large to
+    header-walk in a unit test, so we manufacture the two-chunk case: take a
+    small single-chunk bigdata file, split its bytes at a dgram boundary near
+    the middle (with L1Accepts on BOTH sides), and write the halves as
+    ``...-c000.xtc2`` / ``...-c001.xtc2`` siblings.  We then assert that
+    :func:`psdata.index._enumerate_bd_chunks` finds the c001 sibling and that
+    :func:`psdata.index._scan_bigdata_stream` restarts offsets at 0 inside
+    c001 -- verified record-for-record against an independent walk of the
+    original bytes (``original_offset == c001_offset + split``)."""
+    src = f"{DIR}/{EXP}-r{RUN:04d}-s001-c000.xtc2"        # ~1.5 MB, single chunk
+    with open(src, "rb") as fh:
+        data = fh.read()
+
+    # Oracle: independent walk of the WHOLE original file.
+    boundaries, orig_l1 = _walk_l1accepts(data)
+    assert len(orig_l1) >= 2, "need >=2 L1Accepts to split between"
+
+    # Choose a split at a dgram boundary near the middle with L1Accepts on both
+    # sides.  Boundaries are sorted; scan outward from the midpoint.
+    mid = len(data) // 2
+    split = None
+    order = sorted(range(len(boundaries)),
+                   key=lambda i: abs(boundaries[i] - mid))
+    for i in order:
+        b = boundaries[i]
+        if b == 0:
+            continue                                  # c000 must be non-empty
+        before = any(off < b for _ts, off, _sz in orig_l1)
+        after = any(off >= b for _ts, off, _sz in orig_l1)
+        if before and after:
+            split = b
+            break
+    assert split is not None, \
+        "no dgram boundary has L1Accepts on both sides -- pick another file"
+
+    with tempfile.TemporaryDirectory() as td:
+        stem = "synth-r0001-s000"
+        c000 = os.path.join(td, f"{stem}-c000.xtc2")
+        c001 = os.path.join(td, f"{stem}-c001.xtc2")
+        with open(c000, "wb") as fh:
+            fh.write(data[:split])
+        with open(c001, "wb") as fh:
+            fh.write(data[split:])
+
+        # the -c000/-c001 filename convention must discover the sibling.
+        assert _ix._enumerate_bd_chunks(c000) == [c000, c001], \
+            "enumerate must find the c001 sibling by filename convention"
+
+        recs, _nbytes, chunk_paths = _ix._scan_bigdata_stream(c000)
+        assert chunk_paths == [c000, c001], \
+            "scan must walk both chunks in order"
+
+        # split records by their chunk file.
+        recs0 = [r for r in recs if r[1] == c000]
+        recs1 = [r for r in recs if r[1] == c001]
+        assert recs0 and recs1, "both chunks must contribute L1Accepts"
+
+        # the c001 cursor RESTARTS at 0: its first record's offset is the
+        # offset of the first L1Accept WITHIN the c001 bytes (not a continuation
+        # of c000's cursor, which would be >= split).
+        first_c001_off = recs1[0][2]
+        assert first_c001_off < split, \
+            "c001 offsets must restart from 0, not continue past the split"
+
+        # oracle partition of the original L1Accepts at the same split.
+        orig0 = [(ts, off, sz) for ts, off, sz in orig_l1 if off < split]
+        orig1 = [(ts, off, sz) for ts, off, sz in orig_l1 if off >= split]
+        assert len(recs0) == len(orig0) and len(recs1) == len(orig1)
+
+        # c000 part: byte-exact (ts, offset, size) vs the original walk.
+        for (ts, cp, off, sz), (ots, ooff, osz) in zip(recs0, orig0):
+            assert cp == c000
+            assert (ts, off, sz) == (ots, ooff, osz), \
+                "c000 records must match the original file exactly"
+
+        # c001 part: same ts/size, and original_offset == c001_offset + split,
+        # proving the per-chunk cursor reset reproduces the right offsets.
+        for (ts, cp, off, sz), (ots, ooff, osz) in zip(recs1, orig1):
+            assert cp == c001
+            assert ts == ots and sz == osz, \
+                "c001 records must carry the original ts/size"
+            assert ooff == off + split, \
+                "per-chunk reset: original_offset == c001_offset + split"
+
+    # the whole synthetic path stays framework-pure.
+    _ix.assert_no_framework_imports()
+
+
 def test_bigdata_path_is_framework_pure():
     """Building from bigdata must not import any framework."""
     psdata.build_index(FILES, source="bigdata")
@@ -162,12 +301,17 @@ def test_bigdata_path_is_framework_pure():
 
 
 if __name__ == "__main__":
-    n = test_bigdata_index_byte_exact_against_smd()
-    print(f"OK  bigdata index byte-exact vs SMD ({n} events, small streams)")
+    test_bigdata_index_byte_exact_against_smd()
+    _n = len(psdata.build_index(FILES, source="smd").timestamps)
+    print(f"OK  bigdata index byte-exact vs SMD ({_n} events, small streams)")
     test_random_read_identical_either_index()
     print("OK  random reads byte-identical from either index")
     test_build_index_source_routing()
     print("OK  build_index source routing (smd / bigdata / auto-fallback)")
+    test_build_index_auto_partial_sidecar()
+    print("OK  build_index auto falls back on a single missing sidecar")
+    test_bigdata_scan_multichunk_synthetic()
+    print("OK  bigdata multichunk synthetic: chunk-roll + per-chunk offset reset")
     test_bigdata_path_is_framework_pure()
     print("OK  bigdata scan path is framework-pure")
     print("ALL PASS")

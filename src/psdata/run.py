@@ -66,6 +66,11 @@ class _AlgNamespace:
         self.fields = dict(fields)
 
     def __getattr__(self, name):
+        if name.startswith("__"):
+            # Dunder probes (e.g. __setstate__/__deepcopy__/__reduce_ex__)
+            # during pickle/deepcopy fire __getattr__ before the slot is set;
+            # short-circuit them so we don't recurse on the missing slot.
+            raise AttributeError(name)
         try:
             return self.fields[name]
         except KeyError:
@@ -93,6 +98,11 @@ class _SegConfig:
         self._algs = dict(algs)            # alg name -> _AlgNamespace
 
     def __getattr__(self, name):
+        if name.startswith("__"):
+            # Dunder probes (e.g. __setstate__/__deepcopy__/__reduce_ex__)
+            # during pickle/deepcopy fire __getattr__ before the slot is set;
+            # short-circuit them so we don't recurse on the missing slot.
+            raise AttributeError(name)
         try:
             return object.__getattribute__(self, "_algs")[name]
         except KeyError:
@@ -195,17 +205,21 @@ class Run:
         return _s.events(self.files, run_config=self.config)
 
     # -- random access -----------------------------------------------------
-    def build_index(self, rebuild=False):
+    def build_index(self, rebuild=False, source="auto"):
         """Build (or return the cached) random-access
         :class:`~psdata.index.RunIndex` for this run.
 
         The index is built by scanning only the small SMD files -- the GB-scale
         bigdata is never read during the build.  Cached on the run after the
         first call; pass ``rebuild=True`` to force a fresh build.
+
+        ``source`` selects where the index comes from ({"auto","smd","bigdata"},
+        passed through to :func:`psdata.index.build_index`).
         """
         if self._index is None or rebuild:
             self._index = _i.build_index(
-                self.files, run_config=self.config, smd_files=self._smd_files)
+                self.files, run_config=self.config, smd_files=self._smd_files,
+                source=source)
         return self._index
 
     # convenience alias matching the noun used in the docs/README

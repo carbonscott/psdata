@@ -619,7 +619,7 @@ class RunIndex:
             if name in state:
                 setattr(self, name, state[name])
             else:
-                setattr(self, name, self._PERSIST_DEFAULTS[name])
+                setattr(self, name, self._PERSIST_DEFAULTS.get(name))
         # back-fill: an SMD-built old blob's scan_bytes_read == its smd bytes
         if "scan_bytes_read" not in state:
             self.scan_bytes_read = self.smd_bytes_read
@@ -698,6 +698,11 @@ def _scan_smd_stream(path, bd_c000_path, read_chunk):
     Reads the SMD file in a growing ``os.pread`` window -- the SMD files are
     small (a few MB), so this is the only I/O the index build does; the bigdata
     files are never opened here.
+
+    Only ``SERVICE_L1ACCEPT`` (service 12) dgrams are indexed -- consistent with
+    the bigdata path -- and EOB L1Accepts (``SERVICE_L1ACCEPT_EOB``, service 11,
+    which ``stream.py``'s ``_EVENT_SERVICES`` does yield while streaming) are NOT
+    indexed; revisit if EOB-event random access is needed.
     """
     bd_dir = os.path.dirname(bd_c000_path) if bd_c000_path else None
     cur_chunk_id = 0
@@ -830,6 +835,11 @@ def _scan_bigdata_stream(bd_c000_path):
     :func:`_scan_smd_stream`, so :meth:`RunIndex.build_from_bigdata` and
     :meth:`RunIndex.build` feed :meth:`RunIndex._merge_streams` identically and
     produce byte-for-byte identical indexes.
+
+    Only ``SERVICE_L1ACCEPT`` (service 12) dgrams are indexed -- consistent with
+    the SMD path -- and EOB L1Accepts (``SERVICE_L1ACCEPT_EOB``, service 11,
+    which ``stream.py``'s ``_EVENT_SERVICES`` does yield while streaming) are NOT
+    indexed; revisit if EOB-event random access is needed.
     """
     records = []
     chunk_paths = []
@@ -912,11 +922,11 @@ def build_index(stream_files, run_config=None, smd_files=None, source="auto"):
     """
     if run_config is None:
         run_config = _f.discover(stream_files)
-    if source == "bigdata":
-        return RunIndex.build_from_bigdata(run_config)
-    if source not in ("auto", "smd"):
+    if source not in ("auto", "smd", "bigdata"):
         raise ValueError(
             f"source must be 'auto', 'smd', or 'bigdata' (got {source!r})")
+    if source == "bigdata":
+        return RunIndex.build_from_bigdata(run_config)
     if smd_files is None:
         smd_files = smd_files_for(stream_files)
     if source == "smd":

@@ -458,7 +458,7 @@ def main(argv=None):
             ok_all = False
         if not (ok_all and no_rescan):
             sys.exit(1)
-        print("\nALL US-010 ACCEPTANCE CHECKS PASSED")
+        print("\nALL US-008/US-009 ACCEPTANCE CHECKS PASSED")
 
     return 0 if ok_all else 1
 
