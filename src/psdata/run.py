@@ -223,8 +223,20 @@ class Run:
             return merged
         try:
             valid = frozenset(self.build_index().timestamps)
-        except Exception:
-            return merged          # no SMD index available -> ungated fallback
+        except Exception as exc:
+            # build_index(source="auto") already falls back to a bigdata scan
+            # when the SMD sidecars are absent, so a *legitimate* SMD-absence
+            # does NOT land here -- anything caught here is a real index-build
+            # failure.  Preserve the ungated degrade (don't break iteration),
+            # but warn so the failure is surfaced rather than silently masked.
+            import warnings
+            warnings.warn(
+                f"Run.events(): could not build the SMD index "
+                f"({type(exc).__name__}: {exc}); degrading to the ungated "
+                f"bigdata merge, which may surface unindexed shutdown-tail "
+                f"events. Pass gate=False to silence, or fix the index build.",
+                RuntimeWarning, stacklevel=2)
+            return merged
         return (evt for evt in merged if evt.timestamp in valid)
 
     # -- random access -----------------------------------------------------

@@ -316,6 +316,15 @@ def read_config_object(run_config, det_name, alg="config", fields=None):
     ------
     KeyError
         If ``det_name`` is unknown or has no ``alg`` algorithm.
+
+    Notes
+    -----
+    Scope is the most recent config declared at/before the first L1Accept (the
+    front transitions, last-wins).  A config re-emitted on a transition that
+    occurs AFTER events have begun (a mid-run reconfigure) is out of scope and
+    NOT reflected -- unlike psana's stateful ``_seg_configs()``.  This matches
+    the common case: config is set at Configure/BeginStep and constants are
+    per-run keyed.
     """
     det = run_config.detector(det_name)
     if alg not in det.algs:
