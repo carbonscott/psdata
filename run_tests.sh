@@ -17,11 +17,13 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # project root
 SRC="$REPO/src"                                        # holds only psdata/
 
+PYPARTS="$SRC"
+
 if [[ -z "${PYTHONPATH:-}" ]]; then
   echo "WARNING: PYTHONPATH is empty -- did you source psconda.sh first?" >&2
-  export PYTHONPATH="$SRC"
+  export PYTHONPATH="$PYPARTS"
 else
-  export PYTHONPATH="$SRC:$PYTHONPATH"
+  export PYTHONPATH="$PYPARTS:$PYTHONPATH"
 fi
 
 TESTS=("$@")
@@ -32,8 +34,11 @@ if [[ ${#TESTS[@]} -eq 0 ]]; then
     "$REPO/tests/test_index_us003.py"
     "$REPO/tests/test_robust_us004.py"
     "$REPO/tests/test_regression_us005.py"
-    "$REPO/tests/test_calib_us006.py"
-    "$REPO/tests/test_hdr_us007.py"
+    "$REPO/tests/test_persist_us008.py"
+    "$REPO/tests/test_batch_us009.py"
+    "$REPO/tests/test_config_us010.py"
+    "$REPO/tests/test_torch_us011.py"
+    "$REPO/tests/test_bigdata_scan_us012.py"
   )
 fi
 

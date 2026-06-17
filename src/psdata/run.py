@@ -48,6 +48,72 @@ from . import format as _f
 from . import stream as _s
 from . import index as _i
 
+
+class _AlgNamespace:
+    """Attribute view over one algorithm's CONFIGURE-block fields of a segment.
+
+    Mirrors the leaf of psana's ``det.raw._seg_configs()[seg].config`` object:
+    each field is reachable as an attribute (``cfg.config.trbit``).  Field names
+    that are not valid Python identifiers (e.g. jungfrau's dotted
+    ``user.bias_voltage_v`` or enum-suffixed ``DYNAMIC:gainModeEnum``) cannot be
+    reached by attribute syntax -- read those from the :attr:`fields` dict or
+    via ``getattr(cfg.config, name)`` with the literal name.
+    """
+
+    __slots__ = ("fields",)
+
+    def __init__(self, fields):
+        self.fields = dict(fields)
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            # Dunder probes (e.g. __setstate__/__deepcopy__/__reduce_ex__)
+            # during pickle/deepcopy fire __getattr__ before the slot is set;
+            # short-circuit them so we don't recurse on the missing slot.
+            raise AttributeError(name)
+        try:
+            return self.fields[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def field_names(self):
+        return sorted(self.fields)
+
+    def __repr__(self):
+        return f"_AlgNamespace(fields={self.field_names()})"
+
+
+class _SegConfig:
+    """One segment's CONFIGURE object: ``seg_cfg.<alg>.<field>``.
+
+    The segment-level namespace returned per segment by
+    :meth:`Run.seg_configs`.  Exposes one attribute per algorithm (today only
+    ``config``), matching psana's ``det.raw._seg_configs()[seg].config.<field>``
+    access pattern.
+    """
+
+    __slots__ = ("_algs",)
+
+    def __init__(self, algs):
+        self._algs = dict(algs)            # alg name -> _AlgNamespace
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            # Dunder probes (e.g. __setstate__/__deepcopy__/__reduce_ex__)
+            # during pickle/deepcopy fire __getattr__ before the slot is set;
+            # short-circuit them so we don't recurse on the missing slot.
+            raise AttributeError(name)
+        try:
+            return object.__getattribute__(self, "_algs")[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def alg_names(self):
+        return sorted(self._algs)
+
+    def __repr__(self):
+        return f"_SegConfig(algs={self.alg_names()})"
+
 # Stream/chunk file-name pattern: ``<exp>-r<run4>-s<stream3>-c<chunk3>.xtc2``.
 # psana opens only the first chunk (``c000``) of each stream and rolls forward
 # from there; :func:`psdata.format.filter_c000` reproduces that filter.
@@ -139,17 +205,21 @@ class Run:
         return _s.events(self.files, run_config=self.config)
 
     # -- random access -----------------------------------------------------
-    def build_index(self, rebuild=False):
+    def build_index(self, rebuild=False, source="auto"):
         """Build (or return the cached) random-access
         :class:`~psdata.index.RunIndex` for this run.
 
         The index is built by scanning only the small SMD files -- the GB-scale
         bigdata is never read during the build.  Cached on the run after the
         first call; pass ``rebuild=True`` to force a fresh build.
+
+        ``source`` selects where the index comes from ({"auto","smd","bigdata"},
+        passed through to :func:`psdata.index.build_index`).
         """
         if self._index is None or rebuild:
             self._index = _i.build_index(
-                self.files, run_config=self.config, smd_files=self._smd_files)
+                self.files, run_config=self.config, smd_files=self._smd_files,
+                source=source)
         return self._index
 
     # convenience alias matching the noun used in the docs/README
@@ -166,6 +236,20 @@ class Run:
         builds the index on first use).  Returns a
         :class:`~psdata.stream.Event`."""
         return self.build_index().read_event_at(k)
+
+    def read_events(self, ks):
+        """Batch random-access the events at positions ``ks`` in one coalesced
+        call (builds the index on first use).  Equivalent to
+        ``[read_event_at(k) for k in ks]`` but issues its ``pread``s grouped per
+        chunk file in ascending-offset order; returns the events in ``ks``
+        order.  See :meth:`psdata.index.RunIndex.read_events`."""
+        return self.build_index().read_events(ks)
+
+    def read_stack(self, ks, det, field="raw", alg="raw"):
+        """Batch-read events ``ks`` and stack one detector into a single
+        preallocated ``(len(ks), n_seg, *seg_shape)`` ndarray (builds the index
+        on first use).  See :meth:`psdata.index.RunIndex.read_stack`."""
+        return self.build_index().read_stack(ks, det, field=field, alg=alg)
 
     # -- introspection -----------------------------------------------------
     def detector_names(self, include_bookkeeping=False):
@@ -184,6 +268,38 @@ class Run:
         """Sorted names of detectors whose ``det_type`` matches (e.g. ``'ts'``
         for the timing detector that carries ``pulseId``)."""
         return self.config.find_detector_by_type(det_type)
+
+    # -- CONFIGURE-block accessor -----------------------------------------
+    def seg_configs(self, detname, alg="config"):
+        """Per-segment CONFIGURE-block object for ``detname``.
+
+        Returns ``{segment_id: seg_cfg}`` where ``seg_cfg.<alg>.<field>`` reads
+        a static settings field written into the Configure dgram (not an
+        L1Accept event field) -- e.g. for epix10ka::
+
+            scfg = run.seg_configs("epixquad")          # {0: ..., 1: ..., ...}
+            trbit = scfg[0].config.trbit                # (4,)   uint8
+            apc   = scfg[0].config.asicPixelConfig      # (4,176,192) uint8
+
+        These per-ASIC fields are exactly what the epix gain-range decode needs
+        and are byte-identical to psana's
+        ``det.raw._seg_configs()[seg].config.{trbit,asicPixelConfig}``.  The
+        accessor is generic -- it works for any detector whose Names tables
+        declare a ``config`` algorithm (jungfrau, epix10ka, ...), reading the
+        fields with the same DescData decoder used for event data.
+
+        Field names that are not valid Python identifiers (jungfrau's dotted /
+        enum-suffixed config fields) are reachable from
+        ``seg_cfg.<alg>.fields[name]`` rather than by attribute syntax.
+        """
+        per_seg = _f.read_config_object(self.config, detname, alg=alg)
+        return {seg: _SegConfig({alg: _AlgNamespace(fld_map)})
+                for seg, fld_map in per_seg.items()}
+
+    def config_object(self, detname, alg="config"):
+        """Alias for :meth:`seg_configs` -- the per-segment CONFIGURE object
+        ``{segment_id: seg_cfg}`` (``seg_cfg.<alg>.<field>``)."""
+        return self.seg_configs(detname, alg=alg)
 
     # -- resource management ----------------------------------------------
     def close(self):

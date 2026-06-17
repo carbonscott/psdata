@@ -17,6 +17,15 @@ dependencies = ["numpy"]
 # psconda.sh) -- NOT a pip/uv-installable package. There is deliberately no
 # [psana] extra; see the "Environment" section of the README.
 test = ["pytest"]
+# Demonstrator-only. `examples/cube_ray_shared_index.py` parallelizes the cube
+# with Ray; Ray is NEVER imported by `psdata` itself (`import psdata` stays
+# numpy-only) and is not a core dependency -- it lives here so the demo is
+# installable on its own. See examples/run_cube_ray.sh for the run environment.
+demo = ["ray"]
+# Demonstrator-only. `src/psdata/torch.py` adapts the index into a
+# `torch.utils.data.Dataset`; torch is lazy-imported INSIDE that module's functions and is NEVER imported by `psdata` itself (`import psdata` stays
+# numpy-only). Install with `pip install psdata[torch]` to use XTCDataset.
+torch = ["torch"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/psdata"]
