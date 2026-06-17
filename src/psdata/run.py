@@ -197,12 +197,35 @@ class Run:
         self._index = None                     # lazily built RunIndex
 
     # -- streaming ---------------------------------------------------------
-    def events(self):
+    def events(self, gate=True):
         """Yield assembled :class:`~psdata.stream.Event` objects in ascending
         timestamp order (forward streaming).  Each event exposes ``timestamp``,
         ``pulseId``, and lazy raw detector arrays (``evt.stack(name)`` /
-        ``evt.raw(name)`` / ``evt.as_dict()``)."""
-        return _s.events(self.files, run_config=self.config)
+        ``evt.raw(name)`` / ``evt.as_dict()``).
+
+        By default the event set is **gated to the SMD-defined index**, so
+        forward streaming yields exactly the events psana and
+        :meth:`read_event_at` do.  Why: on a run with a ragged DAQ-shutdown tail,
+        some bigdata streams carry trailing L1Accepts the SMD writer never
+        indexed (it stopped first); the raw k-way merge over the bigdata would
+        surface those extras, making ``events()`` disagree with the index and
+        with psana (observed: jungfrau mfx100848724/r51 -> 17982 raw vs 17872
+        indexed).  Gating filters the merge to the indexed timestamps so the
+        forward, random-access, and psana event sets coincide.
+
+        Pass ``gate=False`` for the ungated, SMD-independent merge straight over
+        the bigdata (the same as the low-level :func:`psdata.events`); it may
+        surface unindexed shutdown-tail events on a truncated run.  If no index
+        can be built (SMD sidecars absent) the gate degrades to ungated.
+        """
+        merged = _s.events(self.files, run_config=self.config)
+        if not gate:
+            return merged
+        try:
+            valid = frozenset(self.build_index().timestamps)
+        except Exception:
+            return merged          # no SMD index available -> ungated fallback
+        return (evt for evt in merged if evt.timestamp in valid)
 
     # -- random access -----------------------------------------------------
     def build_index(self, rebuild=False, source="auto"):
