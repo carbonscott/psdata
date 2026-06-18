@@ -55,12 +55,18 @@ def _entry_key(entry):
 
 
 def test_bigdata_index_byte_exact_against_smd():
-    """Every event the SMD path indexes is present in the bigdata-built index
-    with byte-identical (offset, size); the bigdata index is a superset (it may
-    also recover trailing dgrams the offline smdwriter never wrote to the SMD)."""
+    """The default bigdata-built index is byte-identical to the SMD-built index:
+    same timestamps, same per-stream (offset, size).  ``build_from_bigdata``
+    clamps to the canonical event set (events carrying the timing/master
+    stream), which equals the SMD/``smdwriter`` set exactly.  On these small
+    streams -- which include the timing stream s004 and have no ragged DAQ tail
+    gap -- ``include_shutdown_tail=True`` is a no-op, so it too equals SMD; the
+    17872-vs-17982 superset gap only appears on the full 10-stream scan (the
+    long-running detector streams), validated at scale by verify_cache.py."""
     idx_smd = psdata.build_index(FILES, source="smd")
     idx_bd = psdata.build_index(FILES, source="bigdata")
     assert idx_smd.scan_source == "smd" and idx_bd.scan_source == "bigdata"
+    assert idx_bd.include_shutdown_tail is False, "default must clamp the tail"
 
     bd_pos = {ts: k for k, ts in enumerate(idx_bd.timestamps)}
     assert len(idx_bd.timestamps) >= len(idx_smd.timestamps), \
@@ -69,9 +75,94 @@ def test_bigdata_index_byte_exact_against_smd():
         assert ts in bd_pos, f"bigdata index missing SMD event ts={ts}"
         assert _entry_key(smd_entry) == _entry_key(idx_bd.entries[bd_pos[ts]]), \
             f"offset/size mismatch at ts={ts}"
-    # on THIS run the small streams have no smdwriter tail gap -> exact match.
+    # default clamp == SMD exactly (these small streams carry s004 and have no
+    # DAQ tail gap, so the canonical set is the whole set).
     assert idx_smd.timestamps == idx_bd.timestamps, \
-        "expected exact equality on the small streams of run 51"
+        "default bigdata index must equal the SMD index on run 51's small streams"
+    # the include_shutdown_tail flag plumbs through and, absent a tail here,
+    # yields the same set -- proving it is a no-op when nothing is clamped.
+    idx_bd_full = psdata.build_index(FILES, source="bigdata",
+                                     include_shutdown_tail=True)
+    assert idx_bd_full.include_shutdown_tail is True
+    assert idx_bd_full.timestamps == idx_smd.timestamps, \
+        "no DAQ tail on the small streams -> include_shutdown_tail is a no-op"
+
+
+# --------------------------------------------------------------------------
+# Synthetic clamp-logic tests (no data, no scan): exercise the canonical /
+# shutdown-tail merge directly via a minimal fabricated RunConfig.  The
+# 17872-vs-17982 behaviour is real-data-validated in verify_cache.py; here we
+# pin the merge PREDICATE itself -- fast and deterministic.
+# --------------------------------------------------------------------------
+import psdata.format as _fmt
+
+
+def _fake_rc_with_timing(timing_stream=4, det_streams=(5, 7)):
+    """A minimal RunConfig: a timing detector (det_type 'ts', alg 'raw') on
+    ``timing_stream``, plus a detector spread over ``det_streams``.  Enough for
+    ``_timing_streams`` / ``_merge_streams`` (no real Names tables needed)."""
+    rc = _fmt.RunConfig()
+    rc.stream_files = {s: f"/x/fake-s{s:03d}-c000.xtc2"
+                       for s in {timing_stream, *det_streams}}
+    ts = _fmt.DetectorInfo("timing", "ts", "ts0")
+    ts.algs["raw"] = {}                       # key presence is all that matters
+    ts.segments["raw"] = {0}
+    ts.seg_to_stream[("raw", 0)] = timing_stream
+    rc.detectors["timing"] = ts
+    det = _fmt.DetectorInfo("det", "jungfrau", "jf0")
+    det.algs["raw"] = {}
+    det.segments["raw"] = set(range(len(det_streams)))
+    for i, s in enumerate(det_streams):
+        det.seg_to_stream[("raw", i)] = s
+    rc.detectors["det"] = det
+    return rc
+
+
+def test_merge_streams_clamps_shutdown_tail():
+    """Default merge drops events lacking the timing/master stream; the flag
+    keeps them (the 17872-vs-17982 behaviour, in miniature)."""
+    rc = _fake_rc_with_timing(timing_stream=4, det_streams=(5, 7))
+    cp = "/x/fake-c000.xtc2"
+    # timing stream 4 stops at ts=200; detector streams 5,7 run on to ts=300
+    # (the shutdown tail -- present on disk, no timing/pulseId).
+    per_stream = {
+        4: [(100, cp, 0, 10), (200, cp, 10, 10)],
+        5: [(100, cp, 0, 10), (200, cp, 10, 10), (300, cp, 20, 10)],
+        7: [(100, cp, 0, 10), (200, cp, 10, 10), (300, cp, 20, 10)],
+    }
+    # default: clamp -> the timing-less ts=300 event is dropped.
+    idx = _ix.RunIndex(rc)
+    assert idx.include_shutdown_tail is False
+    assert _ix.RunIndex(rc)._timing_streams() == frozenset({4})
+    idx._merge_streams(per_stream)
+    assert idx.timestamps == [100, 200], "clamp must drop the shutdown tail"
+
+    # include_shutdown_tail=True: keep the full union, tail and all.
+    idx2 = _ix.RunIndex(rc)
+    idx2._merge_streams(per_stream, include_shutdown_tail=True)
+    assert idx2.timestamps == [100, 200, 300], "tail must be kept when asked"
+    tail_entry = idx2.entries[idx2.timestamps.index(300)]
+    assert set(tail_entry) == {5, 7} and 4 not in tail_entry, \
+        "the kept tail event indeed lacks the timing/master stream"
+
+
+def test_merge_streams_no_timing_detector_keeps_all():
+    """Graceful degradation: a run that declares NO timing detector cannot be
+    clamped, so every assembled event is kept (no spurious dropping)."""
+    rc = _fmt.RunConfig()
+    rc.stream_files = {5: "/x/a-c000.xtc2", 7: "/x/b-c000.xtc2"}
+    det = _fmt.DetectorInfo("det", "jungfrau", "jf0")
+    det.algs["raw"] = {}
+    det.segments["raw"] = {0, 1}
+    det.seg_to_stream[("raw", 0)] = 5
+    det.seg_to_stream[("raw", 1)] = 7
+    rc.detectors["det"] = det
+    cp = "/x/c-c000.xtc2"
+    per_stream = {5: [(1, cp, 0, 5), (2, cp, 5, 5)], 7: [(1, cp, 0, 5)]}
+    idx = _ix.RunIndex(rc)
+    assert idx._timing_streams() == frozenset(), "no 'ts' detector -> no clamp"
+    idx._merge_streams(per_stream)
+    assert idx.timestamps == [1, 2], "no timing detector -> keep every event"
 
 
 _BOOKKEEPING = {"smdinfo", "chunkinfo", "runinfo", "epicsinfo"}
@@ -314,4 +405,8 @@ if __name__ == "__main__":
     print("OK  bigdata multichunk synthetic: chunk-roll + per-chunk offset reset")
     test_bigdata_path_is_framework_pure()
     print("OK  bigdata scan path is framework-pure")
+    test_merge_streams_clamps_shutdown_tail()
+    print("OK  merge clamps the shutdown tail by default; flag keeps it")
+    test_merge_streams_no_timing_detector_keeps_all()
+    print("OK  no timing detector -> no clamp (graceful)")
     print("ALL PASS")
