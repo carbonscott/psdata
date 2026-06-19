@@ -52,8 +52,11 @@ the matching bigdata dgram (the DAQ/`smdwriter` write them in lockstep with the
 bigdata).  So they are not *required* -- :meth:`RunIndex.build_from_bigdata`
 rebuilds the identical index by walking the bigdata dgram **headers** directly
 (reading each 24-byte header and seeking past the GB-scale payloads), the
-``smdwriter`` algorithm in pure Python.  An index built this way is
-byte-identical to one built from SMD, so :func:`build_index` defaults to
+``smdwriter`` algorithm in pure Python.  By default the index it produces is
+byte-identical to one built from SMD -- both are clamped to the *canonical*
+event set (events carrying the timing/master stream); the raw walk can also
+recover the ragged DAQ end-of-run tail via ``include_shutdown_tail=True`` (see
+:meth:`RunIndex.build_from_bigdata`).  So :func:`build_index` defaults to
 ``source="auto"``: it uses the SMD sidecars as a fast cache *when present*, and
 falls back to the bigdata scan when they are absent -- the random-access
 capability never *depends* on an artifact owned by the psana/xtcdata toolchain.
@@ -190,6 +193,9 @@ class RunIndex:
         self.multichunk_streams = set()
         self.scan_source = "smd"      # "smd" (sidecar cache) | "bigdata" (no SMD)
         self.scan_bytes_read = 0      # bytes the index scan read (smd OR bigdata)
+        self.include_shutdown_tail = False  # True iff the raw end-of-run tail
+        #   (events lacking the timing/master stream; pulseId=None) is kept;
+        #   default False clamps to the canonical (SMD-equivalent) event set.
         # private: open bigdata fds, lazily, cached per chunk path
         self._bd_fds = {}
         self._ts_to_k = None          # built lazily for read_event(ts)
@@ -235,14 +241,21 @@ class RunIndex:
             if len(chunks) > 1:
                 idx.multichunk_streams.add(stream)
 
-        idx._merge_streams(per_stream)
+        # SMD is already the canonical reference set -- the offline
+        # smdwriter pre-truncated the end-of-run shutdown tail, so the clamp
+        # (which exists only to trim the bigdata walk's tail) has nothing to
+        # remove here.  Pass include_shutdown_tail=True so the SMD path is
+        # provably unchanged: it never re-derives the timing predicate to
+        # second-guess SMD, and the (still-open) damaged-data policy is not
+        # silently decided on this path.
+        idx._merge_streams(per_stream, include_shutdown_tail=True)
         idx.build_seconds = time.monotonic() - t0
         idx.scan_source = "smd"
         idx.scan_bytes_read = idx.smd_bytes_read
         return idx
 
     @classmethod
-    def build_from_bigdata(cls, run_config):
+    def build_from_bigdata(cls, run_config, include_shutdown_tail=False):
         """Build a :class:`RunIndex` WITHOUT any SMD file, by walking the
         bigdata chunk files' dgram headers directly.
 
@@ -251,10 +264,20 @@ class RunIndex:
         (``c000``, ``c001``, ...) from offset 0, record the running byte cursor
         at every ``L1Accept`` (the same ``intOffset`` the SMD file would store)
         and its on-disk size ``XTC_HDR + extent`` (the same ``intDgramSize``),
-        advancing the cursor across every dgram (transitions included).  The
-        resulting index is byte-for-byte identical to one :meth:`build` produces
-        from the SMD sidecars -- but needs no ``.smd.xtc2`` artifact, so the run
-        can be randomly accessed from the bigdata files alone.
+        advancing the cursor across every dgram (transitions included).
+
+        Event set: by default (``include_shutdown_tail=False``) the index is
+        clamped to the *canonical* event set -- the events that carry the
+        timing/master stream (``det_type='ts'``) and so have a ``pulseId`` --
+        which is byte-for-byte identical to one :meth:`build` produces from the
+        SMD sidecars (the offline ``smdwriter`` writes exactly that set), but
+        needs no ``.smd.xtc2`` artifact.  Pass ``include_shutdown_tail=True`` to
+        instead keep every physical L1Accept on disk, including the ragged DAQ
+        end-of-run tail: events some detector streams kept writing after the
+        timing/master streams closed.  Those tail events lack the timing stream,
+        so ``Event.pulseId`` is ``None`` and -- once a detector stream also
+        closes -- they go partial (``Event.stack`` then returns ``None`` by the
+        missing-segment rule); they are a strict superset of the canonical set.
 
         Only each dgram's 24-byte header is read; the (GB-scale) payloads are
         seeked past, so the cost is one ``pread`` per dgram (~thousands per
@@ -267,6 +290,7 @@ class RunIndex:
         """
         idx = cls(run_config)
         idx.scan_source = "bigdata"
+        idx.include_shutdown_tail = include_shutdown_tail
         t0 = time.monotonic()
         # per-stream ordered lists of (ts, chunk_path, offset, size)
         per_stream = {}
@@ -279,23 +303,57 @@ class RunIndex:
             if len(chunks) > 1:
                 idx.multichunk_streams.add(stream)
 
-        idx._merge_streams(per_stream)
+        idx._merge_streams(per_stream,
+                           include_shutdown_tail=include_shutdown_tail)
         idx.build_seconds = time.monotonic() - t0
         return idx
 
-    def _merge_streams(self, per_stream):
+    def _timing_streams(self):
+        """Stream indices that carry the timing/master detector (``det_type
+        'ts'``) -- the streams whose presence makes an event *canonical* (gives
+        it a ``pulseId``).  Empty if the run declares no timing detector, in
+        which case no clamp is applied and every assembled event is kept.
+
+        Mirrors how :attr:`psdata.stream.Event.pulseId` sources its value (the
+        ``raw`` alg of the ``det_type='ts'`` detector, ``stream.py``
+        ``_read_pulse_id``), so the clamp drops exactly the events whose
+        ``pulseId`` would be ``None`` for want of that stream."""
+        rc = self.run_config
+        names = rc.find_detector_by_type(_s._TIMING_DET_TYPE)
+        if not names:
+            return frozenset()
+        det = rc.detector(names[0])
+        alg = "raw" if "raw" in det.algs else None
+        if alg is None:
+            return frozenset()
+        return frozenset(det.streams_for(alg))
+
+    def _merge_streams(self, per_stream, include_shutdown_tail=False):
         """Combine the per-stream ``(ts, chunk_path, off, size)`` records into
         the unified ascending ``timestamps`` / ``entries`` index by
         exact-timestamp merge (an event's identity is its 64-bit ts, shared
-        across streams)."""
+        across streams).
+
+        By default the merge is clamped to the *canonical* event set: an event
+        is kept only if it carries the timing/master stream (see
+        :meth:`_timing_streams`), which matches the SMD/``smdwriter`` event set
+        exactly and excludes the ragged DAQ end-of-run *shutdown tail* (events
+        some detector streams kept writing after the timing/master streams
+        closed; ``pulseId=None``).  Pass ``include_shutdown_tail=True`` to keep
+        that tail -- the full set of physical L1Accepts on disk."""
         # gather the union of timestamps, then for each ts collect the streams
         merged = {}   # ts -> {stream: (chunk_path, off, size)}
         for stream, recs in per_stream.items():
             for ts, chunk_path, off, size in recs:
                 merged.setdefault(ts, {})[stream] = (chunk_path, off, size)
+        timing_streams = (frozenset() if include_shutdown_tail
+                          else self._timing_streams())
         for ts in sorted(merged):
+            entry = merged[ts]
+            if timing_streams and not (timing_streams & entry.keys()):
+                continue   # shutdown-tail event: lacks the timing/master stream
             self.timestamps.append(ts)
-            self.entries.append(merged[ts])
+            self.entries.append(entry)
 
     # -- lookup ------------------------------------------------------------
     @property
@@ -308,7 +366,12 @@ class RunIndex:
         i = bisect.bisect_left(self.timestamps, ts)
         if i < len(self.timestamps) and self.timestamps[i] == ts:
             return i
-        raise KeyError(f"no indexed event with timestamp {ts}")
+        hint = ""
+        if not self.include_shutdown_tail:
+            hint = (" -- this index is clamped to the canonical event set; the "
+                    "timestamp may belong to a shutdown-tail event excluded by "
+                    "default (rebuild with include_shutdown_tail=True for it)")
+        raise KeyError(f"no indexed event with timestamp {ts}{hint}")
 
     def _bd_fd(self, chunk_path):
         """Return an open read fd for ``chunk_path``, cached across reads.
@@ -557,9 +620,10 @@ class RunIndex:
             pass
 
     def __repr__(self):
+        tail = ", shutdown_tail" if self.include_shutdown_tail else ""
         return (f"RunIndex(n_events={self.n_events}, "
                 f"streams={sorted(self.bd_files)}, "
-                f"source={self.scan_source!r}, "
+                f"source={self.scan_source!r}{tail}, "
                 f"build_seconds={self.build_seconds:.3f}, "
                 f"scan_MB={self.scan_bytes_read / 1e6:.1f})")
 
@@ -581,9 +645,9 @@ class RunIndex:
     #
     # The persisted state is exactly: timestamps, entries, bd_files,
     # chunk_files, multichunk_streams, run_config, build_seconds,
-    # smd_bytes_read -- all plain-Python / numpy-dtype values (no fds, no live
-    # C objects), so plain ``pickle.dumps(idx)`` is safe once these two caches
-    # are stripped.
+    # smd_bytes_read, scan_source, scan_bytes_read, include_shutdown_tail -- all
+    # plain-Python / numpy-dtype values (no fds, no live C objects), so plain
+    # ``pickle.dumps(idx)`` is safe once the two per-process caches are stripped.
 
     _PERSIST_FIELDS = (
         "timestamps",
@@ -596,14 +660,18 @@ class RunIndex:
         "smd_bytes_read",
         "scan_source",
         "scan_bytes_read",
+        "include_shutdown_tail",
     )
 
     # Defaults for fields absent from an older persisted blob (back-compat:
     # indexes pickled before the bigdata-scan source existed have no
-    # ``scan_source``/``scan_bytes_read`` -- treat them as SMD-built).
+    # ``scan_source``/``scan_bytes_read`` -- treat them as SMD-built; likewise a
+    # blob predating the clamp has no ``include_shutdown_tail`` -- it was built
+    # before the tail could be kept, so it is canonical: False).
     _PERSIST_DEFAULTS = {
         "scan_source": "smd",
         "scan_bytes_read": 0,
+        "include_shutdown_tail": False,
     }
 
     def _persist_state(self):
@@ -891,7 +959,8 @@ def smd_files_for(stream_files):
     return out
 
 
-def build_index(stream_files, run_config=None, smd_files=None, source="auto"):
+def build_index(stream_files, run_config=None, smd_files=None, source="auto",
+                include_shutdown_tail=False):
     """Build a :class:`RunIndex` for a run.
 
     Parameters
@@ -915,6 +984,14 @@ def build_index(stream_files, run_config=None, smd_files=None, source="auto"):
         * ``"auto"`` (default) -- use the SMD sidecars when *all* are present
           (fast path), else fall back to the bigdata scan.  This keeps the fast
           path when SMD exists while removing the hard *dependency* on it.
+    include_shutdown_tail : bool
+        Only affects the bigdata scan (``source="bigdata"`` or an ``"auto"``
+        fallback).  ``False`` (default) clamps the index to the canonical event
+        set -- byte-identical to the SMD-built index.  ``True`` additionally
+        keeps the ragged DAQ end-of-run shutdown tail (events lacking the
+        timing/master stream, ``pulseId=None``); see
+        :meth:`RunIndex.build_from_bigdata`.  Ignored by the SMD path (the
+        sidecars never recorded that tail).
 
     Returns
     -------
@@ -926,7 +1003,8 @@ def build_index(stream_files, run_config=None, smd_files=None, source="auto"):
         raise ValueError(
             f"source must be 'auto', 'smd', or 'bigdata' (got {source!r})")
     if source == "bigdata":
-        return RunIndex.build_from_bigdata(run_config)
+        return RunIndex.build_from_bigdata(
+            run_config, include_shutdown_tail=include_shutdown_tail)
     if smd_files is None:
         smd_files = smd_files_for(stream_files)
     if source == "smd":
@@ -936,7 +1014,8 @@ def build_index(stream_files, run_config=None, smd_files=None, source="auto"):
     items = _f._normalize_stream_files(smd_files)
     if items and all(os.path.exists(p) for _stream, p in items):
         return RunIndex.build(smd_files, run_config)
-    return RunIndex.build_from_bigdata(run_config)
+    return RunIndex.build_from_bigdata(
+        run_config, include_shutdown_tail=include_shutdown_tail)
 
 
 # ==========================================================================
