@@ -165,6 +165,49 @@ def test_merge_streams_no_timing_detector_keeps_all():
     assert idx.timestamps == [1, 2], "no timing detector -> keep every event"
 
 
+def test_include_shutdown_tail_round_trips():
+    """The clamp flag survives the save/ship round-trips (to_dict/from_dict --
+    and pickle save/load, which share _persist_state), and a pre-clamp blob
+    that lacks the field loads as canonical (False), the back-compat default.
+    Pure-synthetic: no scan, no real data."""
+    rc = _fake_rc_with_timing()
+    idx = _ix.RunIndex(rc)
+    idx.include_shutdown_tail = True
+    back = _ix.RunIndex.from_dict(idx.to_dict())
+    assert back.include_shutdown_tail is True, \
+        "include_shutdown_tail must survive to_dict/from_dict"
+    # an older blob predating the clamp has no such field -> must load as False.
+    state = idx.to_dict()
+    del state["include_shutdown_tail"]
+    assert _ix.RunIndex.from_dict(state).include_shutdown_tail is False, \
+        "a persisted blob lacking the field must restore as canonical (False)"
+
+
+def test_read_event_on_clamped_tail_raises_hinted_keyerror():
+    """read_event(ts) for a shutdown-tail timestamp dropped by the default
+    clamp raises KeyError, and the message names include_shutdown_tail so the
+    caller knows how to recover it (build_from_bigdata(..., include_shutdown_
+    tail=True)).  Pure-synthetic: _position_of raises before any pread."""
+    rc = _fake_rc_with_timing(timing_stream=4, det_streams=(5, 7))
+    cp = "/x/fake-c000.xtc2"
+    per_stream = {
+        4: [(100, cp, 0, 10), (200, cp, 10, 10)],            # timing stops @200
+        5: [(100, cp, 0, 10), (200, cp, 10, 10), (300, cp, 20, 10)],
+        7: [(100, cp, 0, 10), (200, cp, 10, 10), (300, cp, 20, 10)],
+    }
+    idx = _ix.RunIndex(rc)
+    idx._merge_streams(per_stream)               # default clamp drops ts=300
+    assert 300 not in idx.timestamps, "precondition: the tail ts is clamped out"
+    try:
+        idx.read_event(300)
+    except KeyError as e:
+        assert "include_shutdown_tail" in str(e), \
+            "the KeyError must hint at include_shutdown_tail=True for recovery"
+    else:
+        raise AssertionError(
+            "read_event on a clamped-out tail ts must raise KeyError")
+
+
 _BOOKKEEPING = {"smdinfo", "chunkinfo", "runinfo", "epicsinfo"}
 
 
@@ -409,4 +452,8 @@ if __name__ == "__main__":
     print("OK  merge clamps the shutdown tail by default; flag keeps it")
     test_merge_streams_no_timing_detector_keeps_all()
     print("OK  no timing detector -> no clamp (graceful)")
+    test_include_shutdown_tail_round_trips()
+    print("OK  include_shutdown_tail survives save/ship + back-compat default")
+    test_read_event_on_clamped_tail_raises_hinted_keyerror()
+    print("OK  read_event on a clamped tail ts raises a hinted KeyError")
     print("ALL PASS")

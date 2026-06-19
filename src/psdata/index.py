@@ -241,7 +241,14 @@ class RunIndex:
             if len(chunks) > 1:
                 idx.multichunk_streams.add(stream)
 
-        idx._merge_streams(per_stream)
+        # SMD is already the canonical reference set -- the offline
+        # smdwriter pre-truncated the end-of-run shutdown tail, so the clamp
+        # (which exists only to trim the bigdata walk's tail) has nothing to
+        # remove here.  Pass include_shutdown_tail=True so the SMD path is
+        # provably unchanged: it never re-derives the timing predicate to
+        # second-guess SMD, and the (still-open) damaged-data policy is not
+        # silently decided on this path.
+        idx._merge_streams(per_stream, include_shutdown_tail=True)
         idx.build_seconds = time.monotonic() - t0
         idx.scan_source = "smd"
         idx.scan_bytes_read = idx.smd_bytes_read
