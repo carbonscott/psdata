@@ -63,6 +63,11 @@ MC_DIR = "/sdf/data/lcls/ds/MFX/mfx101343025/xtc"
 # Event positions to spot-check (single-chunk run has ~17,872 events).
 K_VALUES = [0, 1, 5, 17, 100, 999, 17871]   # includes 0 and the last event
 
+# An epics variable verified to resolve to a real (non-None) value at the
+# last sampled event of this run -- probes that env_records CONTENT (not just
+# its presence in the persisted field set) survives a round-trip.
+ENV_PROBE_VAR = "BeamMonitor_diode_x"
+
 
 def _stream_files(directory, exp, run):
     """Resolve a run's per-stream bigdata c000 xtc2 files by globbing -- the
@@ -142,7 +147,7 @@ def test_persist_state_fields_exact():
 
         state = ridx._persist_state()
         expected = {
-            "timestamps", "entries", "bd_files", "chunk_files",
+            "timestamps", "entries", "env_records", "bd_files", "chunk_files",
             "multichunk_streams", "run_config", "build_seconds",
             "smd_bytes_read", "scan_source", "scan_bytes_read",
             "include_shutdown_tail",
@@ -182,6 +187,30 @@ def test_to_dict_from_dict_byte_identical():
             assert clone.n_events == ridx.n_events
             assert clone.smd_bytes_read == ridx.smd_bytes_read, \
                 "build provenance (smd_bytes_read) must survive round-trip"
+
+            # env_records CONTENT round-trip.  to_dict/from_dict hands back the
+            # SAME live dict by reference (no copy), so this equality is
+            # nearly tautological here -- the real coverage of a genuine
+            # serialize/deserialize is the disk save/load test's pickle path
+            # below.  Still assert it (plus an as-of lookup through the
+            # reloaded index), so a future to_dict/from_dict change that drops
+            # or copies env_records gets caught here too.
+            assert ridx.env_records, "expected non-empty env_records for this run"
+            assert clone.env_records == ridx.env_records, \
+                "env_records content differs after to_dict/from_dict"
+            from psdata import envstore as _envstore
+            probe_ts = int(ridx.timestamps[K_VALUES[-1]])
+            orig_val = _envstore.EnvStoreManager(
+                ridx.run_config, ridx.env_records
+            ).store("epics").value(ENV_PROBE_VAR, probe_ts)
+            clone_val = _envstore.EnvStoreManager(
+                clone.run_config, clone.env_records
+            ).store("epics").value(ENV_PROBE_VAR, probe_ts)
+            assert orig_val is not None, \
+                f"probe var {ENV_PROBE_VAR!r} must resolve to a real value"
+            assert clone_val == orig_val, \
+                f"env as_of({ENV_PROBE_VAR!r}) differs after to_dict/from_dict"
+
             for k in K_VALUES:
                 a = _event_fingerprint(ridx.read_event_at(k), det_names)
                 b = _event_fingerprint(clone.read_event_at(k), det_names)
@@ -266,6 +295,17 @@ result = {
 with open(expect_path, "rb") as fh:
     expect = pickle.load(fh)   # {k: (ts, pid, {det: (shape,dtype,bytes)|None})}
 
+# env_records content + as-of probe must survive the disk round-trip too
+# (not just be present in the persisted field set).
+from psdata import envstore as _envstore
+result["env_records_match"] = (ridx.env_records == expect["env_records"])
+probe_var, probe_ts, probe_val = expect["env_probe"]
+reloaded_val = _envstore.EnvStoreManager(
+    ridx.run_config, ridx.env_records
+).store("epics").value(probe_var, probe_ts)
+result["env_probe_match"] = (
+    reloaded_val is not None and reloaded_val == probe_val)
+
 for k in k_values:
     evt = ridx.read_event_at(k)
     ets, epid, edets = expect[k]
@@ -305,6 +345,16 @@ def _expected_for_subprocess(ridx, det_names, k_values, path):
             dets[name] = None if st is None else (
                 list(st.shape), str(st.dtype), st.tobytes())
         expect[k] = (int(evt.timestamp), int(evt.pulseId), dets)
+    # env_records content + one as-of probe, keyed by string (never collides
+    # with the integer k keys above) -- lets the reload subprocess confirm
+    # slow (env) data survives the disk round-trip, not just its presence.
+    from psdata import envstore as _envstore
+    expect["env_records"] = ridx.env_records
+    probe_ts = int(ridx.timestamps[k_values[-1]])
+    probe_val = _envstore.EnvStoreManager(
+        ridx.run_config, ridx.env_records
+    ).store("epics").value(ENV_PROBE_VAR, probe_ts)
+    expect["env_probe"] = (ENV_PROBE_VAR, probe_ts, probe_val)
     with open(path, "wb") as fh:
         pickle.dump(expect, fh, protocol=4)
 
@@ -367,6 +417,12 @@ def test_save_load_separate_process_no_rescan():
         assert res["smd_bytes_read_attr"] == orig_smd, \
             "persisted smd_bytes_read (build provenance) should survive save"
         assert res["n_events"] == ridx.n_events
+        assert res["env_records_match"], \
+            "reloaded env_records content must equal the original " \
+            "(disk round-trip via pickle)"
+        assert res["env_probe_match"], \
+            "reloaded env as_of probe must match the original " \
+            "(disk round-trip via pickle)"
     finally:
         ridx.close()
     print(f"[disk] save -> separate-process load: byte-identical reads at "

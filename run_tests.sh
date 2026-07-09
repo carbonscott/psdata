@@ -40,12 +40,24 @@ if [[ ${#TESTS[@]} -eq 0 ]]; then
     "$REPO/tests/test_torch_us011.py"
     "$REPO/tests/test_bigdata_scan_us012.py"
     "$REPO/tests/test_uniqueid_us011.py"
+    "$REPO/tests/test_envstore_us013.py"
   )
 fi
 
 status=0
+passed=0
+failed=0
 for t in "${TESTS[@]}"; do
   echo "### running $t"
-  python3 "$t" || status=$?
+  if python3 "$t"; then
+    passed=$((passed + 1))
+  else
+    status=$?
+    failed=$((failed + 1))
+  fi
 done
+
+# Final tally over the test FILES run (each script is one pass/fail unit; a
+# nonzero exit from any file counts as a failure and is preserved below).
+echo "${passed} passed, ${failed} failed"
 exit $status
