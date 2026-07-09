@@ -88,6 +88,19 @@ _CHUNKINFO_ALG = "chunkinfo"
 _CHUNK_FILENAME_FIELD = "filename"
 _CHUNK_ID_FIELD = "chunkid"
 
+# Env (slow-data) transition services -> the env store they feed.  Mirrors
+# psana's ``EnvStoreManager.update_by_event``: SlowUpdate feeds the ``epics``
+# store; BeginStep and BeginRun feed the ``scan`` store (BeginRun carries no
+# scan container -- the env-store backward scan skips it at lookup time).  The
+# per-dgram (ts, path, offset, size) is bucketed while the L1Accept walk already
+# reads every dgram header, so this costs no extra I/O; the payload is decoded
+# lazily at lookup (see :mod:`psdata.envstore`).
+_ENV_SERVICE_STORE = {
+    _f.SERVICE_SLOWUPDATE: "epics",   # service 10
+    _f.SERVICE_BEGINSTEP: "scan",     # service 6
+    _f.SERVICE_BEGINRUN: "scan",      # service 4
+}
+
 
 def _decode_chunk_filename(arr):
     """``chunkinfo.filename`` is a rank-1 CHARSTR (uint8) field, null-padded.
@@ -186,6 +199,13 @@ class RunIndex:
         self.run_config = run_config
         self.timestamps = []          # ascending L1Accept ts
         self.entries = []             # entries[k] = {stream:(path,offset,size)}
+        # Env (slow-data) records, ADDITIVE to the canonical L1Accept index and
+        # never merged into timestamps/entries: {store_name: {stream: [(ts,
+        # path, offset, size), ...]}} ascending by ts, store_name in
+        # {"epics","scan"}.  ``path`` is the file the env dgram bytes live in
+        # (the SMD sidecar when scanned from SMD, the bigdata chunk from
+        # bigdata).  Consumed by :mod:`psdata.envstore` for as-of lookups.
+        self.env_records = {}
         self.bd_files = dict(run_config.stream_files)
         self.chunk_files = {s: [p] for s, p in run_config.stream_files.items()}
         self.build_seconds = 0.0
@@ -233,13 +253,16 @@ class RunIndex:
             # the bigdata c000 path this SMD stream indexes into (chunkinfo
             # filenames on Enable name the later chunks, in the same directory).
             bd_c000 = run_config.stream_files.get(stream)
+            env_recs = {}
             recs, nbytes, chunks = _scan_smd_stream(
-                smd_path, bd_c000, smd_read_chunk)
+                smd_path, bd_c000, smd_read_chunk, env_recs)
             per_stream[stream] = recs
             idx.smd_bytes_read += nbytes
             idx.chunk_files[stream] = chunks
             if len(chunks) > 1:
                 idx.multichunk_streams.add(stream)
+            for store, erecs in env_recs.items():
+                idx.env_records.setdefault(store, {})[stream] = erecs
 
         # SMD is already the canonical reference set -- the offline
         # smdwriter pre-truncated the end-of-run shutdown tail, so the clamp
@@ -296,12 +319,15 @@ class RunIndex:
         per_stream = {}
         for stream, bd_c000 in _f._normalize_stream_files(
                 run_config.stream_files):
-            recs, nbytes, chunks = _scan_bigdata_stream(bd_c000)
+            env_recs = {}
+            recs, nbytes, chunks = _scan_bigdata_stream(bd_c000, env_recs)
             per_stream[stream] = recs
             idx.scan_bytes_read += nbytes
             idx.chunk_files[stream] = chunks
             if len(chunks) > 1:
                 idx.multichunk_streams.add(stream)
+            for store, erecs in env_recs.items():
+                idx.env_records.setdefault(store, {})[stream] = erecs
 
         idx._merge_streams(per_stream,
                            include_shutdown_tail=include_shutdown_tail)
@@ -643,15 +669,18 @@ class RunIndex:
     # therefore EXCLUDED from the persisted state and re-initialised empty on
     # reconstruction, so fds reopen lazily on the first read in the new process.
     #
-    # The persisted state is exactly: timestamps, entries, bd_files,
-    # chunk_files, multichunk_streams, run_config, build_seconds,
+    # The persisted state is exactly: timestamps, entries, env_records,
+    # bd_files, chunk_files, multichunk_streams, run_config, build_seconds,
     # smd_bytes_read, scan_source, scan_bytes_read, include_shutdown_tail -- all
     # plain-Python / numpy-dtype values (no fds, no live C objects), so plain
     # ``pickle.dumps(idx)`` is safe once the two per-process caches are stripped.
+    # (``env_records`` values are plain (int, str, int, int) tuples -- no fds:
+    # the env store's own fd cache lives on the transient EnvStore, not here.)
 
     _PERSIST_FIELDS = (
         "timestamps",
         "entries",
+        "env_records",
         "bd_files",
         "chunk_files",
         "multichunk_streams",
@@ -672,6 +701,11 @@ class RunIndex:
         "scan_source": "smd",
         "scan_bytes_read": 0,
         "include_shutdown_tail": False,
+        # An index pickled before the env store existed has no env_records --
+        # load it as an empty mapping (no env lookups, but everything else
+        # works).  A fresh dict is installed per instance in _restore_state so
+        # the mutable default is never shared.
+        "env_records": {},
     }
 
     def _persist_state(self):
@@ -691,6 +725,11 @@ class RunIndex:
         # back-fill: an SMD-built old blob's scan_bytes_read == its smd bytes
         if "scan_bytes_read" not in state:
             self.scan_bytes_read = self.smd_bytes_read
+        # A blob predating the env store has no env_records -- install a FRESH
+        # empty dict (not the shared _PERSIST_DEFAULTS one) so it is never
+        # aliased across restored instances.
+        if "env_records" not in state:
+            self.env_records = {}
         self._bd_fds = {}        # MUST be a fresh empty cache -- never the
         self._ts_to_k = None     # serialized one (would carry stale fds)
         return self
@@ -747,8 +786,16 @@ class RunIndex:
 # ==========================================================================
 # SMD scan: read one SMD file's L1Accept records, following the chunk roll
 # ==========================================================================
-def _scan_smd_stream(path, bd_c000_path, read_chunk):
+def _scan_smd_stream(path, bd_c000_path, read_chunk, env_out=None):
     """Scan one SMD file and return ``(records, bytes_read, chunk_paths)``.
+
+    If ``env_out`` (a dict) is given, the env (slow-data) transitions found in
+    this SMD file are bucketed into it as
+    ``{store_name: [(ts, smd_path, offset, size), ...]}`` (SlowUpdate ->
+    ``epics``; BeginStep/BeginRun -> ``scan``), pointing at the SMD file itself
+    (the env dgram payload is carried inline there).  This is additive -- it
+    never enters ``records`` and leaves the 3-tuple return unchanged, so
+    existing callers are unaffected.
 
     ``records`` is a list of ``(ts, chunk_path, intOffset, intDgramSize)`` for
     every ``L1Accept``: ``chunk_path`` is the bigdata chunk file the offset
@@ -830,6 +877,14 @@ def _scan_smd_stream(path, bd_c000_path, read_chunk):
                         cur_chunk_id = new_id
                         cur_chunk_path = os.path.join(bd_dir, new_name)
                         chunk_paths.append(cur_chunk_path)
+            elif env_out is not None and h["service"] in _ENV_SERVICE_STORE:
+                # Env (slow-data) transition: the dgram payload is carried inline
+                # in THIS SMD file (byte-identical to the bigdata copy but at a
+                # different offset), so the env record points at the SMD file.
+                # Additive only -- never enters the L1Accept records.
+                store = _ENV_SERVICE_STORE[h["service"]]
+                env_out.setdefault(store, []).append(
+                    (h["ts"], path, off, total))
             off += total
         return records, bytes_read, chunk_paths
     finally:
@@ -885,7 +940,7 @@ def _enumerate_bd_chunks(bd_c000_path):
     return chunks if chunks else [bd_c000_path]
 
 
-def _scan_bigdata_stream(bd_c000_path):
+def _scan_bigdata_stream(bd_c000_path, env_out=None):
     """Build one stream's L1Accept ``(ts, chunk_path, intOffset, intDgramSize)``
     records by walking the BIGDATA chunk files directly -- no SMD file needed.
 
@@ -902,7 +957,13 @@ def _scan_bigdata_stream(bd_c000_path):
     Returns ``(records, bytes_read, chunk_paths)`` in the SAME shape as
     :func:`_scan_smd_stream`, so :meth:`RunIndex.build_from_bigdata` and
     :meth:`RunIndex.build` feed :meth:`RunIndex._merge_streams` identically and
-    produce byte-for-byte identical indexes.
+    produce byte-for-byte identical indexes.  If ``env_out`` (a dict) is given it
+    is filled with ``{store_name: [(ts, chunk_path, offset, size), ...]}`` for
+    the env transitions (SlowUpdate -> ``epics``; BeginStep/BeginRun ->
+    ``scan``), pointing at the bigdata chunk the bytes live in; additive, never
+    in ``records``, and it leaves the 3-tuple return unchanged.  The env
+    timestamps it yields are identical to the SMD path's (the same broadcast
+    transition dgrams), only the file/offset differ.
 
     Only ``SERVICE_L1ACCEPT`` (service 12) dgrams are indexed -- consistent with
     the SMD path -- and EOB L1Accepts (``SERVICE_L1ACCEPT_EOB``, service 11,
@@ -929,6 +990,13 @@ def _scan_bigdata_stream(bd_c000_path):
                     break                       # truncated final dgram
                 if h["service"] == _f.SERVICE_L1ACCEPT:
                     records.append((h["ts"], chunk_path, cursor, total))
+                elif env_out is not None and h["service"] in _ENV_SERVICE_STORE:
+                    # Env (slow-data) transition: bytes live in THIS bigdata
+                    # chunk at ``cursor``; only its 24-byte header was read, the
+                    # payload is decoded lazily at lookup.  Additive only.
+                    store = _ENV_SERVICE_STORE[h["service"]]
+                    env_out.setdefault(store, []).append(
+                        (h["ts"], chunk_path, cursor, total))
                 cursor += total
         finally:
             os.close(fd)

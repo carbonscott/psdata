@@ -75,6 +75,19 @@ DTYPE_NP = {0: np.uint8, 1: np.uint16, 2: np.uint32, 3: np.uint64,
             8: np.float32, 9: np.float64, 10: np.uint8, 11: np.uint32,
             12: np.uint32}
 
+# DataType.CHARSTR: a null-padded byte string stored as a rank-1 uint8 array
+# (DTYPE_NP[10] == uint8).  psana's ``DetectorImpl._return_types`` maps type 10
+# to ``str`` regardless of rank, so the env store decodes such a field to a
+# Python ``str`` via :func:`decode_charstr`.
+TYPE_CHARSTR = 10
+
+
+def decode_charstr(arr):
+    """Decode a CHARSTR field (a null-padded ``uint8`` array from
+    :func:`extract_field`) to a ``str``: take the bytes up to the first NUL and
+    decode as latin-1.  Mirrors how psana surfaces a ``type==10`` env field."""
+    return bytes(np.asarray(arr).tobytes()).split(b"\x00")[0].decode("latin-1")
+
 MAXRANK = 5
 SHAPE_SZ = 4 * MAXRANK              # uint32 _shape[5] = 20B
 ALG_SZ = 256 + 4                    # char[256] + uint32 version = 260B
@@ -168,17 +181,29 @@ def parse_names_block(buf, payload_off, payload_end):
 
 def parse_configure(buf):
     """Walk the Configure dgram at offset 0; return ``{(nodeId,namesId): table}``.
-    The Configure's top Xtc is a Parent whose children are Names blocks."""
+    The Configure's top Xtc is a Parent whose children are Names blocks -- but a
+    Names table may sit **nested one level deeper** inside another ``TID_PARENT``
+    (the ``scan`` config's Names table does: it rides inside a Parent, so a
+    direct-children-only walk never sees it).  Recurse through ``TID_PARENT``
+    containers while collecting every ``TID_NAMES`` -- the same recursion
+    :func:`iter_shapesdata` uses for ShapesData -- so no declared detector
+    (e.g. ``scan``) is missed.  Return signature is unchanged."""
     cfg = parse_dgram_header(buf, 0)
     assert cfg["service"] == SERVICE_CONFIGURE, "front dgram is not Configure"
     top_payload = DGRAM_HDR                       # 24
     top_end = XTC_HDR + cfg["extent"]             # dgram total on-disk size
     tables = {}
-    for xoff, xh in iter_xtc_children(buf, top_payload, top_end):
-        if typeid_type(xh["typeid"]) == TID_NAMES:
-            nodeId, namesId = namesid_of(xh["src"])
-            tbl = parse_names_block(buf, xoff + XTC_HDR, xoff + xh["extent"])
-            tables[(nodeId, namesId)] = tbl
+    stack = [(top_payload, top_end)]
+    while stack:
+        po, pe = stack.pop()
+        for xoff, xh in iter_xtc_children(buf, po, pe):
+            t = typeid_type(xh["typeid"])
+            if t == TID_NAMES:
+                nodeId, namesId = namesid_of(xh["src"])
+                tbl = parse_names_block(buf, xoff + XTC_HDR, xoff + xh["extent"])
+                tables[(nodeId, namesId)] = tbl
+            elif t == TID_PARENT:
+                stack.append((xoff + XTC_HDR, xoff + xh["extent"]))
     return cfg, tables, top_end
 
 
@@ -821,7 +846,7 @@ def _collect_segments(buf, dg_off, dg_hdr, want, tables, field):
 # ==========================================================================
 # Import-purity self check
 # ==========================================================================
-_FORBIDDEN_MODULES = ("psana", "mpi4py", "h5py")
+_FORBIDDEN_MODULES = ("psana", "mpi4py", "h5py", "xtcdata")
 
 
 def assert_no_framework_imports():

@@ -142,7 +142,7 @@ def test_persist_state_fields_exact():
 
         state = ridx._persist_state()
         expected = {
-            "timestamps", "entries", "bd_files", "chunk_files",
+            "timestamps", "entries", "env_records", "bd_files", "chunk_files",
             "multichunk_streams", "run_config", "build_seconds",
             "smd_bytes_read", "scan_source", "scan_bytes_read",
             "include_shutdown_tail",

@@ -48,13 +48,16 @@ Importing psdata pulls in only numpy -- no psana / mpi4py / h5py.
 from . import format  # noqa: F401  (re-export the parse core)
 from . import stream   # noqa: F401  (re-export the streaming layer)
 from . import index    # noqa: F401  (re-export the random-access layer)
+from . import envstore  # noqa: F401  (re-export the env-store layer)
 from . import run      # noqa: F401  (re-export the public run surface)
 from .format import discover, filter_c000, stream_index_of, decode_damage
 from .stream import Event, events
 from .index import RunIndex, build_index, smd_files_for
+from .envstore import EnvStore, EnvStoreManager
 from .run import Run, open
 
-__all__ = ["format", "stream", "index", "run",
+__all__ = ["format", "stream", "index", "envstore", "run",
            "open", "Run", "discover", "events", "Event",
            "RunIndex", "build_index", "smd_files_for",
+           "EnvStore", "EnvStoreManager",
            "filter_c000", "stream_index_of", "decode_damage"]

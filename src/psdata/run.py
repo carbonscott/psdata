@@ -47,6 +47,7 @@ import os
 from . import format as _f
 from . import stream as _s
 from . import index as _i
+from . import envstore as _e
 
 
 class _AlgNamespace:
@@ -195,6 +196,7 @@ class Run:
         self.config = run_config
         self._smd_files = smd_files            # explicit SMD map, or None
         self._index = None                     # lazily built RunIndex
+        self._env = None                       # lazily built EnvStoreManager
 
     # -- streaming ---------------------------------------------------------
     def events(self, gate=True):
@@ -288,6 +290,49 @@ class Run:
         on first use).  See :meth:`psdata.index.RunIndex.read_stack`."""
         return self.build_index().read_stack(ks, det, field=field, alg=alg)
 
+    # -- env / slow data (epics, scan) ------------------------------------
+    @property
+    def env(self):
+        """The run's :class:`~psdata.envstore.EnvStoreManager` -- as-of random
+        access to the ``epics`` and ``scan`` env stores.
+
+        Lazily built on first use; building it first builds the random-access
+        index (whose header walk already recorded the env dgram offsets, so no
+        extra I/O), then wraps the index's ``env_records``.  Cached on the run.
+        """
+        if self._env is None:
+            idx = self.build_index()
+            self._env = _e.EnvStoreManager(self.config, idx.env_records)
+        return self._env
+
+    def env_store(self, name):
+        """Return the :class:`~psdata.envstore.EnvStore` named ``name``
+        (``"epics"`` or ``"scan"``)."""
+        return self.env.store(name)
+
+    def epics(self, var, ts):
+        """As-of value of epics variable ``var`` at event timestamp ``ts`` (or
+        ``None`` if no SlowUpdate at/before ``ts`` carries it).  Random access:
+        ``searchsorted(env_ts, ts, 'right')-1`` then backward-skip, exactly as
+        psana's env store -- see :meth:`psdata.envstore.EnvStore.as_of`."""
+        return self.env.store("epics").value(var, ts)
+
+    def scan(self, var, ts):
+        """As-of value of scan field ``var`` (``step_value`` / ``step_docstring``)
+        at event timestamp ``ts`` (or ``None``).  Fed by BeginStep; the backward
+        scan skips the containerless BeginRun."""
+        return self.env.store("scan").value(var, ts)
+
+    def epicsinfo(self):
+        """``{(var, pv): pv}`` mapping every epics variable to its real PV name
+        (``''`` if unmapped) -- byte-identical to psana's ``run.epicsinfo``."""
+        return self.env.epicsinfo()
+
+    def scaninfo(self):
+        """``{(var, alg): alg}`` for the scan store -- byte-identical to psana's
+        ``run.scaninfo``."""
+        return self.env.scaninfo()
+
     # -- introspection -----------------------------------------------------
     def detector_names(self, include_bookkeeping=False):
         """Sorted detector names discovered from the Configure Names tables.  By
@@ -355,8 +400,12 @@ class Run:
 
     # -- resource management ----------------------------------------------
     def close(self):
-        """Release the random-access index's open bigdata file descriptors (if
-        an index was built).  Streaming opens/closes its own per-call cursors."""
+        """Release the random-access index's and env store's open file
+        descriptors (if built).  Streaming opens/closes its own per-call
+        cursors."""
+        if self._env is not None:
+            self._env.close()
+            self._env = None
         if self._index is not None:
             self._index.close()
             self._index = None
