@@ -78,6 +78,14 @@ EPICS_VARS = [
 # template str {"detname": "epixhr_0", "scantype": "scan", "step": step}.
 SCAN_VARS = ["step_value", "step_docstring"]
 
+# Floor on how many of the N = len(EVENT_KS) * (EPICS_VARS + SCAN_VARS) pairs
+# must have a non-None psana ground-truth value.  _values_equal(None, None) is
+# True, so without this floor an all-None run (e.g. every as-of lookup broken)
+# would still print "N pairs compared, 0 mismatches".  Measured: 80 of 120
+# pairs are non-None (the other 40 are the 4 pre-first-SlowUpdate/BeginStep
+# events x the 10 epics vars); 60 leaves headroom without masking a regression.
+MIN_NON_NONE_PAIRS = 60
+
 
 # --------------------------------------------------------------------------
 # import purity -- psdata pulls in only numpy, no framework
@@ -201,6 +209,39 @@ def run_oracle_regression():
     psdata_scaninfo = {k[0]: v for k, v in psdata_scaninfo_raw.items()}
     assert "psana" not in sys.modules, "psana leaked into sys.modules via psdata"
 
+    # ---- direct probe: backward scan must skip the containerless BeginRun -
+    # BeginRun (service 4) is always the scan store's earliest record (index 0;
+    # index 1 is BeginStep 0), so an as_of() landing exactly on BeginRun's own
+    # timestamp can never step back to an earlier BeginStep -- the only
+    # provably-correct result there is (None, None): the backward scan reads
+    # BeginRun, finds no scan container, and has nowhere earlier to fall back
+    # to. None of the sampled EVENT_KS lands on BeginRun (even k=0 is already
+    # after BeginStep 0), so this boundary needs its own direct probe -- this
+    # runs BEFORE the psana oracle import so it still exercises psdata even if
+    # psana is unavailable.
+    scan_store = r.env_store("scan")
+    scan_stream = scan_store.owning_stream("step_value")
+    scan_env_ts = scan_store.timestamps(scan_stream)
+    begin_run_ts = int(scan_env_ts[0])
+    begin_step0_ts = int(scan_env_ts[1])
+    assert begin_run_ts < begin_step0_ts, (
+        f"expected the scan store's first record (BeginRun) to precede its "
+        f"second (BeginStep 0): begin_run_ts={begin_run_ts} "
+        f"begin_step0_ts={begin_step0_ts}")
+    probe_ts = begin_run_ts
+    pos = int(np.searchsorted(scan_env_ts, np.uint64(probe_ts), side="right")) - 1
+    assert pos == 0, (
+        f"probe_ts (=begin_run_ts) must resolve to the store's record index 0 "
+        f"(BeginRun); got pos={pos}")
+    probe_result = scan_store.as_of("step_value", probe_ts)
+    assert probe_result == (None, None), (
+        f"as_of('step_value', begin_run_ts) must resolve to (None, None): the "
+        f"backward scan should read the containerless BeginRun, find no "
+        f"step_value field, and have no earlier BeginStep to fall back to -- "
+        f"got {probe_result!r}")
+    print(f"[ok] scan store backward-scan skips the containerless BeginRun "
+          f"(probe_ts={probe_ts} -> as_of('step_value', ...) == (None, None))")
+
     # ---- psana side: the oracle (imports psana; may raise PsanaUnavailable) -
     from _env_oracle import psana_env_ground_truth
     gt = psana_env_ground_truth(
@@ -253,11 +294,14 @@ def run_oracle_regression():
     # ---- (c) every (event, variable) as-of value -------------------------
     N = 0
     M = 0
+    non_none = 0
     for k in EVENT_KS:
         for var in EPICS_VARS:
             N += 1
             gval = gt["epics"][k][var]
             pval = psdata_epics[k][var]
+            if gval is not None:
+                non_none += 1
             if not _values_equal(gval, pval):
                 M += 1
                 print(f"  [FAIL] epics k={k} var={var!r}: "
@@ -266,6 +310,8 @@ def run_oracle_regression():
             N += 1
             gval = gt["scan"][k][var]
             pval = psdata_scan[k][var]
+            if gval is not None:
+                non_none += 1
             if not _values_equal(gval, pval):
                 M += 1
                 print(f"  [FAIL] scan  k={k} var={var!r}: "
@@ -274,8 +320,74 @@ def run_oracle_regression():
     if M == 0:
         print(f"[ok] all {N} (event, variable) as-of values bit-equal to psana")
 
+    # Non-None floor: guards against a vacuous "0 mismatches" tally (see
+    # MIN_NON_NONE_PAIRS above) by requiring a minimum count of pairs whose
+    # psana ground truth actually resolved to a real (non-None) value.
+    if non_none < MIN_NON_NONE_PAIRS:
+        msg = (f"NON-NONE FLOOR BREACHED: only {non_none} of {N} pairs had a "
+               f"non-None psana ground truth value (need >= "
+               f"{MIN_NON_NONE_PAIRS}) -- the comparison may be vacuous")
+        print("  [FAIL] " + msg)
+        hard_failures.append(msg)
+    else:
+        print(f"[ok] non-None floor: {non_none} of {N} pairs have a real "
+              f"psana ground-truth value (>= {MIN_NON_NONE_PAIRS})")
+
     r.close()
     return N, M, hard_failures
+
+
+# --------------------------------------------------------------------------
+# parity tripwires -- psdata-only, no psana needed
+# --------------------------------------------------------------------------
+def test_env_store_parity_invariants():
+    """Pin two invariants that this fixture relies on to make psdata's env-store
+    rules provably equivalent to psana's, for every variable in both the
+    ``epics`` and ``scan`` stores.
+
+    (a) ``type_code <= 10`` for every var: this fixture never exercises the
+        rank-0 ENUMVAL/ENUMDICT (11/12) decode path in
+        :meth:`~psdata.envstore.EnvStore._convert`. If a future dataset
+        introduces a rank-0 enum variable, that path must fail loudly here
+        rather than ship silently unexercised.
+    (b) exactly one owning stream per var: psana's ``EnvManager.locate_variable``
+        stops at the FIRST env manager (stream) that declares the variable;
+        psdata's :meth:`~psdata.envstore.EnvStore.as_of` takes the first
+        owning stream in ascending order
+        (:meth:`~psdata.envstore.EnvStore._owning_streams`). The two
+        "first wins" rules are only provably the same policy when each
+        variable is declared in exactly one stream -- if a var were ever
+        declared in more than one, psana's iteration order and psdata's
+        ascending-stream order could disagree, and this suite would have no
+        way to know.
+
+    Needs psdata only (no psana) -- must pass even when the oracle SKIPs.
+    """
+    import psdata
+
+    r = psdata.open(exp=EXP, run=RUN, dir=DIR)
+    r.build_index()
+
+    checked = 0
+    for store_name in ("epics", "scan"):
+        store = r.env_store(store_name)
+        for var in store.var_names():
+            checked += 1
+            type_code = store._field_info(var).type_code
+            assert type_code <= 10, (
+                f"{store_name}.{var}: type_code={type_code} > 10 -- rank-0 "
+                f"ENUMVAL/ENUMDICT decode path is not exercised by this "
+                f"fixture and must not ship untested")
+            owning = store._owning_streams(var)
+            assert len(owning) == 1, (
+                f"{store_name}.{var}: declared in {len(owning)} streams "
+                f"{owning} (expected exactly 1) -- psana's 'first owning "
+                f"stream wins' and psdata's ascending-order pick are only "
+                f"provably equivalent when unambiguous")
+
+    r.close()
+    print(f"[ok] env-store parity invariants hold for all {checked} vars in "
+          f"epics+scan (type_code<=10, exactly 1 owning stream each)")
 
 
 def main():
@@ -292,6 +404,10 @@ def main():
     print("[ok] import purity (in-proc): psdata + envstore pull in no framework")
     test_import_purity_subprocess()
     print("[ok] import purity (subprocess): fresh interpreter stays clean")
+
+    # psdata-only parity tripwires (no psana needed) -- must run even when the
+    # oracle below SKIPs.
+    test_env_store_parity_invariants()
 
     # 2/3/4/5. build psdata, regenerate psana ground truth, compare.
     from _env_oracle import PsanaUnavailable

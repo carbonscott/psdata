@@ -44,9 +44,12 @@ One row per sampled variable at one env-dgram timestamp:
   pv                 the real EPICS PV name (e.g. 'AT1K0:GAS:PhotonEnergy_RBV').
                      '' for a var with no epicsinfo mapping (e.g. 'StaleFlags')
                      and for every scan var -- such rows are kept, not dropped.
-  value              scalar numeric value (float or int), NUMERIC affinity so an
-                     int stays INTEGER and a float stays REAL; NULL for
-                     str / array / none.
+  value              scalar numeric value (float or int).  NUMERIC affinity
+                     picks INTEGER vs REAL from the VALUE, not the original
+                     Python type -- an integral float (e.g. 10000.0) is
+                     stored as INTEGER, indistinguishable in this column from
+                     a true int.  value_type is the authoritative record of
+                     the original Python type.  NULL for str / array / none.
   value_text         string value (NULL otherwise)
   value_json         a JSON list for a rank>=1 array value, e.g. StaleFlags
                      (NULL otherwise)
@@ -218,7 +221,7 @@ def _create_table(conn, ts_coltype):
             stream             INTEGER NOT NULL,
             var                TEXT    NOT NULL,
             pv                 TEXT    NOT NULL,
-            value              NUMERIC,
+            value              NUMERIC,  -- INTEGER vs REAL is value-based; see value_type
             value_text         TEXT,
             value_json         TEXT,
             value_type         TEXT    NOT NULL,

@@ -105,9 +105,7 @@ _ENV_SERVICE_STORE = {
 def _decode_chunk_filename(arr):
     """``chunkinfo.filename`` is a rank-1 CHARSTR (uint8) field, null-padded.
     Return it as a ``str`` (the bare basename of the next bigdata chunk)."""
-    raw = bytes(np.asarray(arr).tobytes())
-    z = raw.find(b"\x00")
-    return raw[:z if z >= 0 else len(raw)].decode("latin-1")
+    return _f.decode_charstr(arr)
 
 
 # ==========================================================================

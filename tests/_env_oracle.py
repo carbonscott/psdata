@@ -103,7 +103,7 @@ def psana_env_ground_truth(exp, run, dir, event_ks, epics_vars, scan_vars):
           "n_events_iterated": int,
         }
 
-    Stops iterating after ``max(event_ks)`` L1Accepts (the golden run has 50000
+    Stops iterating after ``max(event_ks)`` L1Accepts (the golden run has 10000
     L1Accepts / 2.3 GB of bigdata -- do NOT walk the whole run).
 
     Raises ``PsanaUnavailable`` if psana cannot be imported.

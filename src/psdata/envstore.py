@@ -73,7 +73,20 @@ N_STEP_SEARCH_STEPS = 10
 
 
 def _search_steps():
-    return int(os.environ.get("PSDATA_N_STEP_SEARCH_STEPS", N_STEP_SEARCH_STEPS))
+    raw = os.environ.get("PSDATA_N_STEP_SEARCH_STEPS")
+    if raw is None:
+        return N_STEP_SEARCH_STEPS
+    try:
+        return int(raw)
+    except ValueError:
+        # Name the variable and echo the offending value; a bare int() failure
+        # would crash an otherwise-valid as_of() without saying why.  (A value of
+        # 0 or negative is intentionally accepted -- it yields an empty backward
+        # scan, matching psana's range(pos, pos - depth, -1) parity.)
+        raise ValueError(
+            "PSDATA_N_STEP_SEARCH_STEPS must be an integer (backward-scan "
+            f"depth), got {raw!r}"
+        ) from None
 
 
 class EnvStore:
@@ -185,8 +198,8 @@ class EnvStore:
 
     def _convert(self, var, raw):
         """Coerce the raw DescData value to psana's ``_return_types`` shape:
-        type 10 (CHARSTR) -> str; rank-0 type<8 -> int, type 8/9 -> float;
-        rank>=1 numeric -> ndarray."""
+        type 10 (CHARSTR) -> str; rank-0 type<8, ENUMVAL, or ENUMDICT -> int,
+        rank-0 type 8/9 -> float; rank>=1 numeric -> ndarray."""
         fi = self._field_info(var)
         if fi is None:
             return raw
@@ -194,7 +207,8 @@ class EnvStore:
         if t == _f.TYPE_CHARSTR:
             return _f.decode_charstr(raw)
         if rank == 0:
-            if t < 8:
+            # ENUMVAL/ENUMDICT are scalar-valued like the plain integer types.
+            if t < 8 or t in (_f.TYPE_ENUMVAL, _f.TYPE_ENUMDICT):
                 return int(raw)
             if t < 10:
                 return float(raw)
@@ -258,11 +272,11 @@ class EnvStore:
                     stream = streams[0]
                     path = self._run_config.stream_files[stream]
                     tables = self._run_config.raw_tables[stream]
-                    fd = os.open(path, os.O_RDONLY)
-                    try:
-                        buf = bytearray(os.pread(fd, _f._CONFIG_READ, 0))
-                    finally:
-                        os.close(fd)
+                    # Read the WHOLE Configure dgram (grow-on-demand): a single
+                    # bare pread of _CONFIG_READ would truncate a Configure
+                    # larger than 4 MB, making the epicsinfo walk run past the
+                    # buffer -- silently dropping genuinely-mapped PV names.
+                    buf = _f._read_front_buffer(path)
                     hdr = _f.parse_dgram_header(buf, 0)
                     for fn in info_det.field_names(alg):
                         if fn == _EPICS_INFO_SKIP_FIELD:
@@ -309,6 +323,16 @@ class EnvStore:
                 pass
         self._fds.clear()
 
+    def __del__(self):
+        # Safety net: release the cached fds if this store is dropped without an
+        # explicit close() (e.g. a Run garbage-collected without Run.close()).
+        # Mirrors RunIndex.__del__ -- swallow everything, since during
+        # interpreter shutdown globals (os) may already be gone; must not raise.
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def __repr__(self):
         return (f"EnvStore(name={self.name!r}, streams={sorted(self._records)}, "
                 f"n_items={self.n_items()}, nvars={len(self.var_names())})")
@@ -346,6 +370,14 @@ class EnvStoreManager:
     def close(self):
         for store in self.stores.values():
             store.close()
+
+    def __del__(self):
+        # Safety net: close every owned store if the manager is dropped without
+        # an explicit close() (mirrors RunIndex.__del__).  Must never raise.
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __repr__(self):
         return f"EnvStoreManager(stores={sorted(self.stores)})"
