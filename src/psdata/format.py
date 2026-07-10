@@ -86,6 +86,11 @@ TYPE_CHARSTR = 10
 TYPE_ENUMVAL = 11
 TYPE_ENUMDICT = 12
 
+# Every DataType code this reader can decode.  Exactly the key set of the
+# dtype tables above: FieldInfo raises KeyError on any other code, and
+# EnvStore._convert dispatches on precisely these.
+SUPPORTED_TYPE_CODES = frozenset(DTYPE_NP)
+
 
 def decode_charstr(arr):
     """Decode a CHARSTR field (a null-padded ``uint8`` array from

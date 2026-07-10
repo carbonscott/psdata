@@ -340,16 +340,113 @@ def run_oracle_regression():
 # --------------------------------------------------------------------------
 # parity tripwires -- psdata-only, no psana needed
 # --------------------------------------------------------------------------
+def _fixed_field_store(field_info):
+    """An :class:`~psdata.envstore.EnvStore` that reports ``field_info`` for
+    every variable.
+
+    ``_convert`` reads no instance state other than what ``_field_info``
+    returns, so this drives the real conversion code over type codes the
+    rixx45619 fixture does not happen to carry. ``EnvStore.__init__`` is
+    skipped on purpose: opening a dataset would add nothing to the type
+    dispatch under test.
+    """
+    from psdata.envstore import EnvStore
+
+    class _FixedFieldStore(EnvStore):
+        def __init__(self):
+            pass
+
+        def _field_info(self, var):
+            return field_info
+
+    return _FixedFieldStore()
+
+
+def test_convert_rank0_enum_decode():
+    """Execute the rank-0 ENUMVAL/ENUMDICT -> int branch of
+    :meth:`~psdata.envstore.EnvStore._convert`.
+
+    ``envstore.py`` coerces a rank-0 type 11/12 field to a Python ``int``, to
+    match psana's ``_return_types``. No variable in the rixx45619 fixture is a
+    rank-0 enum, so the branch is driven here against the real ``_convert``
+    with a synthetic ``FieldInfo``.
+
+    Needs psdata only (no psana).
+    """
+    import numpy as np
+    from psdata.format import FieldInfo, TYPE_ENUMVAL, TYPE_ENUMDICT
+
+    decoded = {}
+    for code, label, raw in ((TYPE_ENUMVAL, "ENUMVAL", np.uint32(3)),
+                             (TYPE_ENUMDICT, "ENUMDICT", np.uint32(7))):
+        store = _fixed_field_store(FieldInfo("enum_pv", code, 0))
+        value = store._convert("enum_pv", raw)
+        assert type(value) is int, (
+            f"rank-0 {label} (type {code}) decoded to "
+            f"{type(value).__name__}, expected a Python int")
+        assert value == int(raw), (
+            f"rank-0 {label} (type {code}) decoded to {value!r}, "
+            f"expected {int(raw)!r}")
+        decoded[label] = value
+
+    print(f"[ok] rank-0 ENUMVAL/ENUMDICT -> int conversion executed: "
+          f"ENUMVAL(11) raw uint32(3) -> {decoded['ENUMVAL']!r}, "
+          f"ENUMDICT(12) raw uint32(7) -> {decoded['ENUMDICT']!r} "
+          f"(both Python int)")
+
+
+def test_enum_tripwire_rejects_only_undecodable_types():
+    """The parity invariant's type-code tripwire must accept the enum codes
+    ``_convert`` decodes and reject a code it cannot.
+
+    The original tripwire asserted ``type_code <= 10``, which would have turned
+    this suite red on the first rank-0 enum PV -- exactly the data
+    :meth:`~psdata.envstore.EnvStore._convert` was written to handle. The
+    predicate now tracks what the reader can actually decode, and type code 13
+    witnesses the other side: ``FieldInfo`` cannot even be built for it.
+
+    Needs psdata only (no psana).
+    """
+    from psdata.format import (FieldInfo, SUPPORTED_TYPE_CODES,
+                               TYPE_ENUMDICT, TYPE_ENUMVAL)
+
+    for code, label in ((TYPE_ENUMVAL, "ENUMVAL"), (TYPE_ENUMDICT, "ENUMDICT")):
+        assert code in SUPPORTED_TYPE_CODES, (
+            f"tripwire rejects {label} (type_code={code}), a code _convert "
+            f"decodes to int at rank 0")
+
+    undecodable = 13
+    assert undecodable not in SUPPORTED_TYPE_CODES, (
+        f"tripwire accepts type_code={undecodable}, which _convert cannot "
+        f"decode")
+    try:
+        FieldInfo("bogus", undecodable, 0)
+    except KeyError:
+        pass
+    else:
+        raise AssertionError(
+            f"type_code={undecodable} built a FieldInfo, so it is decodable "
+            f"after all and is the wrong witness for an unhandled code")
+
+    print(f"[ok] enum tripwire predicate accepts type_code {TYPE_ENUMVAL} "
+          f"(ENUMVAL) and {TYPE_ENUMDICT} (ENUMDICT), rejects unhandled "
+          f"type_code {undecodable} "
+          f"(decodable codes: {sorted(SUPPORTED_TYPE_CODES)})")
+
+
 def test_env_store_parity_invariants():
     """Pin two invariants that this fixture relies on to make psdata's env-store
     rules provably equivalent to psana's, for every variable in both the
     ``epics`` and ``scan`` stores.
 
-    (a) ``type_code <= 10`` for every var: this fixture never exercises the
-        rank-0 ENUMVAL/ENUMDICT (11/12) decode path in
-        :meth:`~psdata.envstore.EnvStore._convert`. If a future dataset
-        introduces a rank-0 enum variable, that path must fail loudly here
-        rather than ship silently unexercised.
+    (a) every var's ``type_code`` is one that
+        :meth:`~psdata.envstore.EnvStore._convert` can decode, i.e. a member of
+        ``psdata.format.SUPPORTED_TYPE_CODES``. The rank-0 ENUMVAL/ENUMDICT
+        (11/12) decode path now has direct coverage in
+        :func:`test_convert_rank0_enum_decode`, so a dataset carrying a rank-0
+        enum PV is no longer a reason for this test to fail. What must still
+        fail loudly here is a type code this reader has never seen and cannot
+        decode at all.
     (b) exactly one owning stream per var: psana's ``EnvManager.locate_variable``
         stops at the FIRST env manager (stream) that declares the variable;
         psdata's :meth:`~psdata.envstore.EnvStore.as_of` takes the first
@@ -364,6 +461,7 @@ def test_env_store_parity_invariants():
     Needs psdata only (no psana) -- must pass even when the oracle SKIPs.
     """
     import psdata
+    from psdata.format import SUPPORTED_TYPE_CODES
 
     r = psdata.open(exp=EXP, run=RUN, dir=DIR)
     r.build_index()
@@ -374,10 +472,10 @@ def test_env_store_parity_invariants():
         for var in store.var_names():
             checked += 1
             type_code = store._field_info(var).type_code
-            assert type_code <= 10, (
-                f"{store_name}.{var}: type_code={type_code} > 10 -- rank-0 "
-                f"ENUMVAL/ENUMDICT decode path is not exercised by this "
-                f"fixture and must not ship untested")
+            assert type_code in SUPPORTED_TYPE_CODES, (
+                f"{store_name}.{var}: type_code={type_code} is not a code "
+                f"_convert can decode (decodable: "
+                f"{sorted(SUPPORTED_TYPE_CODES)})")
             owning = store._owning_streams(var)
             assert len(owning) == 1, (
                 f"{store_name}.{var}: declared in {len(owning)} streams "
@@ -387,7 +485,8 @@ def test_env_store_parity_invariants():
 
     r.close()
     print(f"[ok] env-store parity invariants hold for all {checked} vars in "
-          f"epics+scan (type_code<=10, exactly 1 owning stream each)")
+          f"epics+scan (every type_code decodable by _convert, exactly 1 "
+          f"owning stream each)")
 
 
 def main():
@@ -407,6 +506,8 @@ def main():
 
     # psdata-only parity tripwires (no psana needed) -- must run even when the
     # oracle below SKIPs.
+    test_convert_rank0_enum_decode()
+    test_enum_tripwire_rejects_only_undecodable_types()
     test_env_store_parity_invariants()
 
     # 2/3/4/5. build psdata, regenerate psana ground truth, compare.
