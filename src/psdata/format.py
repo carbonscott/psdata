@@ -30,6 +30,7 @@ import os
 import re
 import struct
 import sys
+import warnings
 
 import numpy as np
 
@@ -47,6 +48,39 @@ class XtcFormatError(ValueError):
     It subclasses :class:`ValueError` so existing ``except ValueError`` /
     ``except Exception`` handlers keep degrading exactly as before.
     """
+
+
+class UnvalidatedVersionWarning(UserWarning):
+    """DET-10 signal: a detector's ``raw`` algorithm carries a
+    ``(det_type, version)`` triple psdata has **not** been byte-exact
+    cross-checked against psana for.
+
+    psana dispatches its detector data on the ``(det_type, alg, version)``
+    triple -- its ``DetectorImpl`` class name is literally
+    ``f"{det_type}_{alg}_{major}_{minor}_{micro}"`` (e.g. ``epix10ka_raw_2_0_1``)
+    -- and raises ``KeyError`` on a triple it has no class for.  A reader pinned
+    to an old class table therefore *breaks* on newer raw classes the deployed
+    release ships (e.g. ``epix10ka_raw_3_0_1``, ``epixuhr3x2_raw_0_1_0``).
+
+    psdata decodes the raw frame **generically** from the self-describing Names
+    table (field name / type / rank / per-event shape), so a bumped, additive
+    version cannot make it *mis-decode* -- but it also has no way to know the
+    version was never validated.  This warning is that missing signal: it fires
+    once per unique ``(det_type, 'raw', version)`` outside the validated set,
+    naming the detector and version so a user on new data can *see* they are on
+    an unvalidated version.  It is a real :class:`UserWarning` subclass, so it is
+    shown (not silently swallowed) and can be filtered / escalated with the
+    standard :mod:`warnings` machinery.  Suppress an accepted version with the
+    ``PSDATA_ACK_VERSIONS`` env var or :func:`acknowledge_version`.
+    """
+
+
+class UnvalidatedVersionError(XtcFormatError):
+    """Raised in place of :class:`UnvalidatedVersionWarning` when strict mode is
+    requested (``PSDATA_STRICT_VERSIONS``) -- a fail-closed opt-in for callers
+    who would rather refuse an unvalidated raw version than proceed on the
+    self-describing decode.  Subclasses :class:`XtcFormatError` (hence
+    ``ValueError``) so existing handlers catch it."""
 
 
 # ==========================================================================
@@ -178,6 +212,142 @@ def iter_xtc_children(buf, parent_payload_off, parent_payload_end):
 
 
 # ==========================================================================
+# DET-10: validated raw-alg (detector, version) table + "unknown version" signal
+# ==========================================================================
+# psana's ``Alg`` packs the algorithm version triple into the Names-block uint32
+# as ``(major << 16) | (minor << 8) | micro``; psana's ``DetectorImpl`` then
+# dispatches on the ``(det_type, alg, major, minor, micro)`` tuple (class name
+# ``f"{det_type}_{alg}_{major}_{minor}_{micro}"``) and raises ``KeyError`` on a
+# version it has no class for.  psdata read the packed uint32 (kept as
+# ``alg_version`` in every Names table) and threw it away -- it had NO signal for
+# a raw class outside the set it was validated on.  These helpers add that signal
+# without changing any decode: the returned tables are byte-for-byte identical.
+def unpack_alg_version(packed):
+    """Unpack psana's uint32 ``Alg`` version into a ``(major, minor, micro)``
+    triple: ``major = (v>>16)&0xff``, ``minor = (v>>8)&0xff``, ``micro = v&0xff``
+    (the inverse of psana's ``(major<<16)|(minor<<8)|micro`` packing)."""
+    return ((packed >> 16) & 0xff, (packed >> 8) & 0xff, packed & 0xff)
+
+
+# The ``(det_type, alg, (major, minor, micro))`` combinations whose RAW decode
+# psdata has been byte-exact cross-checked against psana for (``max|diff| == 0``).
+# Deliberately CONSERVATIVE: seeded only from the reference detectors the reader
+# was actually proven on, using the psana ``DetectorImpl`` class names recorded in
+# the sibling projects and capture tooling --
+#   * ``jungfrau_raw_0_1_0``  (jungfrau, raw, 0.1.0)
+#   * ``epix10ka_raw_2_0_1``  (epix10ka/epixquad, raw, 2.0.1)
+# (evidence: ``type(det.raw).__name__`` == ``epix10ka_raw_2_0_1`` in the epix
+# cross-check; ``jungfrau_raw_0_1_0`` in pscalib's detector registry.)  The check
+# is scoped to the ``raw`` alg -- exactly the versioned classes DET-10 is about
+# ("the deployed release ships **raw classes** ..."); the ``config`` alg rides
+# under the same raw class in psana and the bookkeeping algs (runinfo / chunkinfo
+# / epicsinfo / pvdetinfo / triginfo / offsetAlg) are DAQ containers, not
+# version-dispatched detector physics, so none of them are signalled.
+_VALIDATED_RAW_VERSIONS = frozenset({
+    ("jungfrau", "raw", (0, 1, 0)),
+    ("epix10ka", "raw", (2, 0, 1)),
+})
+
+# Signal each unique unvalidated ``(det_type, 'raw', version)`` at most once per
+# process (discovery re-parses the Names tables for every stream / index build).
+_signaled_versions = set()
+
+# Versions acknowledged programmatically at runtime (see acknowledge_version).
+_acknowledged_versions = set()
+
+# Truthy tokens for the boolean strict-mode env var.
+_TRUE_TOKENS = frozenset({"1", "true", "yes", "on", "raise", "strict"})
+
+
+def _strict_versions():
+    """True when the caller opted into fail-closed behaviour for an unvalidated
+    raw version (``PSDATA_STRICT_VERSIONS`` truthy)."""
+    return os.environ.get("PSDATA_STRICT_VERSIONS", "").strip().lower() \
+        in _TRUE_TOKENS
+
+
+def _version_acknowledged(det_type, version_triple):
+    """True when the caller has acknowledged ``(det_type, version_triple)`` as a
+    raw version they have validated -- via :func:`acknowledge_version` or the
+    ``PSDATA_ACK_VERSIONS`` env var.  Env tokens (comma/whitespace separated):
+
+      * ``all`` / ``*``            -- acknowledge every det_type + version
+      * ``<det_type>``             -- acknowledge every version of that det_type
+      * ``<det_type>:<M.m.u>``     -- acknowledge one specific version
+    """
+    if (det_type, version_triple) in _acknowledged_versions \
+            or (det_type, None) in _acknowledged_versions \
+            or (None, None) in _acknowledged_versions:
+        return True
+    spec = os.environ.get("PSDATA_ACK_VERSIONS", "")
+    if not spec.strip():
+        return False
+    vtxt = "%d.%d.%d" % version_triple
+    for tok in re.split(r"[,\s]+", spec.strip()):
+        if not tok:
+            continue
+        if tok in ("all", "*"):
+            return True
+        dt, sep, ver = tok.partition(":")
+        if not sep:
+            if dt == det_type:
+                return True
+        elif dt == det_type and ver in ("", "*", vtxt):
+            return True
+    return False
+
+
+def acknowledge_version(det_type, version=None, alg="raw"):
+    """Acknowledge a raw ``(det_type, version)`` a caller has validated, so it no
+    longer signals (neither warns nor, in strict mode, raises) for the rest of
+    the process.  ``version`` may be a ``(major, minor, micro)`` triple, a
+    ``"major.minor.micro"`` string, or ``None`` to acknowledge every version of
+    ``det_type``; ``det_type=None`` acknowledges everything.  The programmatic
+    twin of the ``PSDATA_ACK_VERSIONS`` env var (``alg`` is accepted for symmetry
+    with the signal, which only ever fires for ``'raw'``)."""
+    if det_type is None:
+        _acknowledged_versions.add((None, None))
+        return
+    if version is None:
+        _acknowledged_versions.add((det_type, None))
+        return
+    if isinstance(version, str):
+        version = tuple(int(p) for p in version.split("."))
+    _acknowledged_versions.add((det_type, tuple(version)))
+
+
+def _signal_unvalidated_raw_version(det_type, alg_name, version_triple):
+    """DET-10 core: if ``(det_type, 'raw', version_triple)`` is not in the
+    validated set (and not acknowledged), SIGNAL it -- raise
+    :class:`UnvalidatedVersionError` in strict mode, else emit a deduplicated
+    :class:`UnvalidatedVersionWarning`.  No-op for any non-``raw`` alg and for
+    every validated / acknowledged version, so a known version's decode is
+    entirely unchanged."""
+    if alg_name != "raw":
+        return
+    key = (det_type, alg_name, version_triple)
+    if key in _VALIDATED_RAW_VERSIONS or _version_acknowledged(det_type,
+                                                               version_triple):
+        return
+    vtxt = "%d.%d.%d" % version_triple
+    msg = (
+        f"psdata has not been byte-exact validated against psana for raw class "
+        f"{det_type}_raw_{version_triple[0]}_{version_triple[1]}_{version_triple[2]} "
+        f"(det_type={det_type!r}, alg='raw', version={vtxt}). The xtc2 raw format "
+        f"is self-describing and additive, so psdata decodes it generically from "
+        f"the Names table without mis-decoding -- but this (detector, version) is "
+        f"OUTSIDE psdata's validated set, so its byte-exactness vs psana is "
+        f"unverified. Acknowledge it (PSDATA_ACK_VERSIONS or "
+        f"psdata.format.acknowledge_version) once you have checked it, or set "
+        f"PSDATA_STRICT_VERSIONS=1 to refuse it.")
+    if _strict_versions():
+        raise UnvalidatedVersionError(msg)
+    if key not in _signaled_versions:
+        _signaled_versions.add(key)
+        warnings.warn(msg, UnvalidatedVersionWarning, stacklevel=3)
+
+
+# ==========================================================================
 # Configure: build the Names tables, keyed by (nodeId, namesId)
 # ==========================================================================
 def parse_names_block(buf, payload_off, payload_end):
@@ -191,6 +361,14 @@ def parse_names_block(buf, payload_off, payload_end):
     alg_name = _cstr(buf, alg_off)
     alg_version = struct.unpack_from("<I", buf, alg_off + 256)[0]
     segment = struct.unpack_from("<I", buf, alg_off + 260)[0]
+
+    # DET-10: the version is no longer silently discarded.  psdata decodes the
+    # raw frame generically (byte-exact reads are unchanged, below), but a raw
+    # class outside the validated set now SIGNALS -- so a user on new/deployed
+    # data (e.g. epix10ka_raw_3_0_1) can see it is unvalidated.  No-op for a
+    # validated version and for every non-raw alg.
+    _signal_unvalidated_raw_version(det_type, alg_name,
+                                    unpack_alg_version(alg_version))
 
     names_off = o + NAMEINFO_SZ
     n_names = (payload_end - names_off) // NAME_SZ
