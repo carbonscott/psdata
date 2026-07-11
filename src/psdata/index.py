@@ -136,7 +136,12 @@ def _decode_chunk_filename(arr):
 # object/pickled array" trap: the ragged per-event ``entries`` are encoded as
 # explicit tagged lists/dicts, never handed to ``np.array``/``np.savez``.
 _INDEX_MAGIC = b"PSDATIDX"          # 8 bytes; identifies a psdata index file
-_INDEX_FORMAT_VERSION = 1           # bump on ANY incompatible layout change
+_INDEX_FORMAT_VERSION = 2           # bump on ANY incompatible layout change
+# v1 -> v2 (IDX-03): the payload gained a ``portability`` record and stores its
+# file paths RELATIVE to a common root (relocatable index).  ``load`` still
+# reads a v1 payload (no ``portability`` key -> absolute paths, as before), so
+# older-but-magic indexes are not orphaned; only the on-disk layout changed.
+_INDEX_SUPPORTED_VERSIONS = frozenset({1, 2})
 _INDEX_CHECKSUM_ALGO = "sha256"     # over the payload bytes, checked on load
 # The ONLY checksum algorithms load() will honor -- an explicit allowlist, not
 # ``hashlib.algorithms_available``.  That set also contains variable-length XOFs
@@ -272,6 +277,122 @@ def _index_decode(doc):
             "psdata index: unknown/unsafe type tag %r in payload" % (t,))
 
     return dec(doc["root"])
+
+
+# ==========================================================================
+# Portable (relocatable) path serialization -- IDX-03
+# ==========================================================================
+# The build records every xtc/bigdata file by ABSOLUTE path (e.g.
+# ``/sdf/data/lcls/ds/<exp>/xtc/...-c000.xtc2``).  psdata's headline feature is
+# a persisted, SHAREABLE index artifact, so it must survive being copied to
+# another mount, host, or container where the same data lives under a DIFFERENT
+# prefix -- a hard-coded absolute path would then load a wrong/absent file.
+#
+# Only the SERIALIZED form is made relocatable; the in-memory index is never
+# touched.  On :func:`_index_encode`, every string is pooled once, and in this
+# domain every ABSOLUTE pool string is a data-file path (detector names, ids,
+# alg/field names and dtype strings are never absolute).  We compute the common
+# parent directory ``root`` of those paths, rewrite each to ``relpath(p, root)``
+# in the pool, and record ``root`` + the rewritten pool indices under a
+# ``portability`` key.  On load the indices are re-joined to a base directory
+# (see :func:`_index_resolve_paths`) BEFORE decoding -- so a load from the
+# ORIGINAL location reconstructs byte-identical absolute paths (downstream reads
+# unchanged) and a relocated load resolves to the data's new home.
+
+def _index_portablize_paths(doc):
+    """In place: relativize the absolute path strings in ``doc['strings']`` and
+    attach ``doc['portability'] = {"root": <common dir | None>, "rel": [i,...]}``
+    naming the rewritten pool indices.  A no-op (``root=None, rel=[]``) when the
+    pool holds no absolute path.  ``doc`` is the throwaway encoder output, so the
+    live index's own strings are never mutated."""
+    strings = doc["strings"]
+    abs_idx = [i for i, s in enumerate(strings) if os.path.isabs(s)]
+    if not abs_idx:
+        doc["portability"] = {"root": None, "rel": []}
+        return doc
+    dirs = sorted({os.path.dirname(strings[i]) for i in abs_idx})
+    root = dirs[0] if len(dirs) == 1 else os.path.commonpath(dirs)
+    rel = []
+    for i in abs_idx:
+        # Defensive: only paths genuinely under ``root`` are relativized (an
+        # unrelated absolute string, should one ever appear, is left absolute
+        # and still loads verbatim -- ``_index_resolve_paths`` skips it).
+        if os.path.commonpath([root, strings[i]]) == root:
+            strings[i] = os.path.relpath(strings[i], root)
+            rel.append(i)
+    doc["portability"] = {"root": root, "rel": rel}
+    return doc
+
+
+def _index_resolve_paths(doc, index_path, dir=None):
+    """In place inverse of :func:`_index_portablize_paths`: re-absolutize the
+    relativized pool strings against a base directory, chosen by this
+    precedence, then leave ``doc`` ready for :func:`_index_decode`.
+
+      * explicit ``dir=`` override -- STRICT: every relativized file must exist
+        under ``dir`` or a clear ``FileNotFoundError`` names the first miss.
+        This is how an index built under ``/sdf/...`` on host A is loaded under
+        ``/data/...`` on host B.
+      * else the stored ``root`` if the files are found there -- the ORIGINAL
+        location; reproduces the exact absolute paths byte-for-byte.
+      * else the index file's OWN directory if the files are found beside it --
+        an index shipped together with its data.
+      * else fall back to the stored ``root`` (reproduce the original absolute
+        paths).  This branch NEVER raises, so an index whose data is momentarily
+        offline still loads and a genuine miss surfaces at read time exactly as
+        it did before portable paths -- and no wrong file is ever opened.
+
+    A v1 payload has no ``portability`` record (its paths are absolute): nothing
+    to resolve, and an explicit ``dir=`` is refused with an actionable error."""
+    port = doc.get("portability")
+    if not isinstance(port, dict):
+        if dir is not None:
+            raise ValueError(
+                "%r: this psdata index predates portable paths (it stores "
+                "absolute file paths) and cannot be relocated with dir=%r -- "
+                "rebuild it with the current psdata to get a relocatable index."
+                % (index_path, dir))
+        return doc
+    strings = doc["strings"]
+    rel = port.get("rel") or []
+    if not rel:
+        return doc
+    root = port.get("root")
+
+    def _first_missing(base):
+        """Pool index of the first relativized file absent under ``base``, or
+        ``None`` if they all exist there."""
+        for i in rel:
+            if not os.path.exists(os.path.normpath(os.path.join(base, strings[i]))):
+                return i
+        return None
+
+    idx_dir = os.path.dirname(os.path.abspath(index_path))
+    if dir is not None:
+        base = os.path.abspath(dir)
+        miss = _first_missing(base)
+        if miss is not None:
+            missing = os.path.normpath(os.path.join(base, strings[miss]))
+            raise FileNotFoundError(
+                "psdata index load: dir=%r does not hold this index's data -- "
+                "expected file %r is missing.  Pass the directory that contains "
+                "the run's xtc2 files (the index stores them relative to %r)."
+                % (dir, missing, root))
+        chosen = base
+    else:
+        chosen = None
+        for cand in (root, idx_dir):
+            if cand is not None and _first_missing(cand) is None:
+                chosen = cand
+                break
+        if chosen is None:
+            # Data not found at the original root nor beside the index: reproduce
+            # the ORIGINAL absolute paths so the load still succeeds; any real
+            # miss surfaces at read time (os.open), never as a wrong file.
+            chosen = root if root is not None else idx_dir
+    for i in rel:
+        strings[i] = os.path.normpath(os.path.join(chosen, strings[i]))
+    return doc
 
 
 # ==========================================================================
@@ -531,15 +652,50 @@ class RunIndex:
         some detector streams kept writing after the timing/master streams
         closed; ``pulseId=None``).  Pass ``include_shutdown_tail=True`` to keep
         that tail -- the full set of physical L1Accepts on disk."""
-        # gather the union of timestamps, then for each ts collect the streams
+        # Gather the union of timestamps, then for each ts collect the streams.
+        # STR-03 -- the ts-keyed merge is hardened against timestamp collisions:
+        #   * Records from DIFFERENT streams that share a ts are the SAME event
+        #     and combine into one entry -- the normal cross-stream merge, kept
+        #     exactly (a ts collision ACROSS streams is not a collision at all).
+        #   * A duplicate L1Accept ts WITHIN one stream is a DAQ/clock anomaly:
+        #     the entry shape ((chunk_path, off, size) per stream) holds only one
+        #     dgram per (ts, stream) and the ts-unique bisect index
+        #     (_position_of) cannot address two events at one ts, so a second
+        #     event landing on an already-filled (ts, stream) slot is RAISED,
+        #     never silently overwritten -- an event is never lost without a word.
+        #   * A transition dgram (is_event=False) that happens to share a ts with
+        #     an L1Accept must NOT flip the event's classification: the L1Accept
+        #     wins and stays indexed, the transition is additive-only and never
+        #     becomes -- nor displaces -- an event.
+        # A record is either (ts, chunk_path, off, size) -- always an L1Accept
+        # event, the only shape the scans emit, so the no-collision production
+        # path is byte-for-byte unchanged -- or (ts, chunk_path, off, size,
+        # is_event) whose is_event=False marks a non-event transition.
         merged = {}   # ts -> {stream: (chunk_path, off, size)}
         for stream, recs in per_stream.items():
-            for ts, chunk_path, off, size in recs:
-                merged.setdefault(ts, {})[stream] = (chunk_path, off, size)
+            for rec in recs:
+                if len(rec) == 5:
+                    ts, chunk_path, off, size, is_event = rec
+                else:
+                    ts, chunk_path, off, size = rec
+                    is_event = True
+                slot = merged.setdefault(ts, {})
+                if not is_event:
+                    continue   # transition: shares the ts but is not an event
+                if stream in slot:
+                    raise ValueError(
+                        "psdata index: duplicate L1Accept timestamp %d in "
+                        "stream %r -- two events share one 64-bit ts (DAQ/clock "
+                        "anomaly); the ts-keyed random-access index cannot "
+                        "address both. Refusing to silently drop an event."
+                        % (ts, stream))
+                slot[stream] = (chunk_path, off, size)
         timing_streams = (frozenset() if include_shutdown_tail
                           else self._timing_streams())
         for ts in sorted(merged):
             entry = merged[ts]
+            if not entry:
+                continue   # only transition(s) carried this ts -> not an event
             if timing_streams and not (timing_streams & entry.keys()):
                 continue   # shutdown-tail event: lacks the timing/master stream
             self.timestamps.append(ts)
@@ -963,9 +1119,17 @@ class RunIndex:
         so repeated chunk paths cost one entry.  ``checksum`` is the
         ``sha256`` of the payload bytes, verified on load.  Only the fd-safe
         ``_persist_state`` is written.
+
+        The payload is made RELOCATABLE (IDX-03) by
+        :func:`_index_portablize_paths`: file paths are stored relative to their
+        common root plus a ``portability`` record, so the index survives being
+        copied to another mount/host/container (resolved by :meth:`load`).  This
+        transforms only the throwaway encoder output -- the live index keeps its
+        absolute paths, and a reload from the original location is byte-exact.
         """
-        payload = json.dumps(_index_encode(self._persist_state()),
-                             separators=(",", ":")).encode("utf-8")
+        payload = json.dumps(
+            _index_portablize_paths(_index_encode(self._persist_state())),
+            separators=(",", ":")).encode("utf-8")
         digest = hashlib.new(_INDEX_CHECKSUM_ALGO, payload).hexdigest()
         header = json.dumps(
             {"checksum_algo": _INDEX_CHECKSUM_ALGO,
@@ -980,11 +1144,21 @@ class RunIndex:
             fh.write(payload)
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path, dir=None):
         """Reload an index written by :meth:`save`.  Opens ONLY the index file
         (no SMD files, no rescan): ``smd_bytes_read`` is whatever the original
         build measured, but no new SMD I/O happens here.  Fds into the bigdata
         files reopen lazily on the first :meth:`read_event_at`.
+
+        ``dir`` (optional) is the directory that holds the run's xtc2 files at
+        THIS location -- pass it to relocate a portable index whose data now
+        lives under a different prefix than where it was built (e.g. built under
+        ``/sdf/...`` on host A, loaded under ``/data/...`` on host B).  When
+        omitted, the paths resolve to the original build location if the files
+        are there, else to the index file's own directory if the data was
+        shipped beside it, else the original absolute paths are reproduced (a
+        genuine miss then surfaces at read time -- never a wrong file).  See
+        :func:`_index_resolve_paths`.
 
         The magic + version + checksum are all verified before any content is
         interpreted, and the payload is decoded by the whitelist codec
@@ -1008,12 +1182,12 @@ class RunIndex:
                 raise ValueError(
                     "%r: truncated psdata index (no format version)" % (path,))
             version = struct.unpack("<I", vbytes)[0]
-            if version != _INDEX_FORMAT_VERSION:
+            if version not in _INDEX_SUPPORTED_VERSIONS:
                 raise ValueError(
                     "%r: unsupported psdata index format version %d -- this "
-                    "psdata reads version %d.  Rebuild the index with the "
+                    "psdata reads versions %s.  Rebuild the index with the "
                     "current psdata (build_index(...).save(...))."
-                    % (path, version, _INDEX_FORMAT_VERSION))
+                    % (path, version, sorted(_INDEX_SUPPORTED_VERSIONS)))
             hlen_bytes = fh.read(4)
             if len(hlen_bytes) < 4:
                 raise ValueError(
@@ -1053,6 +1227,11 @@ class RunIndex:
         except (ValueError, UnicodeDecodeError) as e:
             raise ValueError(
                 "%r: corrupt psdata index payload (%s)" % (path, e))
+        # Re-absolutize the relocatable paths (IDX-03) against the resolved base
+        # BEFORE decoding, so the reconstructed state carries absolute paths and
+        # the in-memory index is byte-identical to the original at its home.
+        if isinstance(doc, dict):
+            _index_resolve_paths(doc, path, dir)
         state = _index_decode(doc)
         idx = cls.__new__(cls)
         return idx._restore_state(state)
@@ -1187,8 +1366,8 @@ def _read_chunkinfo(buf, dg_off, dg_hdr, tables):
 # ==========================================================================
 def _enumerate_bd_chunks(bd_c000_path):
     """Ordered bigdata chunk files for a stream, from its ``c000`` path, by the
-    ``-c000``/``-c001``/... filename convention (stops at the first missing
-    chunk id).  A single-chunk stream returns ``[c000]``.
+    ``-c000``/``-c001``/... filename convention.  A single-chunk stream returns
+    ``[c000]``.
 
     Enumerating by the on-disk filename convention -- rather than following the
     ``chunkinfo`` carried on each Enable (the SMD path's mechanism) -- keeps the
@@ -1196,6 +1375,18 @@ def _enumerate_bd_chunks(bd_c000_path):
     chunkinfo and no SMD.  The chunk filenames ``chunkinfo`` would name are
     exactly these ``-c00N`` siblings in the same directory, so the set walked is
     identical to the one the SMD-following path rolls through.
+
+    STR-04: the chunk set is discovered by ENUMERATING the ``-c00N`` siblings
+    that actually exist on disk (not by incrementing until the first miss), then
+    checked for contiguity.  Incrementing until the first miss silently
+    TRUNCATES a non-contiguous set: if ``c001`` is absent but ``c002`` exists
+    (a partial copy, a filesystem hiccup, a stray deletion), the old walk
+    stopped at ``c001`` and indexed only ``c000``, dropping every event in
+    ``c002+`` with no error -- a silently short index the caller never sees.
+    An interior hole is therefore a HARD ERROR here: we fail closed and name the
+    stream, the missing chunk(s), and the higher chunk(s) that exist.  Reaching
+    the last chunk (``max`` id present, nothing above it) is the legitimate end
+    condition, not a hole, and returns the full ordered set.
     """
     d = os.path.dirname(bd_c000_path)
     base = os.path.basename(bd_c000_path)
@@ -1204,15 +1395,47 @@ def _enumerate_bd_chunks(bd_c000_path):
         return [bd_c000_path]
     prefix = base[:m.start()]            # '<exp>-rNNNN-sMMM'
     width = len(m.group(1))              # zero-pad width (3 -> c000)
-    chunks = []
-    cid = 0
-    while True:
-        cand = os.path.join(d, f"{prefix}-c{cid:0{width}d}.xtc2")
-        if not os.path.exists(cand):
-            break
-        chunks.append(cand)
-        cid += 1
-    return chunks if chunks else [bd_c000_path]
+
+    # Enumerate the chunk ids that ACTUALLY exist for this stream by matching
+    # the c000's ``<prefix>-c<id>.xtc2`` siblings in its directory, rather than
+    # assuming contiguity by incrementing until the first miss.
+    sibling_re = re.compile(r"^" + re.escape(prefix) + r"-c(\d+)\.xtc2$")
+    listing = d if d else os.curdir
+    try:
+        names = os.listdir(listing)
+    except OSError:
+        names = []
+    found = set()                        # chunk ids present on disk
+    for name in names:
+        sm = sibling_re.match(name)
+        if sm:
+            found.add(int(sm.group(1)))
+    if not found:
+        # Not even c000 turned up (unusual path form, or the file vanished);
+        # fall back to the caller's own c000 path unchanged, as before.
+        return [bd_c000_path]
+
+    hi = max(found)
+    missing = [cid for cid in range(hi + 1) if cid not in found]
+    if missing:
+        # A true interior hole (a missing -c00N with a higher chunk present):
+        # refuse to silently index a truncated run -- fail closed, loudly.
+        sm = re.search(r"-s(\d+)$", prefix)
+        stream = sm.group(1) if sm else "?"
+        fmt = lambda c: f"c{c:0{width}d}"
+        miss_lo = min(missing)
+        higher = sorted(c for c in found if c > miss_lo)
+        raise ValueError(
+            f"non-contiguous bigdata chunk set for stream s{stream}: "
+            f"missing chunk(s) {[fmt(c) for c in missing]} while higher "
+            f"chunk(s) {[fmt(c) for c in higher]} exist (prefix {prefix!r} in "
+            f"{listing!r}); refusing to silently index a truncated run "
+            f"(dropping {fmt(hi)} and below the gap) -- STR-04")
+
+    # Contiguous set 0..hi: build the ordered paths exactly as before
+    # (byte-identical to the old first-miss walk for a normal chunk set).
+    return [os.path.join(d, f"{prefix}-c{cid:0{width}d}.xtc2")
+            for cid in range(hi + 1)]
 
 
 def _scan_bigdata_stream(bd_c000_path, env_out=None):
