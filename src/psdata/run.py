@@ -277,31 +277,90 @@ class Run:
         of the bigdata (a truncation shared by scan and merge would not be
         caught).  Inspect ``run.build_index().scan_source`` if that distinction
         matters to you.
+
+        **O(1)-memory streaming (STR-05).**  The gate is applied by a streaming
+        *merge-join*, not by pre-building the whole index.  Both the forward
+        bigdata merge and the gate source (:func:`psdata.index.iter_gate_
+        timestamps`) are ascending in timestamp, so this method walks them in
+        lockstep: it advances the gate cursor to each bigdata event's timestamp
+        and yields the event iff the gate carries it (a bigdata timestamp past
+        the gate cursor is a phantom -> skipped; when the gate exhausts, every
+        remaining bigdata event is the ragged shutdown tail -> dropped).  So the
+        first event is yielded after reading only the first gate entry and the
+        first bigdata event, and peak memory is one bigdata event plus O(1)
+        cursor state -- rather than materializing all N timestamps (and the
+        per-event x per-stream ``RunIndex.entries``) before event 0.  The yielded
+        SEQUENCE is byte-identical to the old ``frozenset(build_index().
+        timestamps)`` filter; :meth:`build_index` and random access are
+        unchanged and still available.
         """
         merged = _s.events(self.files, run_config=self.config)
         if not gate:
             return merged
         try:
-            index = self.build_index()
+            gate_ts = _i.iter_gate_timestamps(
+                self.files, run_config=self.config, smd_files=self._smd_files,
+                source="auto")
         except _INDEX_BUILD_ERRORS as exc:
             # Fail closed: the safety net could not be built, so refuse to
             # stream rather than silently degrade to the ungated merge (which
             # would resurrect the phantom shutdown-tail events with no signal).
-            # build_index(source="auto") already covers a *legitimate* SMD
-            # absence by scanning the bigdata, so reaching here is a real
-            # build failure.  A caller who truly wants the ungated set must say
-            # so explicitly with gate=False.
+            # iter_gate_timestamps(source="auto") already covers a *legitimate*
+            # SMD absence by scanning the bigdata headers, so reaching here is a
+            # real build failure.  A caller who truly wants the ungated set must
+            # say so explicitly with gate=False.  Setup (source selection, file
+            # opens, Configure parses) runs eagerly inside iter_gate_timestamps,
+            # so a failure surfaces HERE at call time, not mid-stream.
             raise GateBuildError(
-                f"Run.events(gate=True): could not build the SMD gate index "
+                f"Run.events(gate=True): could not build the SMD gate source "
                 f"for this run ({type(exc).__name__}: {exc}). Refusing to "
                 f"stream: an ungated bigdata merge may surface unindexed "
                 f"DAQ-shutdown-tail events that psana and read_event_at() do "
-                f"not have. Fix the index build, or -- if you genuinely want "
+                f"not have. Fix the gate source, or -- if you genuinely want "
                 f"the raw, ungated bigdata event set -- call "
                 f"Run.events(gate=False) explicitly."
             ) from exc
-        valid = frozenset(index.timestamps)
-        return (evt for evt in merged if evt.timestamp in valid)
+        return self._gated_stream(merged, gate_ts)
+
+    @staticmethod
+    def _gated_stream(merged, gate_ts):
+        """Merge-join the forward bigdata merge ``merged`` against the ascending
+        gate timestamps ``gate_ts`` (STR-05), yielding exactly the events whose
+        timestamp is in the gate -- byte-identical to the old
+        ``(evt for evt in merged if evt.timestamp in frozenset(index.
+        timestamps))`` filter, but in O(1) memory with the first event immediate.
+
+        Both inputs ascend in timestamp.  For each bigdata event ts ``b``:
+        advance the gate cursor over every gate ts ``< b`` (gate entries with no
+        bigdata match -- normal); if the gate head ``== b`` the event is gated in
+        (yield, leaving the head so a repeated ``b`` from a ts collision still
+        matches); if the head is ``> b`` the event is a phantom absent from the
+        gate (skip); and when the gate EXHAUSTS every remaining bigdata event is
+        the ragged shutdown tail past the last gated event (stop).  Both open
+        cursor sets are released on stop / early consumer break."""
+        gate = iter(gate_ts)
+        try:
+            try:
+                head = next(gate)
+            except StopIteration:
+                return                     # empty gate -> no gated events
+            for evt in merged:
+                b = evt.timestamp
+                while head is not None and head < b:
+                    try:
+                        head = next(gate)
+                    except StopIteration:
+                        head = None
+                if head is None:
+                    return                 # gate exhausted -> rest is the tail
+                if head == b:
+                    yield evt              # gated in (head kept for a ts dup)
+                # head > b: a phantom not in the gate -> skip this event
+        finally:
+            for gen in (merged, gate_ts):
+                close = getattr(gen, "close", None)
+                if close is not None:
+                    close()
 
     # -- random access -----------------------------------------------------
     def build_index(self, rebuild=False, source="auto"):

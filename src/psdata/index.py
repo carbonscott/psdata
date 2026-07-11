@@ -68,6 +68,7 @@ Like the rest of ``psdata``, this module imports **no** psana / mpi4py / h5py
 import base64
 import bisect
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -639,16 +640,11 @@ class RunIndex:
         Mirrors how :attr:`psdata.stream.Event.pulseId` sources its value (the
         ``raw`` alg of the ``det_type='ts'`` detector, ``stream.py``
         ``_read_pulse_id``), so the clamp drops exactly the events whose
-        ``pulseId`` would be ``None`` for want of that stream."""
-        rc = self.run_config
-        names = rc.find_detector_by_type(_s._TIMING_DET_TYPE)
-        if not names:
-            return frozenset()
-        det = rc.detector(names[0])
-        alg = "raw" if "raw" in det.algs else None
-        if alg is None:
-            return frozenset()
-        return frozenset(det.streams_for(alg))
+        ``pulseId`` would be ``None`` for want of that stream.  Delegates to the
+        module-level :func:`_timing_streams_of` so the STR-05 streaming gate
+        (:func:`iter_gate_timestamps`) applies the *identical* clamp this merge
+        does."""
+        return _timing_streams_of(self.run_config)
 
     def _merge_streams(self, per_stream, include_shutdown_tail=False):
         """Combine the per-stream ``(ts, chunk_path, off, size)`` records into
@@ -2179,6 +2175,257 @@ def build_index(stream_files, run_config=None, smd_files=None, source="auto",
         return RunIndex.build(smd_files, run_config)
     return RunIndex.build_from_bigdata(
         run_config, include_shutdown_tail=include_shutdown_tail)
+
+
+# ==========================================================================
+# STR-05: O(1)-memory streaming source of the canonical gate timestamps.
+#
+# ``Run.events(gate=True)`` filters the forward bigdata merge to the canonical
+# (SMD-equivalent) event set so the ragged DAQ-shutdown tail is dropped
+# (FAIL-01/GATE-02).  It used to get that set by building the ENTIRE
+# :class:`RunIndex` first (``frozenset(build_index().timestamps)``) -- so every
+# one of the run's N timestamps (and, worse, the per-event x per-stream
+# ``entries``) was materialized BEFORE event 0 was yielded: O(N) time and memory
+# up front, defeating the "streaming reader" property.
+#
+# :func:`iter_gate_timestamps` instead yields the SAME canonical timestamps
+# INCREMENTALLY, in ascending order, reading only a bounded window of the SMD
+# (or bigdata-header) source at a time.  ``Run.events`` merge-joins it against
+# the ascending forward merge, so the first event is yielded after O(1) work and
+# peak memory is one bigdata event + O(1) cursor state.  The yielded sequence is
+# byte-identical to ``build_index(...).timestamps`` on a well-formed run: it
+# reuses the same source selection, the same per-stream L1Accept filter (SMD:
+# service 12 dgrams carrying an ``smdinfo`` record, exactly :func:`_scan_smd_
+# stream`; bigdata: service 12 dgram headers, exactly :func:`_scan_bigdata_
+# stream`), the same cross-stream union, and the same timing/master-stream clamp
+# (:func:`_timing_streams_of`) -- so it drops the same events in the same order.
+# ==========================================================================
+def _timing_streams_of(run_config):
+    """Stream indices carrying the timing/master detector (``det_type 'ts'``) --
+    the streams whose presence makes an event *canonical* (gives it a
+    ``pulseId``); ``frozenset()`` if the run declares no timing detector (then no
+    clamp is applied and every assembled event is kept).
+
+    The single definition of the clamp predicate, shared by
+    :meth:`RunIndex._timing_streams` (the random-access merge) and
+    :func:`iter_gate_timestamps` (the streaming gate) so the two never drift.
+    Mirrors how :attr:`psdata.stream.Event.pulseId` sources its value, so the
+    clamp drops exactly the events whose ``pulseId`` would be ``None``."""
+    names = run_config.find_detector_by_type(_s._TIMING_DET_TYPE)
+    if not names:
+        return frozenset()
+    det = run_config.detector(names[0])
+    alg = "raw" if "raw" in det.algs else None
+    if alg is None:
+        return frozenset()
+    return frozenset(det.streams_for(alg))
+
+
+def _smd_cursor_and_smdinfo(smd_path, stream, read_chunk):
+    """EAGER setup for one SMD stream's gate source: open ``smd_path``, parse its
+    Configure for the ``smdinfo`` table and post-Configure offset, and return
+    ``(cursor, smdinfo_key, table)``.
+
+    Raises here -- at ``iter_gate_timestamps`` call time, not lazily mid-stream
+    -- so :meth:`psdata.run.Run.events` fails closed on a missing/corrupt SMD
+    sidecar (``OSError`` / ``struct.error`` / a sidecar with no smdinfo table ->
+    ``RuntimeError``), exactly as :func:`_scan_smd_stream` does during a build.
+    The returned :class:`~psdata.stream._StreamCursor` reads the sidecar in a
+    bounded, self-trimming window (O(1) memory) -- an SMD file is single-chunk
+    (its ``.smd.xtc2`` name does not match the ``-c00N.xtc2`` roll convention),
+    so no SMD chunk roll is followed, matching :func:`_scan_smd_stream`."""
+    fd = os.open(smd_path, os.O_RDONLY)
+    try:
+        buf = bytearray(os.pread(fd, max(read_chunk, _f._CONFIG_READ), 0))
+    finally:
+        os.close(fd)
+    _cfg, tables, cfg_end = _f.parse_configure(buf)
+    smdinfo_key = _find_smdinfo_key(tables)
+    if smdinfo_key is None:
+        raise RuntimeError(
+            f"{os.path.basename(smd_path)} has no smdinfo table -- is it an "
+            f"SMD (smalldata) file?")
+    cur = _s._StreamCursor(stream, smd_path, cfg_end, read_chunk=read_chunk)
+    return cur, smdinfo_key, tables[smdinfo_key]
+
+
+def _iter_smd_cursor_ts(cursor, stream, smdinfo_key, table):
+    """LAZY: yield ``(ts, stream)`` for each SMD ``L1Accept`` whose dgram carries
+    an ``smdinfo`` record, in ascending ts -- the streaming counterpart of the
+    records :func:`_scan_smd_stream` appends (service 12 AND ``_read_smdinfo``
+    not ``None``), so the gate set equals the SMD-built index exactly."""
+    while True:
+        h = cursor.peek()
+        if h is None:
+            return
+        if h["service"] == _f.SERVICE_L1ACCEPT:
+            buf, off, hh = cursor.head_view()
+            if _read_smdinfo(buf, off, hh, smdinfo_key, table) is not None:
+                yield (h["ts"], stream)
+        cursor.advance()
+
+
+def _validate_bigdata_stream(bd_c000_path):
+    """EAGER setup for one bigdata stream's gate source: enumerate its chunk
+    files (:func:`_enumerate_bd_chunks`, which fails closed on a non-contiguous
+    ``-c00N`` set -- STR-04) and confirm the first chunk opens.  Returns the
+    ordered chunk paths.  Raising here (``ValueError`` on a chunk hole,
+    ``OSError`` on a missing file) makes the gate build fail closed at call time
+    rather than lazily mid-stream."""
+    chunks = _enumerate_bd_chunks(bd_c000_path)
+    os.close(os.open(chunks[0], os.O_RDONLY))
+    return chunks
+
+
+def _iter_bigdata_l1_timestamps(chunk_paths, stream):
+    """LAZY: yield ``(ts, stream)`` for every bigdata ``L1Accept`` across a
+    stream's ordered ``chunk_paths``, in ascending ts, reading ONLY each dgram's
+    24-byte header (never its GB-scale payload) and restarting the per-chunk
+    offset at 0 on the roll -- the header-only streaming counterpart of
+    :func:`_scan_bigdata_stream`.  O(1) memory.  Fails closed on a chunk cut
+    mid-stream (a header running past EOF, or trailing bytes too few for a
+    header), exactly as :func:`_scan_bigdata_stream` does."""
+    for chunk_path in chunk_paths:
+        fd = os.open(chunk_path, os.O_RDONLY)
+        try:
+            filesize = os.fstat(fd).st_size
+            cursor = 0
+            while cursor + _f.DGRAM_HDR <= filesize:
+                hdr = os.pread(fd, _f.DGRAM_HDR, cursor)
+                if len(hdr) < _f.DGRAM_HDR:
+                    raise RuntimeError(
+                        f"truncated xtc file {chunk_path!r}: only {len(hdr)} "
+                        f"byte(s) readable where a {_f.DGRAM_HDR}-byte dgram "
+                        f"header was expected at offset {cursor} -- the gate "
+                        f"source fails closed here, as _scan_bigdata_stream does")
+                h = _f.parse_dgram_header(hdr, 0)
+                total = _f.XTC_HDR + h["extent"]
+                if cursor + total > filesize:
+                    raise RuntimeError(
+                        f"truncated xtc file {chunk_path!r}: dgram header at "
+                        f"offset {cursor} declares size {total} (ending at "
+                        f"{cursor + total}) past the {filesize}-byte file end")
+                if h["service"] == _f.SERVICE_L1ACCEPT:
+                    yield (h["ts"], stream)
+                cursor += total
+            else:
+                if cursor < filesize:
+                    raise RuntimeError(
+                        f"truncated xtc file {chunk_path!r}: trailing "
+                        f"{filesize - cursor} byte(s) too few for a "
+                        f"{_f.DGRAM_HDR}-byte dgram header at offset {cursor}")
+        finally:
+            os.close(fd)
+
+
+def _merge_join_gate_ts(per_stream_gens, timing_streams, cursors):
+    """LAZY: k-way merge the per-stream ascending ``(ts, stream)`` generators by
+    ts, yield each DISTINCT ts once, applying the timing clamp -- an event is
+    kept only if a timing/master stream carried it, exactly
+    :meth:`RunIndex._merge_streams` (an empty ``timing_streams`` keeps every
+    event, the SMD / ``include_shutdown_tail=True`` case).
+
+    O(1) memory: only the current ts-group's contributing-stream set is held.
+    Closes any SMD ``cursors`` when the merge exhausts or the consumer stops."""
+    try:
+        merged = heapq.merge(*per_stream_gens, key=lambda p: p[0])
+        cur_ts = None
+        cur_streams = set()
+        for ts, stream in merged:
+            if cur_ts is None:
+                cur_ts, cur_streams = ts, {stream}
+            elif ts == cur_ts:
+                cur_streams.add(stream)
+            else:
+                if not timing_streams or (timing_streams & cur_streams):
+                    yield cur_ts
+                cur_ts, cur_streams = ts, {stream}
+        if cur_ts is not None and (
+                not timing_streams or (timing_streams & cur_streams)):
+            yield cur_ts
+    finally:
+        for cur in cursors:
+            cur.close()
+
+
+def iter_gate_timestamps(stream_files, run_config=None, smd_files=None,
+                         source="auto", read_chunk=1 << 20):
+    """Yield the run's canonical gate timestamps in ascending order, STREAMING in
+    O(1) memory, WITHOUT materializing the whole :class:`RunIndex`.
+
+    The yielded sequence is byte-identical to ``build_index(stream_files,
+    run_config=run_config, smd_files=smd_files, source=source).timestamps`` on a
+    well-formed run -- the same event set, the same order, dropping the same
+    ragged DAQ-shutdown tail.  It is the O(1)-memory gate source
+    :meth:`psdata.run.Run.events` (default ``gate=True``) merge-joins against the
+    forward bigdata merge, so the first event is yielded immediately.
+
+    Source selection mirrors :func:`build_index` exactly:
+
+      * ``"smd"``     -- the SMD sidecars (NO timing clamp: the offline smdwriter
+        already trimmed the tail, matching :meth:`RunIndex.build`, which merges
+        with ``include_shutdown_tail=True``);
+      * ``"bigdata"`` -- the bigdata dgram headers, clamped to the timing/master
+        stream (matching :meth:`RunIndex.build_from_bigdata`, default
+        ``include_shutdown_tail=False``);
+      * ``"auto"`` (default) -- SMD when *all* sidecars are present, else bigdata.
+
+    **Fail-closed / eager setup.**  Everything that can fail -- source selection,
+    opening the files, parsing each Configure -- runs EAGERLY in this call (this
+    is a plain function returning a generator, not itself a generator), so
+    :meth:`Run.events` can wrap a gate-build failure in
+    :class:`~psdata.run.GateBuildError` at call time instead of surfacing it
+    mid-stream.  Only the incremental ts walk is deferred to the returned
+    generator.
+
+    ``run_config`` is required only for the bigdata clamp; it is dereferenced
+    (via :func:`_timing_streams_of`) AFTER the files are opened, so a run whose
+    files are absent fails with the file ``OSError`` rather than a config error.
+    """
+    if run_config is None:
+        run_config = _f.discover(stream_files)
+    if source not in ("auto", "smd", "bigdata"):
+        raise ValueError(
+            f"source must be 'auto', 'smd', or 'bigdata' (got {source!r})")
+
+    # Decide SMD vs bigdata exactly as build_index(source=...) does.  Use the
+    # passed ``stream_files`` (never ``run_config`` yet) so a Run built with a
+    # placeholder config still reaches the file-open error, not an attribute one.
+    use_smd = False
+    smd_map = None
+    if source != "bigdata":
+        if smd_files is None:
+            smd_files = smd_files_for(stream_files)
+        smd_map = dict(_f._normalize_stream_files(smd_files))
+        if source == "smd":
+            use_smd = True             # build() would raise on a missing sidecar
+        else:                          # auto
+            use_smd = bool(smd_map) and all(
+                os.path.exists(p) for p in smd_map.values())
+
+    cursors = []
+    gens = []
+    try:
+        if use_smd:
+            for stream, smd_path in _f._normalize_stream_files(smd_map):
+                cur, key, table = _smd_cursor_and_smdinfo(
+                    smd_path, stream, read_chunk)
+                cursors.append(cur)
+                gens.append(_iter_smd_cursor_ts(cur, stream, key, table))
+            timing_streams = frozenset()          # SMD == include_shutdown_tail
+        else:
+            for stream, bd_c000 in _f._normalize_stream_files(stream_files):
+                chunks = _validate_bigdata_stream(bd_c000)
+                gens.append(_iter_bigdata_l1_timestamps(chunks, stream))
+            # Files are open now: dereferencing run_config for the clamp here is
+            # safe (a Run with a placeholder config already failed on os.open).
+            timing_streams = _timing_streams_of(run_config)
+    except BaseException:
+        for cur in cursors:
+            cur.close()
+        raise
+
+    return _merge_join_gate_ts(gens, timing_streams, cursors)
 
 
 # ==========================================================================
