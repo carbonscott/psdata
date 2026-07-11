@@ -64,6 +64,8 @@ if _HERE not in sys.path:
 import psdata                       # noqa: E402
 from psdata import index as psindex  # noqa: E402
 
+from _skips import skip             # noqa: E402  (machine-readable skips, HYG-03)
+
 # ---- multi-chunk reference run (streams 7/8/9/10 roll c000 -> c001) --------
 MC_EXP = "mfx101343025"
 MC_RUN = 35
@@ -82,18 +84,16 @@ MAX_STREAM_EVENTS = 200_000
 
 
 def _mc_dir():
-    d = next((c for c in MC_DIR_CANDIDATES if os.path.isdir(c)), None)
-    assert d is not None, (
-        f"multi-chunk run dir not found under any of {list(MC_DIR_CANDIDATES)}; "
-        f"STR-01 is a multi-chunk-forward-streaming defect and can only be "
-        f"exercised on a real run whose streams roll c000->c001")
-    return d
+    """The multi-chunk run's xtc dir if reachable on this node, else ``None``
+    (the caller emits a named SKIP -- a data-absent node cannot run the oracle
+    and SHOULD redden the suite, but a named skip is clearer than an
+    AssertionError; mirrors ``test_batch_us009::test_multichunk_batch``)."""
+    return next((c for c in MC_DIR_CANDIDATES if os.path.isdir(c)), None)
 
 
-def _mc_stream_files():
+def _mc_stream_files(d):
     """The rolled run's per-stream c000 bigdata files, keyed by real stream index
     (so jungfrau segments map to the right streams)."""
-    d = _mc_dir()
     paths = sorted(glob.glob(os.path.join(
         d, f"{MC_EXP}-r{MC_RUN:04d}-s*-c000.xtc2")))
     paths = psdata.filter_c000(paths)
@@ -118,7 +118,18 @@ def _first_complete_jungfrau_at_or_after(ridx, k0, n):
 
 
 def test_forward_streaming_follows_chunk_roll():
-    files = _mc_stream_files()
+    d = _mc_dir()
+    if d is None:
+        # Data-absent node: the oracle genuinely cannot run here.  Emit a named
+        # SKIP (NOT allowlisted -- it SHOULD redden the suite) rather than a hard
+        # AssertionError.  On a data-PRESENT node d is not None and this is inert,
+        # so the milano gate is unaffected.
+        return skip(
+            "str01_multichunk_run_missing",
+            f"the multi-chunk run {MC_EXP}/r{MC_RUN} is not reachable on this "
+            f"node (looked under {list(MC_DIR_CANDIDATES)}); the forward-roll "
+            f"check needs real multi-chunk data (streams that roll c000->c001)")
+    files = _mc_stream_files(d)
     rc = psdata.discover(files)
 
     # --- the CORRECT reference: the random-access index already follows the roll
