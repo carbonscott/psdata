@@ -796,7 +796,58 @@ class RunIndex:
         return h["service"]
 
     # -- batch random read (US-009) ---------------------------------------
-    def read_events(self, ks):
+    #
+    # MEM-01: ``read_events``/``read_stack`` materialize the WHOLE requested
+    # slice at once -- ``read_events`` holds all K events, ``read_stack``
+    # allocates one ``(K, *frame)`` buffer (335 GB at K=10000 jungfrau).  For a
+    # bounded, streaming read use :meth:`iter_events` / :meth:`iter_stack`
+    # (peak memory ``O(batch_size)``); the whole-slice calls now REFUSE a
+    # request whose materialized size exceeds ``max_bytes`` instead of silently
+    # attempting the allocation.  The default batch size mirrors the ``32`` the
+    # cube example had to hand-roll to survive.
+    DEFAULT_READ_BATCH = 32
+    #: Whole-slice ``read_events``/``read_stack`` refuse to materialize more
+    #: than this many bytes in one call (override per call via ``max_bytes=``;
+    #: ``max_bytes=None`` disables the guard).
+    DEFAULT_READ_MEM_LIMIT = 2 * 1024 ** 3   # 2 GiB
+
+    def _estimate_read_bytes(self, ks):
+        """Cheap, index-only upper bound (NO I/O) on the bytes a single
+        all-at-once materialization of ``ks`` will hold: the summed indexed
+        dgram ``size`` over the *distinct* requested positions (a repeated k is
+        read once).  This raw payload is the dominant term of the ``read_stack``
+        ``(K, *frame)`` buffer (``K x prod(shape) x itemsize``) and is exactly
+        what ``read_events`` keeps alive, so it drives the memory guard."""
+        total = 0
+        seen = set()
+        for k in ks:
+            k = int(k)
+            if k in seen:
+                continue
+            seen.add(k)
+            for stream in self.entries[k]:
+                total += self.entries[k][stream][2]   # (chunk_path, offset, size)
+        return total
+
+    def _check_read_budget(self, ks, max_bytes, stream_api):
+        """Raise ``MemoryError`` if materializing ``ks`` in one call would
+        exceed ``max_bytes`` (``None`` disables the check), pointing the caller
+        at the bounded streaming API instead of silently attempting the
+        allocation.  Runs after ``ks`` has been range-validated."""
+        if max_bytes is None:
+            return
+        est = self._estimate_read_bytes(ks)
+        if est > max_bytes:
+            n_distinct = len({int(k) for k in ks})
+            raise MemoryError(
+                f"reading {n_distinct} events at once would materialize "
+                f"~{est / (1024 ** 3):.2f} GiB in memory, over the "
+                f"{max_bytes / (1024 ** 3):.2f} GiB limit -- refusing rather "
+                f"than attempt the allocation (MEM-01). Stream them in bounded "
+                f"memory with {stream_api} (peak O(batch_size)), or pass a "
+                f"larger max_bytes= (max_bytes=None disables the guard).")
+
+    def read_events(self, ks, *, max_bytes=DEFAULT_READ_MEM_LIMIT):
         """Read many events by position in ONE coalesced call.
 
         Equivalent to ``[self.read_event_at(k) for k in ks]`` but issues its
@@ -824,11 +875,25 @@ class RunIndex:
         ks : sequence[int]
             Event positions (0-based).  Each is validated against the index
             range; an out-of-range position raises ``IndexError``.
+        max_bytes : int or None, keyword-only
+            Memory guard (MEM-01): if the estimated size of the K materialized
+            events exceeds this, ``read_events`` REFUSES (raises
+            ``MemoryError``) and points at :meth:`iter_events` rather than
+            attempting the allocation.  Defaults to
+            :data:`DEFAULT_READ_MEM_LIMIT`; ``None`` disables the guard.  For a
+            reasonable K (below the limit) nothing changes -- the returned list
+            is byte-identical to the un-guarded call.
 
         Returns
         -------
         list[psdata.stream.Event]
             One per requested ``k``, in ``ks`` order.
+
+        Raises
+        ------
+        MemoryError
+            If materializing all K events at once would exceed ``max_bytes``
+            (use :meth:`iter_events` to stream them in bounded memory).
         """
         ks = [int(k) for k in ks]
         n = len(self.timestamps)
@@ -836,6 +901,9 @@ class RunIndex:
             if not (0 <= k < n):
                 raise IndexError(
                     f"event position {k} out of range [0, {n})")
+
+        # MEM-01 guard: refuse a catastrophic all-at-once materialization.
+        self._check_read_budget(ks, max_bytes, "iter_events(ks, batch_size=...)")
 
         # Collect every required read as (chunk_path, offset, size, k, stream),
         # then group by chunk file and read each file's dgrams in ascending
@@ -872,7 +940,8 @@ class RunIndex:
         }
         return [built[k] for k in ks]
 
-    def read_stack(self, ks, det, field="raw", alg="raw"):
+    def read_stack(self, ks, det, field="raw", alg="raw", *,
+                   max_bytes=DEFAULT_READ_MEM_LIMIT):
         """Batch-read events ``ks`` and stack one detector's segment arrays into
         ONE preallocated buffer of shape ``(len(ks), n_seg, *seg_shape)``.
 
@@ -912,17 +981,38 @@ class RunIndex:
             Shape ``(len(ks), n_seg, *seg_shape)``, ``out[i]`` the stack for
             ``ks[i]``.
 
+        max_bytes : int or None, keyword-only
+            Memory guard (MEM-01): if the estimated size of the ``(len(ks),
+            *frame)`` buffer exceeds this, ``read_stack`` REFUSES (raises
+            ``MemoryError``) and points at :meth:`iter_stack` rather than
+            attempting the allocation (335 GB for K=10000 jungfrau).  Defaults
+            to :data:`DEFAULT_READ_MEM_LIMIT`; ``None`` disables the guard.  For
+            a reasonable K (below the limit) the returned array is unchanged.
+
         Raises
         ------
         ValueError
             If ``ks`` is empty, or any requested event is missing a segment for
             ``det`` (so a dense stack cannot represent it).
+        MemoryError
+            If the ``(len(ks), *frame)`` buffer would exceed ``max_bytes`` (use
+            :meth:`iter_stack` to stream it in bounded memory).
         """
         ks = [int(k) for k in ks]
         if not ks:
             raise ValueError("read_stack requires at least one event position")
+        n = len(self.timestamps)
+        for k in ks:
+            if not (0 <= k < n):
+                raise IndexError(f"event position {k} out of range [0, {n})")
 
-        events = self.read_events(ks)
+        # MEM-01 guard: refuse the catastrophic (K, *frame) allocation up front,
+        # before read_events materializes anything.
+        self._check_read_budget(ks, max_bytes,
+                                "iter_stack(ks, det, batch_size=...)")
+
+        # Already budget-checked above -- don't re-guard the inner call.
+        events = self.read_events(ks, max_bytes=None)
 
         # Shape/dtype come from the first event's stack (segment shape is only
         # known at event time).  Allocate ONE buffer and fill it row by row.
@@ -943,6 +1033,86 @@ class RunIndex:
                     f"!= first event's {out.shape[1:]}")
             out[i] = st
         return out
+
+    # -- bounded / streaming batch read (MEM-01) --------------------------
+    def iter_events(self, ks, batch_size=DEFAULT_READ_BATCH):
+        """Stream events for positions ``ks`` in fixed-size batches.
+
+        Bounded-memory counterpart to :meth:`read_events`.  Yields successive
+        ``list[Event]`` of at most ``batch_size`` events which together cover
+        ``ks`` in order, so peak memory is ``O(batch_size)`` frames -- never the
+        ``O(len(ks))`` of :meth:`read_events`, which builds one list holding all
+        K events (``K x frame``; e.g. 335 GB for K=10000 jungfrau).
+
+        Each batch is read by :meth:`read_events` (its coalesced,
+        ascending-offset ``pread`` grouping applied *within* the batch), so an
+        event yielded here is byte-identical to ``read_event_at(k)``; only the
+        coalescing is per-batch rather than global.  The per-batch read is not
+        size-guarded -- a batch is bounded by construction.
+
+        Parameters
+        ----------
+        ks : sequence[int]
+            Event positions (0-based); arbitrary / shuffled / repeated is fine.
+        batch_size : int
+            Maximum events materialized (and yielded) at once.  Must be > 0.
+
+        Yields
+        ------
+        list[psdata.stream.Event]
+            Consecutive slices of ``ks`` (in order), each of length
+            ``<= batch_size``.
+        """
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        ks = [int(k) for k in ks]
+
+        def _gen():
+            for i in range(0, len(ks), batch_size):
+                yield self.read_events(ks[i:i + batch_size], max_bytes=None)
+        return _gen()
+
+    def iter_stack(self, ks, det, field="raw", alg="raw",
+                   batch_size=DEFAULT_READ_BATCH):
+        """Stream a detector's stacked frames for ``ks`` in fixed-size batches.
+
+        Bounded-memory counterpart to :meth:`read_stack`.  Yields successive
+        ndarrays of shape ``(b, n_seg, *seg_shape)`` with ``b <= batch_size``
+        which together cover ``ks`` in order, so peak memory is
+        ``O(batch_size * frame)`` -- never the single ``(len(ks), *frame)``
+        buffer :meth:`read_stack` allocates whole (335 GB for K=10000 jungfrau).
+
+        Each yielded batch is produced by :meth:`read_stack`, so ``batch[j]`` is
+        byte-identical to ``read_event_at(k).stack(det, field, alg)`` for the
+        corresponding ``k``, and the same missing-segment ``ValueError`` policy
+        applies within each batch.
+
+        Parameters
+        ----------
+        ks : sequence[int]
+            Event positions (0-based); arbitrary order is fine.
+        det, field, alg :
+            As in :meth:`read_stack`.
+        batch_size : int
+            Maximum rows per yielded array.  Must be > 0.
+
+        Yields
+        ------
+        numpy.ndarray
+            Shape ``(b, n_seg, *seg_shape)`` with ``b <= batch_size``,
+            covering ``ks`` in order.
+        """
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        ks = [int(k) for k in ks]
+
+        def _gen():
+            for i in range(0, len(ks), batch_size):
+                yield self.read_stack(ks[i:i + batch_size], det,
+                                      field=field, alg=alg, max_bytes=None)
+        return _gen()
 
     # -- resource management ----------------------------------------------
     def close(self):
