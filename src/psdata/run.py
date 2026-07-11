@@ -308,9 +308,14 @@ class Run:
             # iter_gate_timestamps(source="auto") already covers a *legitimate*
             # SMD absence by scanning the bigdata headers, so reaching here is a
             # real build failure.  A caller who truly wants the ungated set must
-            # say so explicitly with gate=False.  Setup (source selection, file
-            # opens, Configure parses) runs eagerly inside iter_gate_timestamps,
-            # so a failure surfaces HERE at call time, not mid-stream.
+            # say so explicitly with gate=False.  Gate-source *construction*
+            # failures (missing/unreadable files, a malformed Configure) run
+            # eagerly inside iter_gate_timestamps, so they surface HERE at call
+            # time as GateBuildError.  A truncation found DEEP in the walk (a
+            # present-but-cut chunk/sidecar) can only be seen while streaming, so
+            # it surfaces later as a loud RuntimeError from the gate generator --
+            # still fail-closed (never a silent short gate), just not eager; that
+            # is inherent to O(1) startup, which does not read the source up front.
             raise GateBuildError(
                 f"Run.events(gate=True): could not build the SMD gate source "
                 f"for this run ({type(exc).__name__}: {exc}). Refusing to "

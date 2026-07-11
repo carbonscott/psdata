@@ -56,6 +56,11 @@ gated event):
   4. **Fail-closed preserved.**  When the gate source cannot be built (absent
      files), ``events(gate=True)`` raises ``GateBuildError`` (chaining the
      cause), while ``events(gate=False)`` still returns the ungated merge.
+  5. **Fail-closed parity on a truncated sidecar (F2).**  The streaming SMD gate
+     must RAISE on a sub-24-byte trailing remnant on the sidecar -- exactly as
+     ``_scan_smd_stream`` (what ``build_index`` uses) does -- never silently
+     yield a short gate that would make the merge-join drop the corresponding
+     trailing bigdata events as if they were the ragged tail.
 
 Self-contained: stdlib + numpy only -- NO psana, NO SLAC data.  It hand-builds
 synthetic xtc2 dgrams byte-for-byte to ``src/psdata/format.py`` (the same idiom
@@ -97,21 +102,70 @@ def _pack_xtc(src, damage, tid, payload):
     return struct.pack("<IHHI", src, damage, tid, extent) + payload
 
 
+def _dgram_svc(service, ts, top_payload):
+    """One on-disk dgram: Transition(12) + a top PARENT Xtc wrapping
+    ``top_payload``, with ``service`` in the top 4 bits of env (matching
+    ``parse_dgram_header``'s ``service = (env >> 24) & 0xf``)."""
+    nsec = ts & 0xFFFFFFFF
+    sec = (ts >> 32) & 0xFFFFFFFF
+    env = (service & 0xf) << 24
+    return (struct.pack("<III", nsec, sec, env)
+            + _pack_xtc(0, 0, fmt.TID_PARENT, top_payload))
+
+
 def _make_l1(ts):
     """A minimal ``L1Accept`` dgram carrying timestamp ``ts`` and an empty
     top-Xtc payload (service 12, no ShapesData)."""
-    nsec = ts & 0xFFFFFFFF
-    sec = (ts >> 32) & 0xFFFFFFFF
-    env = fmt.SERVICE_L1ACCEPT << 24
-    transition = struct.pack("<III", nsec, sec, env)
-    top = _pack_xtc(0, 0, fmt.TID_PARENT, b"")
-    return transition + top
+    return _dgram_svc(fmt.SERVICE_L1ACCEPT, ts, b"")
 
 
 def _write(path, ts_list):
     with open(path, "wb") as fh:
         for ts in ts_list:
             fh.write(_make_l1(ts))
+
+
+# --- SMD sidecar byte builders (used only by the F2 fail-closed parity check):
+#     a Configure declaring the smdinfo/offsetAlg Names table plus smdinfo-bearing
+#     L1Accepts, byte-for-byte to format.parse_configure / parse_names_block (the
+#     same layout as tests/test_fail04_truncated_index.py, replicated here so this
+#     file stays self-contained). ------------------------------------------------
+_UINT64 = 3                # DataType.UINT64 (the rank-0 smdinfo fields)
+_SMDINFO_SRC = 1           # namesid_of(1) == (nodeId=0, namesId=1)
+
+
+def _cstr(s, n=256):
+    b = s.encode("latin-1")[:n]
+    return b + b"\x00" * (n - len(b))
+
+
+def _smd_configure():
+    """A Configure dgram declaring the ``smdinfo``/``offsetAlg`` Names table
+    (fields ``intOffset``, ``intDgramSize``) the SMD scan requires."""
+    fields = [("intOffset", _UINT64, 0), ("intDgramSize", _UINT64, 0)]
+    p = struct.pack("<I", len(fields))                       # num_arrays
+    p += _cstr("offset") + _cstr("smdinfo") + _cstr("detid-serial")
+    p += _cstr("offsetAlg") + struct.pack("<I", 1) + struct.pack("<I", 0)
+    assert len(p) == fmt.NAMEINFO_SZ, (len(p), fmt.NAMEINFO_SZ)
+    for fname, ftype, frank in fields:
+        nm = b"\x00" * fmt.ALG_SZ + _cstr(fname) + struct.pack("<II", ftype, frank)
+        assert len(nm) == fmt.NAME_SZ, (len(nm), fmt.NAME_SZ)
+        p += nm
+    return _dgram_svc(fmt.SERVICE_CONFIGURE, 1,
+                      _pack_xtc(_SMDINFO_SRC, 0, fmt.TID_NAMES, p))
+
+
+def _smd_l1(ts, intoff, intsize=96):
+    """An L1Accept carrying an ``smdinfo`` ShapesData (rank-0 ``intOffset`` /
+    ``intDgramSize``) -- what ``_scan_smd_stream`` records a ts for."""
+    data = _pack_xtc(0, 0, fmt.TID_DATA, struct.pack("<QQ", intoff, intsize))
+    sd = _pack_xtc(_SMDINFO_SRC, 0, fmt.TID_SHAPESDATA, data)
+    return _dgram_svc(fmt.SERVICE_L1ACCEPT, ts, sd)
+
+
+def _write_bytes(path, data):
+    with open(path, "wb") as fh:
+        fh.write(data)
 
 
 def _det(name, det_type, stream, alg="raw", seg=0):
@@ -387,6 +441,76 @@ def test_fail_closed_when_gate_source_unbuildable():
           "(cause chained); gate=False still returns the ungated merge")
 
 
+# ===========================================================================
+# 5. F2 -- the streaming SMD gate must FAIL CLOSED on a truncated sidecar,
+#    exactly as _scan_smd_stream (what build_index uses) does.
+# ===========================================================================
+def test_smd_gate_fails_closed_on_trailing_remnant():
+    """A ``_StreamCursor`` treats a sub-24-byte trailing remnant on a
+    single-chunk SMD sidecar as a CLEAN end (``peek()`` -> ``None``) -- but
+    :func:`psdata.index._scan_smd_stream`, which ``build_index`` uses, FAILS
+    CLOSED on exactly that ("trailing N byte(s) too few").  If the streaming gate
+    accepted it as EOF it would yield a SHORT gate, and the merge-join would then
+    silently drop the corresponding trailing bigdata event(s) as if they were the
+    ragged tail -- a silent divergence from ``build_index`` and a silent breach of
+    the fail-closed contract.
+
+    This locks the parity: the streaming SMD gate must RAISE on the same corrupt
+    bytes ``_scan_smd_stream`` raises on.  The oracle half (``_scan_smd_stream``
+    raises) holds on both parent and fix; the gate half is a fix-only lock
+    (``iter_gate_timestamps`` exists only on the fix) and is reached only after
+    check 1, which already reddens the parent."""
+    with tempfile.TemporaryDirectory() as td:
+        sd = os.path.join(td, "smalldata")
+        os.makedirs(sd)
+        bd = os.path.join(td, "synth-r0002-s000-c000.xtc2")
+        smd = os.path.join(sd, "synth-r0002-s000-c000.smd.xtc2")
+        body = b"".join(_smd_l1(500 + i, 10 * i) for i in range(5))
+        # a VALID sidecar, then a 7-byte remnant (< the 24-byte dgram header):
+        # _StreamCursor stops here treating it as EOF; _scan_smd_stream raises.
+        _write_bytes(smd, _smd_configure() + body + b"\x07" * 7)
+        _write_bytes(bd, b"\x00" * 16)          # bd never opened on the SMD path
+        rc = fmt.RunConfig()
+        rc.stream_files = {0: bd}
+        smd_map = pidx.smd_files_for(rc.stream_files)
+
+        # ORACLE (parent AND fix): the index-build SMD scan fails closed here.
+        try:
+            pidx._scan_smd_stream(smd, bd, 1 << 22)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(
+                "precondition: _scan_smd_stream must RAISE on a sub-header "
+                "trailing remnant -- the parity oracle is broken; a full "
+                "synthetic SMD sidecar was not built correctly")
+
+        # THE F2 LOCK (fix): the streaming SMD gate must ALSO raise on the same
+        # bytes, not silently yield a short gate.
+        gate_iter = getattr(pidx, "iter_gate_timestamps", None)
+        if gate_iter is None:                   # pre-fix tree: nothing to lock
+            print("[ok] STR-05 F2: iter_gate_timestamps absent (pre-fix tree); "
+                  "the oracle _scan_smd_stream fails closed as required")
+            return
+        try:
+            list(gate_iter(rc.stream_files, run_config=rc, smd_files=smd_map,
+                           source="smd"))
+        except RuntimeError as exc:
+            assert "truncat" in str(exc).lower(), (
+                f"STR-05 F2: the gate raised, but not a truncation error: "
+                f"{exc!r}")
+        else:
+            raise AssertionError(
+                "STR-05 F2: iter_gate_timestamps SILENTLY accepted a truncated "
+                "SMD sidecar (a sub-header trailing remnant) as a clean end and "
+                "yielded a short gate -- it must fail closed like "
+                "_scan_smd_stream, or the merge-join drops the trailing bigdata "
+                "event(s) as if they were the ragged shutdown tail")
+
+    print("[ok] STR-05 F2: the streaming SMD gate fails closed on a sub-header "
+          "trailing remnant -- parity with _scan_smd_stream / build_index")
+
+
 def main():
     print("=" * 72)
     print("STR-05 regression: Run.events(gate=True) is an O(1) streaming "
@@ -396,6 +520,7 @@ def main():
     test_gated_set_identical_to_index_drops_tail_spans_roll()
     test_gate_false_is_strict_superset_with_tail()
     test_fail_closed_when_gate_source_unbuildable()
+    test_smd_gate_fails_closed_on_trailing_remnant()
     print()
     print("ALL STR-05 CHECKS PASSED")
     return 0

@@ -2253,14 +2253,42 @@ def _iter_smd_cursor_ts(cursor, stream, smdinfo_key, table):
     """LAZY: yield ``(ts, stream)`` for each SMD ``L1Accept`` whose dgram carries
     an ``smdinfo`` record, in ascending ts -- the streaming counterpart of the
     records :func:`_scan_smd_stream` appends (service 12 AND ``_read_smdinfo``
-    not ``None``), so the gate set equals the SMD-built index exactly."""
+    not ``None``), so the gate set equals the SMD-built index exactly.
+
+    **Fail-closed parity (STR-05 F2).**  A ``_StreamCursor`` treats a
+    sub-24-byte trailing remnant on a single-chunk file as a CLEAN end
+    (``peek()`` returns ``None``) -- but :func:`_scan_smd_stream`, which
+    ``build_index`` uses, FAILS CLOSED on exactly that ("trailing N byte(s) too
+    few for a dgram header").  If the streaming gate accepted it as EOF it would
+    yield a SHORT gate, and the merge-join would then silently drop the
+    corresponding trailing bigdata event(s) as if they were the ragged tail --
+    where ``build_index`` would have RAISED.  So on a ``None`` head we check for
+    a leftover sub-header remnant and raise the same truncation ``RuntimeError``,
+    keeping the streaming gate byte-identical to (and as fail-closed as) the
+    SMD-built index.  A mid-dgram cut (header present, body past EOF) already
+    raises inside ``peek`` on both paths, so only the ``<`` header remnant needs
+    this guard.  A clean end (nothing left after the last dgram) returns."""
+    count = 0
     while True:
         h = cursor.peek()
         if h is None:
+            remnant = len(cursor.buf) - cursor.pos
+            if remnant > 0:
+                trunc_off = cursor.base + cursor.pos
+                raise RuntimeError(
+                    f"truncated xtc file {cursor.path!r}: trailing {remnant} "
+                    f"byte(s) too few for a {_f.DGRAM_HDR}-byte dgram header at "
+                    f"byte offset {trunc_off}. {count} complete L1Accept "
+                    f"event(s) scanned (last complete event index {count - 1}); "
+                    f"the file was cut mid-stream (a partial transfer or an "
+                    f"aborted DAQ). Refusing to yield a silently short gate that "
+                    f"would drop trailing bigdata events -- _scan_smd_stream "
+                    f"fails closed here too.")
             return
         if h["service"] == _f.SERVICE_L1ACCEPT:
             buf, off, hh = cursor.head_view()
             if _read_smdinfo(buf, off, hh, smdinfo_key, table) is not None:
+                count += 1
                 yield (h["ts"], stream)
         cursor.advance()
 
@@ -2370,13 +2398,21 @@ def iter_gate_timestamps(stream_files, run_config=None, smd_files=None,
         ``include_shutdown_tail=False``);
       * ``"auto"`` (default) -- SMD when *all* sidecars are present, else bigdata.
 
-    **Fail-closed / eager setup.**  Everything that can fail -- source selection,
-    opening the files, parsing each Configure -- runs EAGERLY in this call (this
+    **Fail-closed, always -- eagerly where it can be.**  Gate-source
+    *construction* failures -- source selection, opening the files, parsing each
+    Configure, a sidecar with no smdinfo table -- run EAGERLY in this call (this
     is a plain function returning a generator, not itself a generator), so
-    :meth:`Run.events` can wrap a gate-build failure in
-    :class:`~psdata.run.GateBuildError` at call time instead of surfacing it
-    mid-stream.  Only the incremental ts walk is deferred to the returned
-    generator.
+    :meth:`Run.events` can wrap them in :class:`~psdata.run.GateBuildError` at
+    call time.  A truncation discovered DEEP in the walk, however -- a
+    present-but-cut chunk/sidecar (a header running past EOF, or a sub-header
+    trailing remnant) -- can only be found while walking, so it surfaces as a
+    loud ``RuntimeError`` mid-stream (see :func:`_iter_smd_cursor_ts` /
+    :func:`_iter_bigdata_l1_timestamps`).  That is inherent to O(1) startup: we
+    do not read the whole source up front, so a deep truncation is not knowable
+    up front either.  Either way the gate is fail-closed -- it raises rather than
+    silently yielding a short gate (which would make the merge-join drop the
+    corresponding trailing bigdata events as if they were the ragged tail) -- and
+    matches what :func:`build_index` does on the identical bytes.
 
     ``run_config`` is required only for the bigdata clamp; it is dereferenced
     (via :func:`_timing_streams_of`) AFTER the files are opened, so a run whose
