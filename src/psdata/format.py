@@ -25,6 +25,7 @@ The format constants and the five functions named in the acceptance criteria
 ``parse_configure``, ``extract_field``) are the same as in ``psdata.py``.
 """
 
+import logging
 import math
 import os
 import re
@@ -229,6 +230,24 @@ def unpack_alg_version(packed):
     return ((packed >> 16) & 0xff, (packed >> 8) & 0xff, packed & 0xff)
 
 
+def _norm_version_triple(version):
+    """Normalise a user-supplied version to a ``(major, minor, micro)`` int
+    triple: accept a ``"major.minor.micro"`` string or any int sequence, PAD a
+    short one with zeros (so ``"0.1"`` / ``(0, 1)`` -> ``(0, 1, 0)`` matches the
+    canonical triple), and reject one with more than three components with a
+    clear error.  Guards the documented major.minor.micro contract of
+    :func:`acknowledge_version` and the ``PSDATA_ACK_VERSIONS`` tokens."""
+    if isinstance(version, str):
+        parts = tuple(int(p) for p in version.split("."))
+    else:
+        parts = tuple(int(p) for p in version)
+    if len(parts) > 3:
+        raise ValueError(
+            f"version must be major.minor.micro (at most 3 components); "
+            f"got {version!r}")
+    return parts + (0,) * (3 - len(parts))
+
+
 # The ``(det_type, alg, (major, minor, micro))`` combinations whose RAW decode
 # psdata has been byte-exact cross-checked against psana for (``max|diff| == 0``).
 # Deliberately CONSERVATIVE: seeded only from the reference detectors the reader
@@ -282,7 +301,6 @@ def _version_acknowledged(det_type, version_triple):
     spec = os.environ.get("PSDATA_ACK_VERSIONS", "")
     if not spec.strip():
         return False
-    vtxt = "%d.%d.%d" % version_triple
     for tok in re.split(r"[,\s]+", spec.strip()):
         if not tok:
             continue
@@ -292,8 +310,14 @@ def _version_acknowledged(det_type, version_triple):
         if not sep:
             if dt == det_type:
                 return True
-        elif dt == det_type and ver in ("", "*", vtxt):
-            return True
+        elif dt == det_type:
+            if ver in ("", "*"):
+                return True
+            try:
+                if _norm_version_triple(ver) == version_triple:
+                    return True   # normalise so 'jungfrau:0.1' matches (0,1,0)
+            except (ValueError, TypeError):
+                pass
     return False
 
 
@@ -311,9 +335,7 @@ def acknowledge_version(det_type, version=None, alg="raw"):
     if version is None:
         _acknowledged_versions.add((det_type, None))
         return
-    if isinstance(version, str):
-        version = tuple(int(p) for p in version.split("."))
-    _acknowledged_versions.add((det_type, tuple(version)))
+    _acknowledged_versions.add((det_type, _norm_version_triple(version)))
 
 
 def _signal_unvalidated_raw_version(det_type, alg_name, version_triple):
@@ -344,6 +366,21 @@ def _signal_unvalidated_raw_version(det_type, alg_name, version_triple):
         raise UnvalidatedVersionError(msg)
     if key not in _signaled_versions:
         _signaled_versions.add(key)
+        # DET-10 durability: mirror the first occurrence to the logging
+        # subsystem as well as the warnings channel.  ``warnings.warn`` can be
+        # silently swallowed by a suppressing context (``simplefilter('ignore')``,
+        # a wrapping ``catch_warnings``, ``-W ignore``, ``PYTHONWARNINGS``) -- and
+        # because the dedup key is marked on THIS first occurrence, no later read
+        # would ever re-warn, leaving the unvalidated version permanently silent.
+        # A logging record is not subject to ``warnings`` filters, so a pipeline
+        # that silences Python warnings still gets the signal in its logs (a
+        # WARNING reaches stderr via logging's last-resort handler even with no
+        # logging configured).  Both channels fire; logging is the durable one.
+        logging.getLogger("psdata").warning(
+            "unvalidated detector raw version %s for det_type=%r (alg='raw') -- "
+            "not byte-exact validated vs psana; acknowledge via "
+            "PSDATA_ACK_VERSIONS / psdata.format.acknowledge_version, or set "
+            "PSDATA_STRICT_VERSIONS=1 to fail closed", vtxt, det_type)
         warnings.warn(msg, UnvalidatedVersionWarning, stacklevel=3)
 
 

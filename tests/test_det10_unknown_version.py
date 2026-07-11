@@ -35,6 +35,7 @@ xtc2 file -- the Names payload is built by hand, in bytes, to the exact layout
 version set to a known / unknown triple.  ``main()`` + ``__main__``; cwd-robust.
 """
 
+import logging
 import os
 import struct
 import sys
@@ -120,6 +121,18 @@ def _unval_warnings(recorded):
     probe never imports a symbol the PARENT lacks."""
     return [w for w in recorded
             if w.category.__name__ == "UnvalidatedVersionWarning"]
+
+
+class _ListHandler(logging.Handler):
+    """Capture ``logging`` records so the durable (filter-proof) DET-10 channel
+    can be asserted."""
+
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
 
 
 # The expected decode of the one-field table below -- what parse_names_block must
@@ -258,11 +271,111 @@ def check_strict_mode_raises():
     print(f"OK: PSDATA_STRICT_VERSIONS=1 raises {type(raised).__name__} naming 9.9.9")
 
 
+# ===========================================================================
+# 5. DURABILITY (NIT 1): even when the warnings channel is fully suppressed, the
+#    signal must survive via logging -- else the once-per-process dedup would
+#    make the unvalidated version permanently silent.
+# ===========================================================================
+def check_suppressed_warnings_still_logs():
+    version = (9, 9, 9)
+    buf = build_names_payload("jungfrau", "jungfrau", "serialX", "raw",
+                              version, 0, [("raw", 1, 0)], num_arrays=0)
+
+    _reset_signal_dedup()
+    os.environ.pop("PSDATA_STRICT_VERSIONS", None)
+    os.environ.pop("PSDATA_ACK_VERSIONS", None)
+
+    logger = logging.getLogger("psdata")
+    handler = _ListHandler()
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    try:
+        # A suppressing context: warnings are IGNORED (as `-W ignore` /
+        # PYTHONWARNINGS=ignore / an outer catch_warnings would do), so the
+        # warnings channel records nothing.
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("ignore")
+            _parse(buf)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+    # The warnings channel is genuinely silenced here...
+    assert len(_unval_warnings(recorded)) == 0, \
+        "precondition: warnings must be suppressed in this context"
+
+    # ...but the DURABLE logging channel must still carry the signal (WARNING,
+    # on the 'psdata' logger, naming the unvalidated version).  On the PARENT
+    # parse_names_block emits nothing to logging, so this fails -> exit non-zero.
+    logged = [r for r in handler.records
+              if r.levelno >= logging.WARNING and "9.9.9" in r.getMessage()]
+    if not logged:
+        raise AssertionError(
+            "DET-10 durability: with Python warnings suppressed, an unvalidated "
+            "raw version emitted NO logging record -- the dedup would then keep "
+            "it permanently silent. It must also log (WARNING) so a warnings-"
+            "silencing pipeline still sees the signal.")
+    assert "jungfrau" in logged[0].getMessage(), \
+        f"the logged signal must name the detector; got: {logged[0].getMessage()!r}"
+    print("OK: warnings suppressed -> signal still emitted on the 'psdata' logger "
+          "(durable channel survives warnings filters)")
+
+
+# ===========================================================================
+# 6. ACK NORMALISATION (NIT 2): a short 'major.minor' acknowledgement is padded
+#    to the canonical triple and still matches.
+# ===========================================================================
+def check_ack_short_version_normalizes():
+    # The env token uses the two-component form 'jungfrau:9.9', which must
+    # normalise to (9, 9, 0)...
+    v_env = (9, 9, 0)
+    buf_env = build_names_payload("jungfrau", "jungfrau", "serialX", "raw",
+                                  v_env, 0, [("raw", 1, 0)], num_arrays=0)
+    _reset_signal_dedup()
+    os.environ.pop("PSDATA_STRICT_VERSIONS", None)
+    os.environ["PSDATA_ACK_VERSIONS"] = "jungfrau:9.9"
+    try:
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            _parse(buf_env)
+    finally:
+        os.environ.pop("PSDATA_ACK_VERSIONS", None)
+    assert len(_unval_warnings(recorded)) == 0, \
+        "env token 'jungfrau:9.9' must normalise to (9,9,0) and suppress it; " \
+        f"got {[str(w.message) for w in recorded]!r}"
+
+    # ...and the programmatic acknowledge_version accepts a short string too,
+    # padding '2.5' -> (2,5,0).  Guarded: acknowledge_version does not exist on
+    # the PARENT, so skip that leg there (the durability/signal checks above are
+    # the discriminators).
+    ack = getattr(fmt, "acknowledge_version", None)
+    if ack is not None:
+        v_api = (2, 5, 0)
+        buf_api = build_names_payload("epix10ka", "epixquad", "serialY", "raw",
+                                      v_api, 0, [("raw", 1, 0)], num_arrays=0)
+        _reset_signal_dedup()
+        ack("epix10ka", "2.5")            # short form, padded to (2,5,0)
+        try:
+            with warnings.catch_warnings(record=True) as recorded2:
+                warnings.simplefilter("always")
+                _parse(buf_api)
+        finally:
+            fmt._acknowledged_versions.discard(("epix10ka", (2, 5, 0)))
+        assert len(_unval_warnings(recorded2)) == 0, \
+            "acknowledge_version('epix10ka', '2.5') must pad to (2,5,0) and " \
+            f"suppress; got {[str(w.message) for w in recorded2]!r}"
+    print("OK: short 'major.minor' acknowledgements normalise to the canonical "
+          "triple (env + programmatic)")
+
+
 def main():
     check_unknown_version_signals()
     check_known_version_no_signal_and_byte_unchanged()
     check_ack_suppresses_signal()
     check_strict_mode_raises()
+    check_suppressed_warnings_still_logs()
+    check_ack_short_version_normalizes()
     print("\nALL DET-10 CHECKS PASSED")
     return 0
 
