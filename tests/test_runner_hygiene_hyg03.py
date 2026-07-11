@@ -86,9 +86,22 @@ def _fake_skipping_test(tmp, fname, skip_name):
 
 
 def _fake_clean_test(tmp, fname="fake_clean.py"):
+    # NB: the body must not print any skip-looking word, or the runner's
+    # unmarked-skip check would (correctly) redden this deliberately-clean file.
     return _write(os.path.join(tmp, fname), (
         "#!/usr/bin/env python3\n"
-        "print('[ok] nothing skipped here')\n"
+        "print('[ok] a clean check ran')\n"
+        "raise SystemExit(0)\n"))
+
+
+def _fake_bare_skip_test(tmp, fname="fake_bare_skip.py"):
+    """A fake test that skips a check the OLD way -- a printed '[skip]' line and
+    ``return``, exiting 0 with NO ##SKIP## marker.  This is the pre-fix idiom the
+    unmarked-skip check exists to catch."""
+    return _write(os.path.join(tmp, fname), (
+        "#!/usr/bin/env python3\n"
+        "print('[skip] no psana in this env')\n"   # old idiom, no marker
+        "print('ALL CHECKS PASSED')\n"
         "raise SystemExit(0)\n"))
 
 
@@ -150,9 +163,10 @@ def test_unlisted_skip_fails_the_suite():
     # the skip's reason is surfaced, not just its name
     assert "synthetic skip emitted by the HYG-03 self-test" in out, \
         "the runner must print each skip's reason\n" + out
-    print(f"[ok] unlisted skip -> runner exit {rc} (nonzero), "
-          f"summary '{n_pass} passed, {n_fail} failed, {n_skip} skipped', "
-          f"UNJUSTIFIED SKIP named")
+    # (do not echo the literal 'S skipped' summary word here -- this test's own
+    #  stdout is itself scanned by the outer suite's unmarked-skip check)
+    print(f"[ok] unlisted skip -> runner exit {rc} (nonzero); summary carried "
+          f"an explicit skip count (S={n_skip}); UNJUSTIFIED SKIP named")
 
 
 # --------------------------------------------------------------------------
@@ -180,7 +194,7 @@ def test_allowlisted_skip_passes_but_is_counted():
     assert name in out and "justification:" in out, \
         "the runner must print the skip with its justification\n" + out
     print(f"[ok] allowlisted skip {name!r} -> runner exit 0, still counted "
-          f"({n_skip} skipped) and printed with its justification")
+          f"(skip count S={n_skip}) and printed with its justification")
 
 
 # --------------------------------------------------------------------------
@@ -218,6 +232,64 @@ def test_runner_still_streams_test_output():
 
 
 # --------------------------------------------------------------------------
+# 4b. THE SECOND DISCRIMINATOR: an UNMARKED (old-idiom) skip fails the suite
+# --------------------------------------------------------------------------
+def test_bare_unmarked_skip_fails_the_suite():
+    """A test that skips the OLD way -- prints a bare '[skip]' line and exits 0,
+    with NO ##SKIP## marker -- must NOT score as a pass.
+
+    The ##SKIP## protocol only reclassifies a run when the marker appears; a
+    future author who reverts to the old idiom would slip a silent skip past it.
+    On the parent commit this exits 0 (there is no such check at all); on the
+    fixed runner it exits nonzero and tells the author to route the skip through
+    ``skip(name, reason)``.  A fresh discriminator, independent of the marker path.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        bare = _fake_bare_skip_test(tmp, "fake_bare_skip.py")
+        clean = _fake_clean_test(tmp)
+        rc, out = _run_suite(bare, clean)
+
+    assert rc != 0, (
+        "run_tests.sh exited 0 on a bare unmarked skip line -- an old-idiom "
+        "skip is being scored as a pass (HYG-03).  Output was:\n" + out)
+    assert "UNMARKED SKIP" in out, (
+        "the runner must flag the unmarked skip line\n" + out)
+    assert bare in out, "the runner must name the offending test file\n" + out
+    # it must point the author at the sanctioned protocol
+    assert "skip(" in out, (
+        "the runner must tell the author to route it through skip(name, reason)"
+        "\n" + out)
+    # a bare skip is NOT a ##SKIP## record, so it must not inflate the skip count
+    n_pass, n_fail, n_skip = _summary_counts(out)
+    assert n_skip == 0, (
+        f"an unmarked skip must not be counted as a ##SKIP## record; summary "
+        f"said {n_skip}\n{out}")
+    print(f"[ok] a bare unmarked skip line reddens the run (exit {rc}); runner "
+          f"names the file and points the author at skip(name, reason)")
+
+
+# --------------------------------------------------------------------------
+# 4c. a vacuous green -- zero test files executed -- must fail, not pass
+# --------------------------------------------------------------------------
+def test_zero_tests_fails():
+    """A run that executes zero test files must FAIL, not silently report
+    success on nothing.  Reached via PSDATA_NO_DEFAULT_TESTS=1 with no args (the
+    only way to express 'run nothing' -- otherwise no-args means the default
+    suite)."""
+    proc = subprocess.run(
+        ["bash", RUN_TESTS], cwd="/", capture_output=True, text=True,
+        env={**os.environ, "PSDATA_NO_DEFAULT_TESTS": "1"},
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, \
+        f"a 0-test run must fail; runner exited {proc.returncode}\n{out}"
+    assert "ran 0 tests" in out, \
+        "the runner must say it ran 0 tests\n" + out
+    print(f"[ok] a 0-test run fails (exit {proc.returncode}, 'ran 0 tests') -- "
+          f"no vacuous green")
+
+
+# --------------------------------------------------------------------------
 # 5. every tests/test_*.py on disk is registered in the default TESTS list
 # --------------------------------------------------------------------------
 def test_default_suite_registers_every_test_file():
@@ -243,6 +315,8 @@ def main():
     test_allowlisted_skip_passes_but_is_counted()
     test_clean_run_and_failure_still_work()
     test_runner_still_streams_test_output()
+    test_bare_unmarked_skip_fails_the_suite()
+    test_zero_tests_fails()
     test_default_suite_registers_every_test_file()
     print("\nALL HYG-03 RUNNER-HYGIENE CHECKS PASSED")
 

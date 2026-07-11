@@ -44,7 +44,11 @@ fi
 # unregistered test file is another way for a check to silently not run;
 # tests/test_runner_hygiene_hyg03.py asserts this list is complete.
 TESTS=("$@")
-if [[ ${#TESTS[@]} -eq 0 ]]; then
+# PSDATA_NO_DEFAULT_TESTS=1 suppresses the default list even with no args -- so an
+# empty run is expressible (the CLI otherwise can't distinguish "no args" from
+# "run nothing").  It exists so the 0-test guard below is reachable and testable;
+# a real caller just passes files or nothing.
+if [[ ${#TESTS[@]} -eq 0 && "${PSDATA_NO_DEFAULT_TESTS:-}" != "1" ]]; then
   TESTS=(
     "$REPO/tests/test_format_us001.py"
     "$REPO/tests/test_stream_us002.py"
@@ -96,6 +100,17 @@ passed=0
 failed=0
 skip_names=()
 skip_reasons=()
+bare_skip_files=()          # test files that emitted an UNMARKED skip line
+bare_skip_lines=()          # the offending line, verbatim
+
+# Lines that look like the OLD skip idiom -- 'print("[skip] ..."); return' and
+# friends -- but carry NO ##SKIP## marker.  A future author who writes one of
+# these exits 0 with no marker, so the counter above never sees it and it scores
+# as a PASS: exactly the pre-fix bug.  We grep each test's log for these and fail
+# the suite, telling the author to route the skip through tests/_skips.py.  The
+# ##SKIP## marker lines are excluded (they are the SANCTIONED form), so a real
+# skip record -- even one whose reason text says "skipped" -- never trips this.
+BARE_SKIP_RE='\[skip\]|skipping|SKIPPED'
 
 for t in "${TESTS[@]}"; do
   echo "### running $t"
@@ -126,10 +141,26 @@ for t in "${TESTS[@]}"; do
     skip_names+=("$name")
     skip_reasons+=("$reason")
   done < <(grep -F "$SKIP_MARKER" "$out" || true)
+  # UNMARKED skips: skip-looking lines that are NOT ##SKIP## records.
+  while IFS= read -r bline; do
+    [[ -n "$bline" ]] || continue
+    bare_skip_files+=("$t")
+    bare_skip_lines+=("$bline")
+  done < <(grep -iE "$BARE_SKIP_RE" "$out" 2>/dev/null | grep -vF "$SKIP_MARKER" || true)
   rm -f "$out"
 done
 
+ran=$((passed + failed))
+
+# A vacuous green -- zero test files executed -- must not read as success.
+if [[ $ran -eq 0 ]]; then
+  echo
+  echo "RESULT: FAIL -- ran 0 tests" >&2
+  exit 1
+fi
+
 n_skipped=${#skip_names[@]}
+n_bare=${#bare_skip_lines[@]}
 
 # Final tally over the test FILES run (each script is one pass/fail unit) plus
 # the INDIVIDUAL checks that skipped inside them.  A skip is not a pass.
@@ -161,6 +192,21 @@ if [[ $unjustified -gt 0 ]]; then
   echo "FAILED: ${unjustified} unjustified skip(s) -- a check that did not run" \
        "is not a passing check.  Fix the cause, or add the skip to" \
        "tests/skips_allowed.txt with a real justification." >&2
+  [[ $status -ne 0 ]] || status=1
+fi
+
+# Unmarked (old-idiom) skips: a printed skip that carries no ##SKIP## marker.
+if [[ $n_bare -gt 0 ]]; then
+  echo "--- unmarked skips (HYG-03) ----------------------------------------"
+  for i in "${!bare_skip_lines[@]}"; do
+    echo "UNMARKED SKIP in ${bare_skip_files[$i]}:"
+    echo "     ${bare_skip_lines[$i]}"
+  done
+  echo "--------------------------------------------------------------------"
+  echo "FAILED: ${n_bare} unmarked skip(s) -- a printed skip with no ##SKIP##" \
+       "marker exits 0 and scores as a PASS (the exact HYG-03 bug).  Route it" \
+       "through tests/_skips.py: skip(name, reason), and justify it in" \
+       "tests/skips_allowed.txt if it is legitimate." >&2
   [[ $status -ne 0 ]] || status=1
 fi
 

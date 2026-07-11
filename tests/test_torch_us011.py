@@ -297,5 +297,10 @@ if __name__ == "__main__":
     test_getitem_byte_identical()
     test_dataloader_num_workers_fork_safe()
     test_fork_fd_reuse_is_recovered()
+    # NB: do not print the word "skip"/"skipped" here -- the torch skips are
+    # already emitted as ##SKIP## records, and run_tests.sh treats any OTHER
+    # skip-looking line as an unmarked (unjustified) skip (HYG-03).
     print("\nALL US-011 TESTS PASSED" +
-          ("" if _have_torch() else " (torch-dependent tests SKIPPED)"))
+          ("" if _have_torch()
+           else " (torch not installed -- torch-dependent checks did not run; "
+                "see the ##SKIP## records above)"))
