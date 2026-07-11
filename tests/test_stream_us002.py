@@ -18,6 +18,11 @@ Verifies the acceptance criteria:
      reference run is clean, so a synthetic missing-segment case proves the
      logic; US-004 exercises it on a dataset that triggers it naturally).
   5. Importing psdata / psdata.stream does not import psana, mpi4py, or h5py.
+  6. Forward streaming is gated to the SMD/psana event set: on the reference
+     run's ragged DAQ-shutdown tail the ungated k-way merge would surface 17982
+     bigdata L1Accepts against the 17872 the SMD writer indexed.  This check is
+     SLOW (one full forward pass over a 10-stream Jungfrau run) and it ALWAYS
+     runs -- no environment variable can turn it off.
 
 Needs the production psana env (psconda.sh) on host sdfiana025 to generate
 ground truth.
@@ -228,13 +233,22 @@ def test_byte_exact_first_20_vs_psana():
 #    k-way merge surfaces them, so r.events() would yield MORE events than the
 #    index and psana.  mfx100848724/r51 exercises this exactly: 17982 ungated vs
 #    17872 indexed.  Run.events() now filters the merge to the indexed
-#    timestamps.  SLOW (one full forward pass over a 10-stream Jungfrau run);
-#    set PSDATA_SKIP_SLOW=1 to skip.
+#    timestamps.  SLOW (one full forward pass over a 10-stream Jungfrau run) --
+#    and it ALWAYS runs, because this is the gate that locks the invariant and a
+#    gate that can be switched off is not a gate.  It used to honour
+#    PSDATA_SKIP_SLOW=1, which the canonical runner always sets
+#    (`PSDATA_SKIP_SLOW=1 bash run_tests.sh`, tests/env_store_suite.sbatch), so
+#    in every "green" run on record this check printed SKIP, returned None, and
+#    was still counted a pass.  The env var is no longer consulted here, and
+#    tests/test_gate02_gated_forward.py pins that: it sets PSDATA_SKIP_SLOW=1 and
+#    demands a real event count back from this function.
 # --------------------------------------------------------------------------
 def test_forward_gated_to_index_event_set():
-    if os.environ.get("PSDATA_SKIP_SLOW"):
-        print("SKIP gated-forward regression (PSDATA_SKIP_SLOW set)")
-        return
+    """Walk the full gated forward pass; return the number of events walked.
+
+    Returns the count (never None) so that a caller can mechanically observe the
+    gate really executed -- see tests/test_gate02_gated_forward.py.
+    """
     import psdata
     r = psdata.open(exp=EXP, run=RUN, dir=DIR)
     valid = set(r.build_index().timestamps)
@@ -249,6 +263,11 @@ def test_forward_gated_to_index_event_set():
             assert evt.timestamp > last, "gated forward not strictly ascending"
         last = evt.timestamp
         n += 1
+    # Anti-toothlessness: a gate that walks zero events proves nothing, and it
+    # would let the n == nidx equality below pass vacuously on an empty index.
+    assert n > 0, (
+        f"gated forward walked 0 events -- the gate is toothless; expected the "
+        f"{nidx} SMD-indexed L1Accepts of {EXP}/r{RUN}")
     # If the gate were removed, Run.events() would yield the raw bigdata count
     # (17982 on this run) instead of the indexed 17872 -- so this single equality
     # decisively catches a gate regression without a second (slow) ungated pass.
@@ -257,6 +276,7 @@ def test_forward_gated_to_index_event_set():
         "Run.events() is no longer gated to the SMD/psana event set")
     print(f"gated forward == index event set ({n} events); "
           "shutdown-tail stragglers excluded")
+    return n
 
 
 def main():
@@ -271,6 +291,9 @@ def main():
     print("[ok] missing-segment -> detector None")
     test_byte_exact_first_20_vs_psana()
     print("[ok] byte-exact vs psana (ts + pulseId + raw, first 20)")
+    # The (slow) full gated forward pass, driven exactly ONCE here.  It no longer
+    # honours PSDATA_SKIP_SLOW; tests/test_gate02_gated_forward.py is the
+    # regression that pins that it cannot skip itself.
     test_forward_gated_to_index_event_set()
     print("[ok] forward streaming gated to SMD/psana event set")
     print("\nALL US-002 ACCEPTANCE CHECKS PASSED")
