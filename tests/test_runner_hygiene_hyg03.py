@@ -127,6 +127,17 @@ def _fake_skip_token_test(tmp, fname="fake_skip_token.py"):
         "raise SystemExit(0)\n"))
 
 
+def _fake_prose_marker_test(tmp, fname="fake_prose_marker.py"):
+    """A GREEN test whose summary merely MENTIONS the marker in prose -- exactly
+    like test_torch_us011's real line 'see the ##SKIP## records above' -- with NO
+    real skip record.  The marker appears mid-line (not at line start) and there
+    is no '::', so the collector must NOT count it as a skip."""
+    return _write(os.path.join(tmp, fname), (
+        "#!/usr/bin/env python3\n"
+        "print('ALL CHECKS PASSED (done; see the %s records above)')\n"
+        "raise SystemExit(0)\n" % SKIP_MARKER))
+
+
 def _fake_failing_test(tmp, fname="fake_fail.py"):
     return _write(os.path.join(tmp, fname), (
         "#!/usr/bin/env python3\n"
@@ -324,6 +335,41 @@ def test_bare_skip_token_fails_the_suite():
 
 
 # --------------------------------------------------------------------------
+# 4b''. a PROSE mention of the marker is NOT a skip record (collector anchored)
+# --------------------------------------------------------------------------
+def test_prose_marker_mention_is_not_counted():
+    """A GREEN test whose output merely MENTIONS the marker in prose -- exactly
+    test_torch_us011's real summary line 'see the ##SKIP## records above' -- must
+    NOT be collected as a skip record.
+
+    On the parent (marker collected with an unanchored `grep -F`) that prose line
+    parses to a phantom skip named 'records above)', which is not allowlisted ->
+    UNJUSTIFIED SKIP -> the whole suite falsely exits 1 (this was the only thing
+    keeping the merged suite red).  The anchored collector -- the marker must
+    start the line and a real record carries '::' -- ignores it: 0 skips, exit 0.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        prose = _fake_prose_marker_test(tmp, "fake_prose_marker.py")
+        clean = _fake_clean_test(tmp)
+        rc, out = _run_suite(prose, clean)
+
+    n_pass, n_fail, n_skip = _summary_counts(out)
+    assert n_skip == 0, (
+        f"a prose mention of the marker was miscounted as a skip record "
+        f"(S={n_skip}) -- the collector is not anchored to line start (HYG-03).  "
+        f"Output was:\n{out}")
+    assert rc == 0, (
+        f"a green run whose output merely mentions the marker in prose must exit "
+        f"0; runner exited {rc}\n{out}")
+    assert "UNJUSTIFIED SKIP" not in out, (
+        "a prose marker mention must not raise an unjustified-skip failure\n" + out)
+    assert n_pass == 2 and n_fail == 0, \
+        f"expected 2 passed, 0 failed; got {n_pass} passed, {n_fail} failed\n{out}"
+    print("[ok] a prose mention of the marker is not counted as a skip record "
+          "(collector anchored to line start); the run stays green")
+
+
+# --------------------------------------------------------------------------
 # 4c. a vacuous green -- zero test files executed -- must fail, not pass
 # --------------------------------------------------------------------------
 def test_zero_tests_fails():
@@ -434,6 +480,7 @@ def main():
     test_runner_still_streams_test_output()
     test_bare_unmarked_skip_fails_the_suite()
     test_bare_skip_token_fails_the_suite()
+    test_prose_marker_mention_is_not_counted()
     test_zero_tests_fails()
     test_empty_justification_is_not_allowed()
     test_default_suite_matches_disk_both_ways()
