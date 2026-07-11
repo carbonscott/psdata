@@ -260,6 +260,45 @@ def test_read_stack_refuses_oversized_request():
 
 
 # ==========================================================================
+# 4b. read_stack sizes its guard by len(ks) ROWS, not distinct positions -- a
+#     single position repeated K times still allocates a (K, *frame) buffer, so
+#     it must be refused even though only ONE distinct event is read.
+# ==========================================================================
+def test_read_stack_duplicate_positions_refused():
+    n_rep = 100_000
+    per_event = 50_000                          # one frame: 50 KB << 2 GiB
+    ridx = _synthetic_reader(1, per_event=per_event)   # only position 0 exists
+    ks = [0] * n_rep
+    distinct_est = per_event                    # what a distinct-only estimate sees
+    buffer_bytes = n_rep * per_event            # the real (K, *frame) buffer
+    assert distinct_est < LIMIT_BYTES < buffer_bytes, (
+        "test setup: distinct estimate must slip under the limit while the true "
+        "buffer blows past it")
+
+    refused = None
+    other = None
+    try:
+        ridx.read_stack(ks, "jungfrau")
+    except MemoryError as e:
+        refused = e
+    except Exception as e:
+        other = e
+
+    assert refused is not None, (
+        "read_stack did NOT refuse %d DUPLICATE positions (MEM-01): the "
+        "(len(ks), *frame) output buffer is ~%.1f GiB, but a distinct-only "
+        "estimate (~%d B, one frame) slipped past the guard -- the buffer has "
+        "one row per position, so the budget must size by len(ks)%s"
+        % (n_rep, buffer_bytes / (1024 ** 3), distinct_est,
+           "." if other is None else " -- it raised %r instead." % (other,)))
+    msg = str(refused).lower()
+    assert "iter_stack" in msg or "stream" in msg, \
+        "the refusal must point the caller at iter_stack: %r" % (refused,)
+    print("[ok] read_stack refuses %d duplicate positions (~%.1f GiB buffer, "
+          "1 distinct event) -> iter_stack" % (n_rep, buffer_bytes / (1024 ** 3)))
+
+
+# ==========================================================================
 # 5. The guard is SIZE-GATED, not a blanket refusal (existing small-K callers
 #    must be byte-unchanged: a small in-limit request is never refused).
 # ==========================================================================
@@ -284,6 +323,7 @@ def main():
     test_iter_stack_streams_in_bounded_batches()
     test_read_events_refuses_oversized_request()
     test_read_stack_refuses_oversized_request()
+    test_read_stack_duplicate_positions_refused()
     test_small_request_not_refused()
     print("\nALL MEM-01 TESTS PASSED")
 

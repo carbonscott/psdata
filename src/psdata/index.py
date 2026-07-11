@@ -811,36 +811,49 @@ class RunIndex:
     #: ``max_bytes=None`` disables the guard).
     DEFAULT_READ_MEM_LIMIT = 2 * 1024 ** 3   # 2 GiB
 
-    def _estimate_read_bytes(self, ks):
+    def _estimate_read_bytes(self, ks, dedupe=True):
         """Cheap, index-only upper bound (NO I/O) on the bytes a single
         all-at-once materialization of ``ks`` will hold: the summed indexed
-        dgram ``size`` over the *distinct* requested positions (a repeated k is
-        read once).  This raw payload is the dominant term of the ``read_stack``
-        ``(K, *frame)`` buffer (``K x prod(shape) x itemsize``) and is exactly
-        what ``read_events`` keeps alive, so it drives the memory guard."""
+        dgram ``size`` (the raw payload -- the dominant term of a decoded frame,
+        ``prod(shape) x itemsize``).
+
+        ``dedupe`` controls whether repeated positions are counted once, which
+        differs by caller:
+
+          * ``read_events`` returns the SAME :class:`Event` object for a
+            repeated ``k`` (built once, keyed by distinct position), so its live
+            memory is per-*distinct* position -> ``dedupe=True`` (default).
+          * ``read_stack`` allocates one ROW per requested position (``out`` has
+            ``len(ks)`` rows, repeats included), so a duplicate really does cost
+            another frame of buffer -> ``dedupe=False``.  Guarding on distinct
+            positions there would let ``read_stack([0] * K, det)`` estimate one
+            frame yet allocate ``K`` of them."""
         total = 0
         seen = set()
         for k in ks:
             k = int(k)
-            if k in seen:
-                continue
-            seen.add(k)
+            if dedupe:
+                if k in seen:
+                    continue
+                seen.add(k)
             for stream in self.entries[k]:
                 total += self.entries[k][stream][2]   # (chunk_path, offset, size)
         return total
 
-    def _check_read_budget(self, ks, max_bytes, stream_api):
+    def _check_read_budget(self, ks, max_bytes, stream_api, dedupe=True):
         """Raise ``MemoryError`` if materializing ``ks`` in one call would
         exceed ``max_bytes`` (``None`` disables the check), pointing the caller
         at the bounded streaming API instead of silently attempting the
-        allocation.  Runs after ``ks`` has been range-validated."""
+        allocation.  Runs after ``ks`` has been range-validated.  ``dedupe`` is
+        forwarded to :meth:`_estimate_read_bytes` (``False`` for the
+        ``read_stack`` output buffer, which counts one row per position)."""
         if max_bytes is None:
             return
-        est = self._estimate_read_bytes(ks)
+        est = self._estimate_read_bytes(ks, dedupe=dedupe)
         if est > max_bytes:
-            n_distinct = len({int(k) for k in ks})
+            n = len({int(k) for k in ks}) if dedupe else len(ks)
             raise MemoryError(
-                f"reading {n_distinct} events at once would materialize "
+                f"reading {n} events at once would materialize "
                 f"~{est / (1024 ** 3):.2f} GiB in memory, over the "
                 f"{max_bytes / (1024 ** 3):.2f} GiB limit -- refusing rather "
                 f"than attempt the allocation (MEM-01). Stream them in bounded "
@@ -1007,9 +1020,13 @@ class RunIndex:
                 raise IndexError(f"event position {k} out of range [0, {n})")
 
         # MEM-01 guard: refuse the catastrophic (K, *frame) allocation up front,
-        # before read_events materializes anything.
+        # before read_events materializes anything.  Size by len(ks) rows, NOT
+        # distinct positions (dedupe=False): the output buffer has one row per
+        # requested position, so read_stack([0] * K, det) costs K frames even
+        # though it reads a single distinct event.
         self._check_read_budget(ks, max_bytes,
-                                "iter_stack(ks, det, batch_size=...)")
+                                "iter_stack(ks, det, batch_size=...)",
+                                dedupe=False)
 
         # Already budget-checked above -- don't re-guard the inner call.
         events = self.read_events(ks, max_bytes=None)
