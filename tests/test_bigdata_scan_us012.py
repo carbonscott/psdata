@@ -20,9 +20,15 @@ What this suite proves (oracle = psdata's OWN SMD-scan path):
      when all sidecars are present;
   4. the bigdata path stays framework-pure (no psana / xtcdata / mpi4py / h5py).
 
-For speed it uses only the run's three SMALL streams (s000/s001/s004): the
-bigdata-header walk of a small file is sub-second, while the giant detector
-streams (tens-to-hundreds of GB) are validated at scale outside the suite.
+For speed the byte-exact SMD-vs-bigdata comparison uses the run's three SMALL
+streams (s000/s001/s004): a full bigdata-header walk of a small file is
+sub-second.  The giant detector streams (jungfrau s005/s007, tens-to-hundreds
+of GB) cannot be header-walked in full here -- the walk "didn't finish in 480 s"
+-- so GATE-06 covers them with a BOUNDED tail scan instead: it seeds the
+SMD-free header walk at the last SMD-indexed dgram's byte offset (deep in the
+file -- the tail, never a head prefix) and walks forward to EOF, reaching the
+ragged DAQ end-of-run shutdown tail where the 17982-vs-17872 superset case
+actually lives (see :func:`test_bigdata_detector_stream_reaches_ragged_tail`).
 """
 import os
 import sys
@@ -47,11 +53,93 @@ RUN = 51
 SMALL_STREAMS = (0, 1, 4)
 FILES = [f"{DIR}/{EXP}-r{RUN:04d}-s{s:03d}-c000.xtc2" for s in SMALL_STREAMS]
 
+# GATE-06 -- the DETECTOR (jungfrau) BIGDATA streams of this run.  The ragged
+# DAQ end-of-run shutdown tail lives HERE (streams 5 & 7), and a FULL
+# bigdata-header walk of a ~600 GB jungfrau stream is far too slow for the suite
+# (it "didn't finish in 480 s").  So the covered-stream set can no longer be the
+# three SMALL streams alone: without a detector stream the "SMD is optional"
+# bigdata build is never exercised on real detector data and the superset /
+# ragged-tail case it advertises is never met.  These are covered WITHOUT a full
+# walk -- a BOUNDED tail scan seeded at the last SMD offset; see
+# :func:`test_bigdata_detector_stream_reaches_ragged_tail`.
+DETECTOR_STREAMS = (5, 7)
+DET_FILES = {s: f"{DIR}/{EXP}-r{RUN:04d}-s{s:03d}-c000.xtc2"
+             for s in DETECTOR_STREAMS}
+
+# Oracle magnitudes for mfx100848724/r51, pinned across the suite (see
+# tests/test_stream_us002.py N_INDEXED and src/psdata/run.py): the offline SMD
+# writer indexed 17872 canonical L1Accepts, while the bigdata detector streams
+# physically carry 17982 -- 110 more, the ragged DAQ-shutdown tail the SMD never
+# recorded.  These are the ONLY assertions in the detector test that consult a
+# number psana produced, so it is an ORACLE check, not psdata-vs-psdata.
+N_SMD_INDEXED = 17872
+N_BIGDATA_TAIL = 110              # 17982 - 17872 phantom shutdown-tail events
+N_BIGDATA_SUPERSET = 17982
+
 
 def _entry_key(entry):
     """Normalise one event's index entry to {stream: (basename, off, size)} so
     SMD- and bigdata-built entries compare regardless of absolute path object."""
     return {s: (os.path.basename(p), o, sz) for s, (p, o, sz) in entry.items()}
+
+
+def _forward_l1_from_offset(path, start_off, filesize, max_dgrams=1 << 20):
+    """Seed the SMD-free bigdata cursor at ``start_off`` and walk FORWARD to EOF,
+    reading only each dgram's 24-byte header (never its GB-scale payload).
+
+    This is the exact ``psdata.index._scan_bigdata_stream`` inner loop -- the
+    ``smdwriter`` algorithm in pure Python, the same cursor walk the oracle
+    :func:`_walk_l1accepts` performs -- but *started deep in the file* rather
+    than at offset 0, so it costs only the dgrams from ``start_off`` to EOF.
+    Given a ``start_off`` near the end (the last SMD-indexed dgram of a detector
+    stream) this is a BOUNDED tail scan of a few hundred dgrams, not a full
+    ~600 GB header walk, yet it still reaches the true end of the stream.
+
+    Returns ``(boundary_header, tail_l1, reached_eof, n_dgrams)``:
+
+      * ``boundary_header`` -- the parsed header AT ``start_off`` (with ``_off``
+        and ``_total`` added), i.e. the dgram the SMD offset points at;
+      * ``tail_l1`` -- ``(ts, off, size)`` for every ``L1Accept`` STRICTLY AFTER
+        the boundary dgram, to end of file (the ragged shutdown tail);
+      * ``reached_eof`` -- True iff the walk consumed the file cleanly to a dgram
+        boundary at EOF (so the whole tail was seen, not a window that stopped
+        short);
+      * ``n_dgrams`` -- dgrams walked (boundary included).
+    """
+    boundary_header = None
+    tail_l1 = []
+    n_dgrams = 0
+    reached_eof = False
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        cursor = start_off
+        first = True
+        while cursor + psdata.format.DGRAM_HDR <= filesize:
+            if n_dgrams >= max_dgrams:
+                break                      # safety cap; reached_eof stays False
+            hdr = os.pread(fd, psdata.format.DGRAM_HDR, cursor)
+            if len(hdr) < psdata.format.DGRAM_HDR:
+                break
+            h = psdata.format.parse_dgram_header(hdr, 0)
+            total = psdata.format.XTC_HDR + h["extent"]
+            if cursor + total > filesize:
+                break                      # dgram runs past EOF (truncation)
+            n_dgrams += 1
+            if first:
+                boundary_header = dict(h)
+                boundary_header["_off"] = cursor
+                boundary_header["_total"] = total
+                first = False
+            elif h["service"] == psdata.format.SERVICE_L1ACCEPT:
+                tail_l1.append((h["ts"], cursor, total))
+            cursor += total
+        else:
+            # loop ended on the while-condition (not a break): a clean end has
+            # cursor exactly at EOF (r51's streams end on a dgram boundary).
+            reached_eof = (cursor == filesize)
+        return boundary_header, tail_l1, reached_eof, n_dgrams
+    finally:
+        os.close(fd)
 
 
 def test_bigdata_index_byte_exact_against_smd():
@@ -86,6 +174,127 @@ def test_bigdata_index_byte_exact_against_smd():
     assert idx_bd_full.include_shutdown_tail is True
     assert idx_bd_full.timestamps == idx_smd.timestamps, \
         "no DAQ tail on the small streams -> include_shutdown_tail is a no-op"
+
+
+def test_bigdata_detector_stream_reaches_ragged_tail():
+    """GATE-06 -- exercise the "SMD is optional" bigdata build on a real
+    DETECTOR (jungfrau) stream, ALL THE WAY TO its ragged DAQ-shutdown TAIL.
+
+    ``test_bigdata_index_byte_exact_against_smd`` above proves the SMD-free walk
+    on the SMALL streams (0/1/4), which carry the timing stream and have NO
+    ragged tail -- so it can only ever assert *exact* ts equality and never meets
+    the superset case the module advertises.  The 17982-vs-17872 gap lives on the
+    DETECTOR streams (5 & 7), which the small-stream tests never touch.  This test
+    covers them.
+
+    Feasibility: a FULL bigdata-header walk of a ~600 GB jungfrau stream "didn't
+    finish in 480 s", so we do NOT walk from offset 0.  Instead we build the SMD
+    index over the detector streams (fast -- the sidecars are tiny), take the
+    byte offset of the LAST SMD-indexed dgram on each stream (deep in the file --
+    the TAIL, never a head prefix), and walk the SMD-free header cursor forward
+    from there to EOF.  That is a BOUNDED scan of a few hundred dgrams that still
+    reaches the true end of the detector stream, where the shutdown tail lives.
+
+    Assertions (MEANINGFUL -- a superset, not mere equality):
+      1. OVERLAP is byte-exact: at the last SMD offset the SMD-free header walk
+         reads the SMD-recorded ``(ts, intDgramSize)`` -- proving the SMD is just
+         a cache of the same bigdata cursor on the DETECTOR data too;
+      2. the walk reaches EOF, so the WHOLE tail was seen;
+      3. every L1Accept past the boundary is a PHANTOM the SMD never indexed;
+      4. the SMD-free detector-stream event set is a STRICT SUPERSET of the SMD
+         set, of exactly the oracle magnitude (17982 vs 17872, tail = 110).
+    """
+    rc = psdata.discover(DET_FILES)
+    # Sanity: streams 5 & 7 really are the jungfrau (detector) streams -- so this
+    # is genuinely detector coverage, not another non-detector stream.
+    jung = rc.find_detector_by_type("jungfrau")
+    assert jung, "run config declares no jungfrau detector on the detector streams"
+    jstreams = set(rc.detector(jung[0]).streams_for("raw"))
+    assert set(DETECTOR_STREAMS) <= jstreams, \
+        f"streams {DETECTOR_STREAMS} are not all jungfrau streams ({sorted(jstreams)})"
+
+    # SMD-indexed truth over the detector streams only -- fast (tiny sidecars).
+    idx_smd = psdata.build_index(DET_FILES, run_config=rc, source="smd")
+    assert idx_smd.scan_source == "smd"
+    smd_ts = set(idx_smd.timestamps)
+    assert len(smd_ts) == N_SMD_INDEXED, (
+        f"SMD index over the detector streams has {len(smd_ts)} events, expected "
+        f"the oracle {N_SMD_INDEXED} for {EXP}/r{RUN} (the set the superset is "
+        f"taken against must itself be the psana/SMD event set)")
+
+    tail_ts = set()
+    for s in DETECTOR_STREAMS:
+        bd = DET_FILES[s]
+        # Single-chunk run: the whole stream is c000, so a forward walk to EOF
+        # stays in one file (the STR-04 chunk roll is not needed here).
+        assert not os.path.exists(bd.replace("-c000.xtc2", "-c001.xtc2")), \
+            f"stream s{s:03d} is multi-chunk; this bounded tail walk assumes single-chunk r51"
+        filesize = os.path.getsize(bd)
+
+        # The last SMD-indexed dgram ON THIS STREAM: its bigdata offset + size.
+        last = None
+        for ts, entry in zip(reversed(idx_smd.timestamps),
+                             reversed(idx_smd.entries)):
+            if s in entry:
+                cpath, off, size = entry[s]
+                last = (ts, cpath, off, size)
+                break
+        assert last is not None, f"no SMD entry references detector stream s{s:03d}"
+        last_ts, last_cpath, last_off, last_size = last
+        assert os.path.basename(last_cpath) == os.path.basename(bd)
+        # The seed offset is DEEP in the detector file -- this reaches the TAIL,
+        # never a head prefix (a head-prefix scan would start near offset 0).
+        assert last_off > 0.5 * filesize, (
+            f"s{s:03d}: last SMD offset {last_off} is not deep in the "
+            f"{filesize}-byte file -- a tail scan must start near the END, not "
+            f"the head (this is the head-prefix disease GATE-06 guards against)")
+
+        boundary, tail_l1, reached_eof, ndg = _forward_l1_from_offset(
+            bd, last_off, filesize)
+
+        # (1) OVERLAP byte-exact: the SMD-free header walk reproduces the SMD's
+        # recorded (ts, intDgramSize) at the boundary offset on the DETECTOR
+        # stream -- the SMD is just a cache of this same bigdata cursor.
+        assert boundary is not None and \
+            boundary["service"] == psdata.format.SERVICE_L1ACCEPT, \
+            f"s{s:03d}: no L1Accept dgram at the SMD-recorded offset {last_off}"
+        assert boundary["ts"] == last_ts, (
+            f"s{s:03d}: bigdata dgram ts {boundary['ts']} at the SMD offset "
+            f"!= the SMD-recorded ts {last_ts}")
+        assert boundary["_total"] == last_size, (
+            f"s{s:03d}: bigdata dgram size {boundary['_total']} at the SMD offset "
+            f"!= the SMD-recorded intDgramSize {last_size}")
+
+        # (2) reached the TRUE end of the detector stream -> the whole tail seen.
+        assert reached_eof, (
+            f"s{s:03d}: forward walk from the last SMD event did not reach EOF "
+            f"({ndg} dgrams, cursor short of the {filesize}-byte end) -- the tail "
+            f"was not fully covered")
+
+        # (3) every L1Accept past the boundary is a PHANTOM the SMD never indexed.
+        for ts, off, sz in tail_l1:
+            assert off > last_off, \
+                f"s{s:03d}: tail record at {off} is not strictly past the boundary"
+            assert ts not in smd_ts, (
+                f"s{s:03d}: bigdata tail L1Accept ts={ts} is unexpectedly IN the "
+                f"SMD index -- it must be a phantom shutdown-tail event")
+            tail_ts.add(ts)
+
+    # (4) STRICT SUPERSET: the SMD-free bigdata build sees MORE detector-stream
+    # L1Accepts than the SMD recorded -- the 17982-vs-17872 ragged-tail gap,
+    # reproduced here from a BOUNDED tail walk (no full ~600 GB header scan).
+    superset_ts = smd_ts | tail_ts
+    assert superset_ts > smd_ts, (
+        "the detector bigdata must carry ragged-tail L1Accepts the SMD never "
+        "indexed -- a strict superset, not mere equality")
+    assert len(tail_ts) == N_BIGDATA_TAIL, (
+        f"detector-stream ragged tail has {len(tail_ts)} phantom events, expected "
+        f"the oracle {N_BIGDATA_TAIL} ({N_BIGDATA_SUPERSET} bigdata - "
+        f"{N_SMD_INDEXED} SMD) for {EXP}/r{RUN}")
+    assert len(superset_ts) == N_BIGDATA_SUPERSET, (
+        f"SMD-free detector-stream event set has {len(superset_ts)} events, "
+        f"expected the oracle {N_BIGDATA_SUPERSET}")
+    return len(superset_ts)
 
 
 # --------------------------------------------------------------------------
@@ -438,6 +647,10 @@ if __name__ == "__main__":
     test_bigdata_index_byte_exact_against_smd()
     _n = len(psdata.build_index(FILES, source="smd").timestamps)
     print(f"OK  bigdata index byte-exact vs SMD ({_n} events, small streams)")
+    _sup = test_bigdata_detector_stream_reaches_ragged_tail()
+    print(f"OK  detector-stream bigdata build reaches the ragged tail "
+          f"({_sup} events, strict superset of {N_SMD_INDEXED} SMD; streams "
+          f"{DETECTOR_STREAMS})")
     test_random_read_identical_either_index()
     print("OK  random reads byte-identical from either index")
     test_build_index_source_routing()
