@@ -501,14 +501,14 @@ class RunIndex:
         self.include_shutdown_tail = False  # True iff the raw end-of-run tail
         #   (events lacking the timing/master stream; pulseId=None) is kept;
         #   default False clamps to the canonical (SMD-equivalent) event set.
-        # IDX-04 invalidation fingerprint: {bigdata_chunk_path: (size,
-        #   mtime_ns)} captured at build time for every file the index's offsets
-        #   point into (the union of chunk_files).  Verified up front on load()
-        #   so a persisted index whose xtc files changed under it (re-transfer,
-        #   truncation, a different run reusing the path) is REFUSED before it
-        #   can serve stale offsets, rather than only tripping the read-time ts
-        #   re-check.  Empty for a directly-constructed index (no build scan);
-        #   an empty map disables the check (nothing was measured to compare).
+        # IDX-04 invalidation fingerprint: {path: (size, mtime_ns)} captured at
+        #   build time for every file the index reads from (bigdata chunks +
+        #   env-referenced .smd.xtc2 sidecars; see _fingerprint_paths).  Verified
+        #   up front on load() so a persisted index whose xtc files changed under
+        #   it (re-transfer, truncation, a different run reusing the path) is
+        #   REFUSED before it can serve stale offsets, rather than only tripping
+        #   the read-time ts re-check.  Empty for a directly-constructed index
+        #   (no build scan); an empty map disables the check (nothing to compare).
         self.file_fingerprints = {}
         # private: open bigdata fds, lazily, cached per chunk path
         self._bd_fds = {}
@@ -723,43 +723,80 @@ class RunIndex:
     # read).  These two helpers turn that accident into an up-front check: build
     # records a cheap fingerprint (size + mtime) of every indexed file, and
     # load() verifies it (a stat per file) BEFORE serving any offset.
+    #
+    # SIZE vs MTIME (IDX-03 interaction): size is content-derived and survives a
+    # legitimate relocation (a byte-identical copy has the same size); mtime is a
+    # build-host property that a plain relocation RESETS (``cp`` without ``-p``,
+    # an object-store GET, ``untar`` without ``-p``, a container ``COPY`` all
+    # give the copy a fresh mtime).  So the up-front check compares size+mtime
+    # only for a SAME-LOCATION load (catches an in-place re-transfer, whose mtime
+    # changes); a RELOCATED load (explicit ``dir=``, or data resolved off the
+    # original build root) compares SIZE ONLY, so a byte-identical relocated copy
+    # is not falsely invalidated -- honoring IDX-03's "shareable across
+    # mount/host/container" contract (``_index_resolve_paths`` never raises on
+    # relocation, and neither may this).  A same-size content change on a
+    # relocated load falls through to the read-time ts re-check, as before.
     @staticmethod
     def _stat_fingerprint(path):
         """The cheap (no re-read) identity of one file: ``(size, mtime_ns)``.
-        A truncation/regrow changes ``size``; a re-transfer/replace changes
-        ``mtime_ns`` (and usually ``size``).  Nanosecond mtime is stored as an
-        int so the comparison is exact (no float rounding)."""
+        A truncation/regrow changes ``size``; a same-location re-transfer/replace
+        changes ``mtime_ns`` (and usually ``size``).  Nanosecond mtime is stored
+        as an int so the comparison is exact (no float rounding)."""
         st = os.stat(path)
         return (int(st.st_size), int(st.st_mtime_ns))
 
-    def _record_file_fingerprints(self):
-        """Capture ``{chunk_path: (size, mtime_ns)}`` for every bigdata file the
-        index's offsets point into (the union of ``chunk_files``), so a later
-        :meth:`load` can detect the files changing underneath the index.  A
-        chunk that cannot be stat'd at build time is simply left unfingerprinted
-        (no baseline to compare against later); the read-time re-check still
-        guards it."""
-        fps = {}
+    def _fingerprint_paths(self):
+        """Every distinct file the index's offsets read from -- the bigdata chunk
+        files (``chunk_files``, which ``read_event`` ``pread``s) PLUS the
+        env-referenced files (``env_records`` paths: the ``.smd.xtc2`` sidecars
+        for an SMD-scanned index, or the bigdata chunks for a bigdata-scanned
+        one, that the env-store ``pread``s at lookup).  The sidecars are xtc
+        files too, so fingerprinting them means a changed sidecar is caught up
+        front, not only by the read-time backstop."""
+        seen = []
         for chunks in self.chunk_files.values():
             for p in chunks:
-                if p is None or p in fps:
-                    continue
-                try:
-                    fps[p] = self._stat_fingerprint(p)
-                except OSError:
-                    pass
+                if p is not None and p not in seen:
+                    seen.append(p)
+        for streams in self.env_records.values():
+            for recs in streams.values():
+                for rec in recs:
+                    p = rec[1]   # rec == (ts, path, offset, size)
+                    if p is not None and p not in seen:
+                        seen.append(p)
+        return seen
+
+    def _record_file_fingerprints(self):
+        """Capture ``{path: (size, mtime_ns)}`` for every file the index reads
+        from (see :meth:`_fingerprint_paths`), so a later :meth:`load` can detect
+        the files changing underneath the index.  A file that cannot be stat'd at
+        build time is simply left unfingerprinted (no baseline to compare against
+        later); the read-time re-check still guards it."""
+        fps = {}
+        for p in self._fingerprint_paths():
+            try:
+                fps[p] = self._stat_fingerprint(p)
+            except OSError:
+                pass
         self.file_fingerprints = fps
 
-    def _verify_file_fingerprints(self, strict=True):
-        """Proactively invalidate the index if any fingerprinted file's
-        ``(size, mtime_ns)`` no longer matches what was recorded at build time.
+    def _verify_file_fingerprints(self, strict=True, relocated=False):
+        """Proactively invalidate the index if any fingerprinted file no longer
+        matches the fingerprint recorded at build time.
 
-        Raises a clear ``ValueError`` naming every changed file (with its old
-        and current size/mtime) BEFORE any offset is served, so a stale index is
+        Raises a clear ``ValueError`` naming every changed file (with its old and
+        current size/mtime) BEFORE any offset is served, so a stale index is
         refused up front instead of tripping the read-time ts re-check later (or,
         worse, only on the subset of events a caller happens to read).
 
-        Cheap: one ``os.stat`` per distinct chunk file, never a re-read, so an
+        ``relocated`` selects WHICH fields must match (see the class note above):
+        a SAME-LOCATION load (``relocated=False``) requires size AND mtime, so an
+        in-place re-transfer (whose mtime changes) is caught; a RELOCATED load
+        (``relocated=True`` -- explicit ``dir=`` or data resolved off the build
+        root) requires SIZE ONLY, because a legitimate byte-identical copy resets
+        mtime, and IDX-03 must not turn a relocation into a false invalidation.
+
+        Cheap: one ``os.stat`` per distinct file, never a re-read, so an
         UNCHANGED run costs a handful of stats and NEVER fires (byte-exact reads
         are unaffected).  A file that is absent at verify time is skipped, not
         flagged: a portable index (IDX-03) may resolve to the original paths when
@@ -775,17 +812,27 @@ class RunIndex:
                 current = self._stat_fingerprint(path)
             except OSError:
                 continue   # absent/offline -> let read time handle it (IDX-03)
-            if tuple(current) != tuple(recorded):
-                mismatches.append((path, tuple(recorded), current))
+            recorded = tuple(recorded)
+            if relocated:
+                changed = current[0] != recorded[0]        # size only
+            else:
+                changed = current != recorded              # size + mtime
+            if changed:
+                mismatches.append((path, recorded, current))
         if not mismatches:
             return
+        checked = "size" if relocated else "size/mtime"
         lines = []
         for path, (osz, omt), (csz, cmt) in mismatches:
-            lines.append(
-                "  %s\n      built: size=%d mtime_ns=%d\n      now:   "
-                "size=%d mtime_ns=%d" % (path, osz, omt, csz, cmt))
+            if relocated:
+                lines.append("  %s\n      built: size=%d\n      now:   size=%d"
+                             % (path, osz, csz))
+            else:
+                lines.append(
+                    "  %s\n      built: size=%d mtime_ns=%d\n      now:   "
+                    "size=%d mtime_ns=%d" % (path, osz, omt, csz, cmt))
         raise ValueError(
-            "psdata index invalidated: %d indexed file(s) changed since the "
+            "psdata index invalidated: %d indexed file(s) changed (%s) since the "
             "index was built -- the recorded byte offsets no longer correspond "
             "to these files (a re-transfer, truncation, or a different run "
             "reusing the path).  Refusing to serve stale offsets.\n%s\n"
@@ -793,7 +840,7 @@ class RunIndex:
             "(...)), or -- if you KNOW the change is benign (e.g. a metadata-"
             "only touch) -- reload with RunIndex.load(..., verify_files=False) "
             "to bypass this check."
-            % (len(mismatches), "\n".join(lines)))
+            % (len(mismatches), checked, "\n".join(lines)))
 
     # -- lookup ------------------------------------------------------------
     @property
@@ -1254,20 +1301,25 @@ class RunIndex:
         files reopen lazily on the first :meth:`read_event_at`.
 
         ``verify_files`` (default ``True``, IDX-04) checks up front that every
-        indexed bigdata file still matches the ``(size, mtime)`` fingerprint
-        recorded when the index was built (one ``os.stat`` per chunk file, never
-        a re-read).  If a file changed under the index -- a re-transfer,
-        truncation, or a different run reusing the path -- the recorded byte
-        offsets no longer correspond, so ``load`` raises a clear ``ValueError``
-        naming the changed file(s) BEFORE any offset is served, instead of the
-        change only tripping the per-event read-time re-check later.  An
-        UNCHANGED run never fires (byte-exact reads are unaffected), and an
-        indexed file that is momentarily absent is skipped (a portable index may
-        resolve to the original paths when the data is offline -- that genuine
-        miss keeps surfacing at read time as before).  Pass
-        ``verify_files=False`` to bypass the check when a change is known benign
-        (or for an index built before IDX-04, which carries no fingerprints and
-        so is a no-op either way).
+        indexed file (the bigdata chunks AND the env-referenced ``.smd.xtc2``
+        sidecars) still matches the fingerprint recorded when the index was built
+        (one ``os.stat`` per file, never a re-read).  If a file changed under the
+        index -- a re-transfer, truncation, or a different run reusing the path
+        -- the recorded byte offsets no longer correspond, so ``load`` raises a
+        clear ``ValueError`` naming the changed file(s) BEFORE any offset is
+        served, instead of the change only tripping the per-event read-time
+        re-check later.  A SAME-LOCATION load compares size+mtime; a RELOCATED
+        load (explicit ``dir=``, or data resolved off the original build root)
+        compares SIZE ONLY, because a legitimate byte-identical copy resets mtime
+        (plain ``cp`` / object-store GET / ``untar`` without ``-p`` / container
+        ``COPY``) and IDX-03 relocation must not become a false invalidation --
+        relocation does NOT ride the check "for free".  An UNCHANGED run never
+        fires (byte-exact reads are unaffected), and an indexed file that is
+        momentarily absent is skipped (a portable index may resolve to the
+        original paths when the data is offline -- that genuine miss keeps
+        surfacing at read time as before).  Pass ``verify_files=False`` to bypass
+        the check when a change is known benign (or for an index built before
+        IDX-04, which carries no fingerprints and so is a no-op either way).
 
         ``dir`` (optional) is the directory that holds the run's xtc2 files at
         THIS location -- pass it to relocate a portable index whose data now
@@ -1346,6 +1398,11 @@ class RunIndex:
         except (ValueError, UnicodeDecodeError) as e:
             raise ValueError(
                 "%r: corrupt psdata index payload (%s)" % (path, e))
+        # The stored build root (IDX-03 portability) -- captured BEFORE resolve
+        # rewrites the pool -- lets the IDX-04 check tell a same-location load
+        # from a relocated one (mtime is meaningful only in place).
+        port = doc.get("portability") if isinstance(doc, dict) else None
+        build_root = port.get("root") if isinstance(port, dict) else None
         # Re-absolutize the relocatable paths (IDX-03) against the resolved base
         # BEFORE decoding, so the reconstructed state carries absolute paths and
         # the in-memory index is byte-identical to the original at its home.
@@ -1356,9 +1413,36 @@ class RunIndex:
         idx._restore_state(state)
         # IDX-04: proactively refuse a stale index (files changed under it)
         # BEFORE serving any offset -- layered in FRONT of the read-time ts
-        # re-check, which stays as the last-line backstop.
-        idx._verify_file_fingerprints(strict=verify_files)
+        # re-check, which stays as the last-line backstop.  A RELOCATED load
+        # (explicit dir=, or data now resolved off the original build root)
+        # checks size only, so a byte-identical copy with a reset mtime is not
+        # falsely invalidated (IDX-03 contract); a same-location load checks
+        # size+mtime.
+        relocated = idx._resolved_off_build_root(dir, build_root)
+        idx._verify_file_fingerprints(strict=verify_files, relocated=relocated)
         return idx
+
+    def _resolved_off_build_root(self, dir, build_root):
+        """True iff this index was loaded RELOCATED rather than at its build
+        location: an explicit ``dir=`` override was given, or -- with no
+        override -- the resolved data no longer lives under the stored build
+        root ``build_root`` (e.g. it was found beside the index instead).  A v1
+        index (no portability record -> ``build_root is None``) is treated as
+        same-location: it stores absolute paths and cannot be relocated by the
+        portability machinery."""
+        if dir is not None:
+            return True
+        if not build_root:
+            return False
+        nroot = os.path.normpath(build_root)
+        for p in self.file_fingerprints:
+            try:
+                under = os.path.commonpath([nroot, p]) == nroot
+            except ValueError:
+                under = False    # different drive/anchor -> definitely relocated
+            if not under:
+                return True
+        return False
 
 
 # ==========================================================================

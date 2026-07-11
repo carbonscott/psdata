@@ -40,6 +40,15 @@ What it proves:
      preserved).
   3. ``verify_files=False`` BYPASSES the check, loading the (known-benign) stale
      index without raising.
+  4. A RELOCATED byte-identical copy whose mtime was RESET (``load(dir=B)`` where
+     B is a plain copy -- ``cp`` / object-store GET / ``untar`` / container
+     ``COPY`` all reset mtime) loads CLEAN: the relocated check is size-only, so
+     mtime -- a build-host property that legitimate relocation does not preserve
+     -- does not falsely invalidate, honoring IDX-03's shareable contract.
+     (Regression guard for F1; pre-F1 the full size+mtime check raised here.)
+  5. A relocated load whose SIZE changed (a truncated copy) STILL invalidates --
+     size is content-derived, so relocation does not disable content-change
+     detection.
 
 Run (numpy only; no psana needed):
     python3 tests/test_idx04_invalidation.py
@@ -231,6 +240,76 @@ def test_bypass_loads_stale_index():
     print("[bypass] verify_files=False loads a known-benign stale index")
 
 
+# ==========================================================================
+# 4. A relocated byte-identical copy with a RESET mtime loads clean (F1).
+# ==========================================================================
+def test_relocated_reset_mtime_loads_clean():
+    """Build the index with its data under root A (fingerprints capture A's
+    mtimes), then load it RELOCATED against a byte-identical copy under root B
+    whose mtime was reset (as plain cp / object-store GET / untar / container
+    COPY all do).  ``load(dir=B)`` must NOT raise -- the relocated check is
+    size-only, and the sizes are identical -- and every path must resolve under
+    B.  (Pre-F1 the always-on size+mtime check falsely invalidated here.)"""
+    with tempfile.TemporaryDirectory() as td:
+        root_a = os.path.join(td, "hostA", "xtc")
+        root_b = os.path.join(td, "hostB", "xtc")
+        _materialize(root_a)
+        idx = _build_synthetic_index(root_a)            # fingerprints A's mtimes
+        idx_path = os.path.join(td, "run0042.pidx")     # index off to the side
+        idx.save(idx_path)
+
+        # Root B: a byte-identical copy (same content -> same size) whose mtime
+        # is deliberately DIFFERENT from A's, simulating a metadata-resetting
+        # relocation.
+        _materialize(root_b)
+        for rel in _LAYOUT:
+            p = os.path.join(root_b, rel)
+            st = os.stat(p)
+            os.utime(p, ns=(st.st_atime_ns,
+                            st.st_mtime_ns + 9_000_000_000))   # +9s, distinct
+
+        back = IX.RunIndex.load(idx_path, dir=root_b)   # default strict
+        assert back.n_events == 3, \
+            "a relocated byte-identical copy must load with all events intact"
+        for s, p in back.bd_files.items():
+            assert p.startswith(os.path.abspath(root_b) + os.sep), \
+                "relocated path %r did not resolve under dir=%r" % (p, root_b)
+            assert root_a not in p, \
+                "relocated path %r still points at the original build root" % (p,)
+    print("[relocated] a byte-identical copy with a reset mtime loads clean "
+          "(size-only relocated check -- no false invalidation)")
+
+
+# ==========================================================================
+# 5. A relocated load whose SIZE changed STILL invalidates.
+# ==========================================================================
+def test_relocated_size_change_still_invalidates():
+    """Relocation checks size only -- but size IS content-derived, so a
+    truncated copy under ``dir=B`` must still be refused.  Proves the size-only
+    relaxation does not disable content-change detection on a relocated load."""
+    with tempfile.TemporaryDirectory() as td:
+        root_a = os.path.join(td, "hostA", "xtc")
+        root_b = os.path.join(td, "hostB", "xtc")
+        _materialize(root_a)
+        idx = _build_synthetic_index(root_a)
+        idx_path = os.path.join(td, "run0042.pidx")
+        idx.save(idx_path)
+
+        _materialize(root_b)
+        victim = os.path.join(root_b, _LAYOUT[1])       # truncate the copy
+        with open(victim, "r+b") as fh:
+            fh.truncate(_FILE_BYTES // 2)
+
+        msg = _load_raised_invalidation(idx_path, dir=root_b)
+        assert msg is not None, (
+            "a relocated load whose file SIZE changed must still invalidate -- "
+            "size is content-derived, so relocation does not excuse it")
+        assert os.path.basename(victim) in msg, \
+            "the invalidation error must name the changed relocated file; got:\n%s" % msg
+    print("[relocated-size] a truncated relocated copy still invalidates "
+          "(size survives relocation)")
+
+
 def main():
     test_changed_file_invalidates_up_front()
     print("[ok] changed file invalidates load up front")
@@ -238,6 +317,10 @@ def main():
     print("[ok] unchanged run loads clean (no false invalidation)")
     test_bypass_loads_stale_index()
     print("[ok] verify_files=False bypass works")
+    test_relocated_reset_mtime_loads_clean()
+    print("[ok] relocated byte-identical copy with reset mtime loads clean (F1)")
+    test_relocated_size_change_still_invalidates()
+    print("[ok] relocated load with a size change still invalidates")
     print("\nALL IDX-04 TESTS PASSED")
 
 
