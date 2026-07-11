@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""HYG-03 regression: the suite runner must not score a SKIP as a PASS.
+
+The bug
+-------
+``run_tests.sh`` used to tally pass/fail purely from each test file's exit code.
+Individual checks inside a file, however, "skip" by printing a message and
+returning -- the file still exits 0.  So a skipped check scored as a **PASS**,
+and no skip count appeared anywhere: a recorded "12 passed" run concealed three
+skips, two of them the psana oracles on the very code path where the reader's
+worst bug (silent data loss on 3.3% of a run) was later found.
+
+The contract this test pins
+---------------------------
+1. A test that emits an **unlisted** skip record (``##SKIP## <name> :: <reason>``)
+   makes the runner **exit nonzero**, even though the test file itself exited 0.
+   *This is the discriminator*: on the parent commit the runner exits 0 here,
+   because it only ever looked at the exit code.
+2. The final summary carries an **explicit skip count** ("N passed, M failed,
+   S skipped"), and names each skip with its reason.
+3. A skip whose name IS in ``tests/skips_allowed.txt`` (with a justification)
+   does **not** fail the suite -- justified skips stay possible, they just have
+   to be declared.
+4. A genuinely failing test file still fails the suite (no regression in the
+   original behaviour), and a clean run still exits 0.
+5. Every ``tests/test_*.py`` on disk is registered in ``run_tests.sh``'s default
+   TESTS list -- an unregistered test file is another way for a check to not run.
+
+This test is SELF-CONTAINED: no psana, no psdata, no SLAC data.  It synthesizes
+fake test scripts in a temp dir and drives the real ``run_tests.sh`` over them,
+so it can be run from any cwd, on any machine::
+
+    python3 tests/test_runner_hygiene_hyg03.py
+"""
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(_HERE)
+RUN_TESTS = os.path.join(_REPO, "run_tests.sh")
+SKIPS_ALLOWED = os.path.join(_HERE, "skips_allowed.txt")
+
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from _skips import SKIP_MARKER   # noqa: E402  (the protocol under test)
+
+UNLISTED = "hyg03_selftest_unlisted_skip"   # deliberately NOT in the allowlist
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+def _allowed_names():
+    """The skip names declared in tests/skips_allowed.txt ('name :: why')."""
+    names = []
+    with open(SKIPS_ALLOWED) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "::" not in line:
+                continue
+            names.append(line.split("::", 1)[0].strip())
+    return names
+
+
+def _write(path, body):
+    with open(path, "w") as f:
+        f.write(body)
+    os.chmod(path, 0o755)
+    return path
+
+
+def _fake_skipping_test(tmp, fname, skip_name):
+    """A fake test script that skips one check and exits 0 -- exactly the shape
+    the real tests have (print a marker, return, exit 0)."""
+    return _write(os.path.join(tmp, fname), (
+        "#!/usr/bin/env python3\n"
+        "print('[ok] a check that really ran')\n"
+        "print('%s %s :: synthetic skip emitted by the HYG-03 self-test')\n"
+        "print('ALL CHECKS PASSED')\n"
+        "raise SystemExit(0)\n" % (SKIP_MARKER, skip_name)))
+
+
+def _fake_clean_test(tmp, fname="fake_clean.py"):
+    return _write(os.path.join(tmp, fname), (
+        "#!/usr/bin/env python3\n"
+        "print('[ok] nothing skipped here')\n"
+        "raise SystemExit(0)\n"))
+
+
+def _fake_failing_test(tmp, fname="fake_fail.py"):
+    return _write(os.path.join(tmp, fname), (
+        "#!/usr/bin/env python3\n"
+        "print('[FAIL] synthetic failure')\n"
+        "raise SystemExit(3)\n"))
+
+
+def _run_suite(*test_paths):
+    """Invoke the real run_tests.sh over explicit test files (its documented
+    ``$@`` form).  Returns (returncode, combined_output).  Run from / so a cwd
+    dependency in the runner would show up."""
+    proc = subprocess.run(
+        ["bash", RUN_TESTS] + list(test_paths),
+        cwd="/", capture_output=True, text=True,
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def _summary_counts(out):
+    """Parse the 'N passed, M failed, S skipped' tally.  Returns (n, m, s)."""
+    m = re.search(r"^(\d+) passed, (\d+) failed, (\d+) skipped\s*$",
+                  out, re.MULTILINE)
+    assert m, ("no explicit 'N passed, M failed, S skipped' summary in the "
+               "runner output -- a suite with no skip count cannot tell a skip "
+               "from a pass (HYG-03).  Output was:\n" + out)
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+# --------------------------------------------------------------------------
+# 1. THE DISCRIMINATOR: an unlisted skip fails the suite
+# --------------------------------------------------------------------------
+def test_unlisted_skip_fails_the_suite():
+    """A test file that skips a check and exits 0 must NOT be scored as a pass.
+
+    On the parent commit the runner returns 0 here (it only read the exit code);
+    on the fixed runner it returns nonzero and says which skip was unjustified.
+    """
+    assert UNLISTED not in _allowed_names(), \
+        "the self-test's sentinel skip name must not be allowlisted"
+    with tempfile.TemporaryDirectory() as tmp:
+        skipper = _fake_skipping_test(tmp, "fake_skip.py", UNLISTED)
+        clean = _fake_clean_test(tmp)
+        rc, out = _run_suite(skipper, clean)
+
+    assert rc != 0, (
+        "run_tests.sh exited 0 on an UNJUSTIFIED SKIP -- a skip is being scored "
+        "as a pass (HYG-03).  Output was:\n" + out)
+    n_pass, n_fail, n_skip = _summary_counts(out)
+    assert n_skip == 1, f"expected 1 skip counted, summary said {n_skip}\n{out}"
+    assert n_fail == 0, (
+        f"the skipping file exits 0, so it is not a FAILED file; summary said "
+        f"{n_fail} failed\n{out}")
+    assert UNLISTED in out, "the runner must name the offending skip\n" + out
+    assert "UNJUSTIFIED SKIP" in out, (
+        "the runner must say the skip was unjustified\n" + out)
+    # the skip's reason is surfaced, not just its name
+    assert "synthetic skip emitted by the HYG-03 self-test" in out, \
+        "the runner must print each skip's reason\n" + out
+    print(f"[ok] unlisted skip -> runner exit {rc} (nonzero), "
+          f"summary '{n_pass} passed, {n_fail} failed, {n_skip} skipped', "
+          f"UNJUSTIFIED SKIP named")
+
+
+# --------------------------------------------------------------------------
+# 2. an ALLOWLISTED skip does not fail the suite (justified skips stay possible)
+# --------------------------------------------------------------------------
+def test_allowlisted_skip_passes_but_is_counted():
+    """A skip declared in tests/skips_allowed.txt exits 0 -- but is still COUNTED
+    and printed with its justification (visible, not silent)."""
+    allowed = _allowed_names()
+    assert allowed, "tests/skips_allowed.txt declares no skips at all"
+    name = allowed[0]          # whatever the allowlist actually declares
+    with tempfile.TemporaryDirectory() as tmp:
+        skipper = _fake_skipping_test(tmp, "fake_skip_ok.py", name)
+        clean = _fake_clean_test(tmp)
+        rc, out = _run_suite(skipper, clean)
+
+    assert rc == 0, (
+        f"an allowlisted skip ({name}) must not fail the suite; runner exited "
+        f"{rc}\n{out}")
+    n_pass, n_fail, n_skip = _summary_counts(out)
+    assert (n_pass, n_fail, n_skip) == (2, 0, 1), \
+        f"expected 2 passed, 0 failed, 1 skipped; got {(n_pass, n_fail, n_skip)}\n{out}"
+    assert "UNJUSTIFIED SKIP" not in out, \
+        "an allowlisted skip must not be reported as unjustified\n" + out
+    assert name in out and "justification:" in out, \
+        "the runner must print the skip with its justification\n" + out
+    print(f"[ok] allowlisted skip {name!r} -> runner exit 0, still counted "
+          f"({n_skip} skipped) and printed with its justification")
+
+
+# --------------------------------------------------------------------------
+# 3. no regression: a clean run passes, a failing file still fails
+# --------------------------------------------------------------------------
+def test_clean_run_and_failure_still_work():
+    with tempfile.TemporaryDirectory() as tmp:
+        clean = _fake_clean_test(tmp)
+        rc, out = _run_suite(clean)
+        assert rc == 0, f"a clean run must exit 0; got {rc}\n{out}"
+        assert _summary_counts(out) == (1, 0, 0), out
+
+        failing = _fake_failing_test(tmp)
+        rc, out = _run_suite(clean, failing)
+        assert rc != 0, f"a failing test file must fail the suite; got {rc}\n{out}"
+        n_pass, n_fail, n_skip = _summary_counts(out)
+        assert (n_pass, n_fail, n_skip) == (1, 1, 0), \
+            f"expected 1 passed, 1 failed, 0 skipped; got {(n_pass, n_fail, n_skip)}\n{out}"
+    print("[ok] clean run exits 0; a failing test file still fails the suite "
+          "(exit code tally preserved)")
+
+
+# --------------------------------------------------------------------------
+# 4. a skipping test's OWN output still reaches the terminal (tee, not swallow)
+# --------------------------------------------------------------------------
+def test_runner_still_streams_test_output():
+    with tempfile.TemporaryDirectory() as tmp:
+        skipper = _fake_skipping_test(tmp, "fake_skip.py", UNLISTED)
+        rc, out = _run_suite(skipper)
+    assert "[ok] a check that really ran" in out, \
+        "the runner must still stream each test's own output\n" + out
+    assert f"### running {skipper}" in out, \
+        "the runner must still announce each test file\n" + out
+    print("[ok] test output is still streamed (tee), not swallowed by the capture")
+
+
+# --------------------------------------------------------------------------
+# 5. every tests/test_*.py on disk is registered in the default TESTS list
+# --------------------------------------------------------------------------
+def test_default_suite_registers_every_test_file():
+    """An unregistered test file never runs -- the same disease as a skip that
+    scores as a pass, one level up."""
+    with open(RUN_TESTS) as f:
+        runner = f.read()
+    on_disk = sorted(n for n in os.listdir(_HERE)
+                     if n.startswith("test_") and n.endswith(".py"))
+    missing = [n for n in on_disk if n not in runner]
+    assert not missing, (
+        "these test files exist on disk but are NOT in run_tests.sh's default "
+        "TESTS list, so the suite never runs them: %s" % missing)
+    print(f"[ok] all {len(on_disk)} tests/test_*.py files are registered in "
+          f"run_tests.sh's default suite")
+
+
+def main():
+    print("=" * 72)
+    print("HYG-03 regression: a skip is not a pass")
+    print("=" * 72)
+    test_unlisted_skip_fails_the_suite()
+    test_allowlisted_skip_passes_but_is_counted()
+    test_clean_run_and_failure_still_work()
+    test_runner_still_streams_test_output()
+    test_default_suite_registers_every_test_file()
+    print("\nALL HYG-03 RUNNER-HYGIENE CHECKS PASSED")
+
+
+if __name__ == "__main__":
+    main()

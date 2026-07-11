@@ -41,6 +41,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(os.path.dirname(_HERE), "src")  # .../<repo>/src (holds psdata/)
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
+if _HERE not in sys.path:                           # for _skips (sibling module)
+    sys.path.insert(0, _HERE)
+
+from _skips import skip   # noqa: E402  (machine-readable skip records, HYG-03)
 
 # Reference dataset -- lives in the TEST, never in the library.  Single-chunk
 # primary run (mfx100848724 r51): jungfrau raw (32,512,1024) uint16.
@@ -53,7 +57,16 @@ JUNGFRAU = "jungfrau"
 # from more than one chunk file in a single coalesced batch.
 MC_EXP = "mfx101343025"
 MC_RUN = 35
-MC_DIR = "/sdf/data/lcls/ds/MFX/mfx101343025/xtc"
+# The instrument dir has been seen spelled both ways; test_robust_us004 reads
+# this same run from the lowercase path.  Take whichever exists (first by
+# default) so a path-case mismatch cannot silently turn this check into a skip
+# -- an un-run check is not a passing check (HYG-03).
+MC_DIR_CANDIDATES = (
+    "/sdf/data/lcls/ds/mfx/mfx101343025/xtc",
+    "/sdf/data/lcls/ds/MFX/mfx101343025/xtc",
+)
+MC_DIR = next((d for d in MC_DIR_CANDIDATES if os.path.isdir(d)),
+              MC_DIR_CANDIDATES[0])
 
 # A deliberately non-contiguous / shuffled / repeated set of positions, plus 0
 # and a far-out position, to prove order independence and de-duplication.
@@ -360,8 +373,12 @@ def test_multichunk_batch():
     path."""
     paths = sorted(glob.glob(f"{MC_DIR}/{MC_EXP}-r{MC_RUN:04d}-s*-c000.xtc2"))
     if not paths:
-        print(f"[skip] multi-chunk run not found under {MC_DIR}")
-        return
+        return skip(
+            "multichunk_batch_run_missing",
+            f"the multi-chunk run {MC_EXP}/r{MC_RUN} was not found under any of "
+            f"{list(MC_DIR_CANDIDATES)}; a coalesced batch spanning the chunk "
+            f"roll (c000 -> c001) is therefore unverified -- the single-chunk "
+            f"batch checks above cannot exercise a roll")
     import psdata
     from psdata import index as psindex
 

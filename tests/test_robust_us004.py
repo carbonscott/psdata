@@ -24,10 +24,17 @@ What this verifies (US-004 acceptance criteria):
      (id = low 12 bits, userbits = value>>12) and surfaced via
      ``Event.damage`` / ``decode_damage``; the raw array is still returned.
 
-The multi-chunk ground truth is produced by ``gt_capture.py`` (psana) and saved
-as ``gt_mc35_*.npy`` + ``gt_mc35_manifest.json`` in the run directory; this test
-loads those and compares.  If they are absent the multi-chunk psana comparison
-is SKIPPED-with-warning (the SMD-only structural roll checks still run).
+The multi-chunk ground truth is produced by ``tools/gt_capture.py`` (psana) and
+saved as ``gt_mc35_*.npy`` + ``gt_mc35_manifest.json``; this test loads those and
+compares.  Capture it once, from the repo root, in the psana env::
+
+    source /sdf/group/lcls/ds/ana/sw/conda2/manage/bin/psconda.sh
+    PYTHONPATH=src python3 tools/gt_capture.py --out-dir .
+
+If the ground truth is absent the multi-chunk psana comparison emits a SKIP
+record -- which is NOT in ``tests/skips_allowed.txt`` and therefore FAILS the
+suite (HYG-03: a skipped oracle is not a passing oracle).  The SMD-only
+structural roll checks still run and report independently.
 """
 
 import json
@@ -37,10 +44,14 @@ import sys
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # for _skips
+
 import psdata
 from psdata import format as psf
 from psdata import index as psindex
 from psdata import stream as psstream
+
+from _skips import skip   # machine-readable skip records (HYG-03)
 
 # ---- multi-chunk reference run (located & verified for US-004) -------------
 MC_DIR = "/sdf/data/lcls/ds/mfx/mfx101343025/xtc"
@@ -204,10 +215,14 @@ def test_chunk_roll_vs_psana():
     """Byte-identical to psana across the chunk boundary: load the psana ground
     truth captured around the boundary and compare random-access raw arrays."""
     if not os.path.exists(GT_MANIFEST):
-        print(f"[skip] multi-chunk psana ground truth not found at "
-              f"{GT_MANIFEST}; run gt_capture.py first (boundary capture). "
-              f"Structural roll checks still verified above.")
-        return
+        return skip(
+            "multichunk_psana_oracle",
+            f"multi-chunk psana ground truth not found at {GT_MANIFEST}; "
+            f"the byte-exactness of reads ACROSS the chunk boundary is "
+            f"therefore unverified. Capture it with: "
+            f"PYTHONPATH=src python3 tools/gt_capture.py --out-dir . "
+            f"(needs psana; run from the dir this test reads the manifest "
+            f"from, or point PSDATA_GT_MANIFEST at it).")
     with open(GT_MANIFEST) as f:
         man = json.load(f)
     gt_dir = os.path.dirname(os.path.abspath(GT_MANIFEST))
