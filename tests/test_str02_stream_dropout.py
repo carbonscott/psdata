@@ -34,8 +34,14 @@ assembled on the :class:`~psdata.stream.Event` (``Event.dropped_streams``), and
   * ``"absent"``  -- its streams are all still live; it merely did not contribute
     a complete frame this event (legitimate).
 
-The returned frame VALUES are unchanged: a healthy run drops no stream, so
-``dropped_streams`` is always empty and no detector ever reports ``"dropped"``.
+The returned frame VALUES are unchanged: ``dropped_streams`` is a pure
+side-channel, so ``stack`` / ``raw`` never change.  On the canonical (gated)
+event set of a healthy run no stream drops, so the signal stays empty and no
+detector reports ``"dropped"``.  (The test is structural, so on the ungated path
+a benign DAQ-shutdown tail -- some streams writing extra trailing L1Accepts past
+where others stopped -- would flag the earlier-stopping stream on those tail
+events; the gated ``Run.events()`` default filters them out.  This synthetic
+control below is a clean run, where the signal is genuinely silent.)
 
 The discriminator (fail on parent, pass on fix)
 -----------------------------------------------

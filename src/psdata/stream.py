@@ -38,9 +38,23 @@ surfacing as an unnamed hole.  :func:`events` therefore records the streams that
 had stopped by the time each event was assembled on the :class:`Event`
 (``Event.dropped_streams``); :meth:`Event.detector_status` reports ``"dropped"``
 vs ``"absent"`` so a consumer can tell the fault from a legitimate absence
-instead of seeing an indistinguishable ``None``.  The frame VALUES are unchanged
--- a healthy run drops no stream, so ``dropped_streams`` is always empty and the
-new signal never fires.
+instead of seeing an indistinguishable ``None``.  The frame VALUES are never
+changed -- ``dropped_streams`` is a pure side-channel added to the Event, so
+``stack`` / ``raw`` / ``as_dict`` return exactly what they did before, on any run.
+
+The drop-out test is purely *structural* (a stream that WAS yielding has hit EOF
+while others continue), so it cannot by itself distinguish a genuine mid-run
+fault from a stream that simply stopped at the canonical end of the run while
+other streams wrote a benign DAQ-shutdown tail (a ragged shutdown leaves some
+streams with extra trailing L1Accepts past where others stopped --
+mfx100848724/r51).  On the **canonical event set this never surfaces**: those
+tail events are past every SMD-indexed timestamp, so the gated default
+``Run.events()`` filters them out and ``dropped_streams`` is empty for a healthy
+run.  It appears only on the explicitly opted-into **ungated** path
+(``Run.events(gate=False)`` or the raw :func:`events` generator), where -- by the
+structural definition of a drop-out -- an earlier-stopping stream is reported
+``"dropped"`` on that shutdown tail (the same trailing events FAIL-01/STR-01
+already treat as over-counted on that path).
 
 Like :mod:`psdata.format`, this module imports **no** psana / mpi4py / h5py --
 only the standard library and numpy.
@@ -366,11 +380,13 @@ class Event:
         self._pulseid_cache = None
         # STR-02: stream indices that were producing dgrams earlier in the run
         # but had stopped (hit EOF) by the time this event was assembled from
-        # the streams still live.  Empty for a healthy run and for a
-        # random-access read (which observes one event in isolation and cannot
-        # witness a run-scale drop-out).  A detector carried on such a stream is
-        # absent for a *data-quality* reason (a DAQ/transport dropout), distinct
-        # from a detector legitimately not present this event -- see
+        # the streams still live.  Empty on the canonical (gated) event set of a
+        # healthy run and for a random-access read (which observes one event in
+        # isolation and cannot witness a run-scale drop-out); the one benign
+        # exception is a ragged DAQ-shutdown tail on the ungated path -- see the
+        # module docstring.  A detector carried on such a stream is absent for a
+        # *data-quality* reason (a DAQ/transport dropout), distinct from a
+        # detector legitimately not present this event -- see
         # :meth:`detector_status`.
         self._dropped_streams = frozenset(dropped_streams)
 
@@ -412,10 +428,14 @@ class Event:
         """The stream indices that had **dropped out** by the time this event
         was assembled: streams that were producing dgrams earlier in the run but
         had hit EOF while other streams carried the run on (a DAQ/transport
-        dropout).  A ``frozenset`` -- empty for a healthy run (and for any
-        random-access read).  Detectors carried on these streams are absent this
-        event for a data-quality reason, not because they were legitimately not
-        present; :meth:`detector_status` classifies which is which."""
+        dropout).  A ``frozenset`` -- empty on the canonical (gated) event set of
+        a healthy run and for any random-access read.  (The test is structural,
+        so on the explicitly ungated path a benign DAQ-shutdown tail can present
+        an earlier-stopping stream as dropped on those trailing events; the gated
+        ``Run.events()`` default filters them out -- see the module docstring.)
+        Detectors carried on these streams are absent this event for a
+        data-quality reason, not because they were legitimately not present;
+        :meth:`detector_status` classifies which is which."""
         return self._dropped_streams
 
     # -- detector access ---------------------------------------------------
@@ -668,9 +688,15 @@ def events(stream_files, run_config=None):
     # STR-02 drop-out tracking.  ``ever_live`` = streams that have produced at
     # least one head; ``dropped`` = streams that were live but have since hit EOF
     # while the run keeps yielding events from other streams.  ``dropped`` grows
-    # monotonically and is empty for a healthy run (every stream runs to the
-    # run's end and all heads go None together on the final iteration, which
-    # yields nothing), so the frame values are byte-unchanged.
+    # monotonically.  On the canonical event set of a clean run every stream
+    # reaches the run's end together, so all heads go None on the same final
+    # iteration (which yields nothing) and ``dropped`` stays empty.  The test is
+    # purely structural, though: on a ragged DAQ-shutdown tail some streams write
+    # extra trailing L1Accepts (mfx100848724/r51), so an earlier-stopping stream
+    # is -- unavoidably -- flagged dropped on those tail events; that only shows
+    # on the ungated path, since the gated ``Run.events()`` default filters those
+    # events out.  Either way the frame VALUES are byte-unchanged: ``dropped``
+    # only feeds the new side-channel, never a returned array.
     ever_live = set()
     dropped = set()
     try:
