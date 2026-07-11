@@ -1427,7 +1427,8 @@ class RunIndex:
 # ==========================================================================
 # SMD scan: read one SMD file's L1Accept records, following the chunk roll
 # ==========================================================================
-def _scan_smd_stream(path, bd_c000_path, read_chunk, env_out=None):
+def _scan_smd_stream(path, bd_c000_path, read_chunk, env_out=None,
+                     tolerate_truncation=False):
     """Scan one SMD file and return ``(records, bytes_read, chunk_paths)``.
 
     If ``env_out`` (a dict) is given, the env (slow-data) transitions found in
@@ -1459,6 +1460,19 @@ def _scan_smd_stream(path, bd_c000_path, read_chunk, env_out=None):
     the bigdata path -- and EOB L1Accepts (``SERVICE_L1ACCEPT_EOB``, service 11,
     which ``stream.py``'s ``_EVENT_SERVICES`` does yield while streaming) are NOT
     indexed; revisit if EOB-event random access is needed.
+
+    Truncation (FAIL-04).  A well-formed stream ends on a dgram boundary: the
+    last dgram finishes exactly at the file end.  A file cut mid-stream (a
+    partial transfer, an aborted DAQ) instead ends with an *incomplete* dgram --
+    a header declaring an extent that runs past EOF, or trailing bytes too few
+    to be even a 24-byte header.  Silently stopping at the last complete dgram
+    would return a short index that drops this and every following event with no
+    word -- while the forward *streaming* path raises on the same bytes, so the
+    two read paths would disagree.  This scan therefore FAILS CLOSED by default:
+    it raises ``RuntimeError`` naming the file, the byte offset of the
+    truncation, and the last complete event index (mirroring the streaming
+    path).  Pass ``tolerate_truncation=True`` to instead index the intact prefix
+    deliberately and stop (the old silent behavior, now explicit and opt-in).
     """
     bd_dir = os.path.dirname(bd_c000_path) if bd_c000_path else None
     cur_chunk_id = 0
@@ -1467,6 +1481,7 @@ def _scan_smd_stream(path, bd_c000_path, read_chunk, env_out=None):
 
     fd = os.open(path, os.O_RDONLY)
     try:
+        filesize = os.fstat(fd).st_size
         # Configure sits at offset 0; read enough to parse it, then grow.
         buf = bytearray(os.pread(fd, max(read_chunk, _f._CONFIG_READ), 0))
         bytes_read = len(buf)
@@ -1483,11 +1498,34 @@ def _scan_smd_stream(path, bd_c000_path, read_chunk, env_out=None):
             for t in tables.values())
 
         records = []
+
+        def _truncated(trunc_off, detail):
+            """Fail-closed truncation error (FAIL-04): a file cut mid-stream
+            must not yield a silently short index -- name the file, the byte
+            offset, and the last complete event, mirroring the streaming path."""
+            return RuntimeError(
+                f"truncated xtc file {path!r}: {detail} at byte offset "
+                f"{trunc_off} (file size {filesize}). {len(records)} complete "
+                f"L1Accept event(s) scanned (last complete event index "
+                f"{len(records) - 1}); the file was cut mid-stream (a partial "
+                f"transfer or an aborted DAQ). Refusing to return a silently "
+                f"short index that drops this and every following event -- the "
+                f"streaming path fails closed here too. Pass "
+                f"tolerate_truncation=True to index the intact prefix and stop.")
+
         off = cfg_end
         while True:
             if off + _f.DGRAM_HDR > len(buf):
                 more = os.pread(fd, read_chunk, len(buf))
                 if not more:
+                    # No more bytes on disk.  off == filesize is a CLEAN end
+                    # (the last dgram finished exactly at the file boundary);
+                    # any leftover bytes are too few for even a dgram header
+                    # -> the file is truncated mid-stream (FAIL-04).
+                    if off < filesize and not tolerate_truncation:
+                        raise _truncated(
+                            off, f"trailing {filesize - off} byte(s) too few "
+                            f"for a {_f.DGRAM_HDR}-byte dgram header")
                     break
                 buf.extend(more)
                 bytes_read += len(more)
@@ -1497,7 +1535,14 @@ def _scan_smd_stream(path, bd_c000_path, read_chunk, env_out=None):
             if off + total > len(buf):
                 more = os.pread(fd, max(read_chunk, total), len(buf))
                 if not more:
-                    break   # truncated final dgram -> stop (clean EOF)
+                    # The dgram header at `off` declares an on-disk size that
+                    # runs past EOF: the file was cut inside this dgram, not a
+                    # clean end (FAIL-04).
+                    if not tolerate_truncation:
+                        raise _truncated(
+                            off, f"dgram header declares size {total} (ending "
+                            f"at {off + total}) past the file end")
+                    break   # tolerate: index the intact prefix, stop here
                 buf.extend(more)
                 bytes_read += len(more)
                 continue
@@ -1625,7 +1670,7 @@ def _enumerate_bd_chunks(bd_c000_path):
             for cid in range(hi + 1)]
 
 
-def _scan_bigdata_stream(bd_c000_path, env_out=None):
+def _scan_bigdata_stream(bd_c000_path, env_out=None, tolerate_truncation=False):
     """Build one stream's L1Accept ``(ts, chunk_path, intOffset, intDgramSize)``
     records by walking the BIGDATA chunk files directly -- no SMD file needed.
 
@@ -1654,10 +1699,35 @@ def _scan_bigdata_stream(bd_c000_path, env_out=None):
     the SMD path -- and EOB L1Accepts (``SERVICE_L1ACCEPT_EOB``, service 11,
     which ``stream.py``'s ``_EVENT_SERVICES`` does yield while streaming) are NOT
     indexed; revisit if EOB-event random access is needed.
+
+    Truncation (FAIL-04).  A well-formed chunk ends on a dgram boundary.  A
+    chunk cut mid-stream (a partial transfer, an aborted DAQ) ends with an
+    *incomplete* dgram -- a header declaring an extent past EOF, or trailing
+    bytes too few for even a 24-byte header.  Rather than silently stopping at
+    the last complete dgram (a short index that drops this and every following
+    event, while the forward streaming path raises on the same bytes), this scan
+    FAILS CLOSED by default: it raises ``RuntimeError`` naming the file, the
+    truncation offset, and the last complete event index.  Pass
+    ``tolerate_truncation=True`` to instead index the intact prefix and stop.
     """
     records = []
     chunk_paths = []
     bytes_read = 0
+
+    def _truncated(chunk, trunc_off, fsize, detail):
+        """Fail-closed truncation error (FAIL-04): see :func:`_scan_smd_stream`;
+        name the file, the byte offset, and the last complete event so the
+        index path agrees with the streaming path instead of losing data."""
+        return RuntimeError(
+            f"truncated xtc file {chunk!r}: {detail} at byte offset "
+            f"{trunc_off} (file size {fsize}). {len(records)} complete "
+            f"L1Accept event(s) scanned (last complete event index "
+            f"{len(records) - 1}); the file was cut mid-stream (a partial "
+            f"transfer or an aborted DAQ). Refusing to return a silently short "
+            f"index that drops this and every following event -- the streaming "
+            f"path fails closed here too. Pass tolerate_truncation=True to "
+            f"index the intact prefix and stop.")
+
     for chunk_path in _enumerate_bd_chunks(bd_c000_path):
         chunk_paths.append(chunk_path)
         fd = os.open(chunk_path, os.O_RDONLY)
@@ -1668,11 +1738,25 @@ def _scan_bigdata_stream(bd_c000_path, env_out=None):
                 hdr = os.pread(fd, _f.DGRAM_HDR, cursor)
                 bytes_read += len(hdr)
                 if len(hdr) < _f.DGRAM_HDR:
-                    break                       # truncated tail -> clean stop
+                    # fstat said these bytes existed but the read came up short:
+                    # the file shrank under us -> a partial header, truncation.
+                    if not tolerate_truncation:
+                        raise _truncated(
+                            chunk_path, cursor, filesize,
+                            f"only {len(hdr)} byte(s) readable where a "
+                            f"{_f.DGRAM_HDR}-byte dgram header was expected")
+                    break
                 h = _f.parse_dgram_header(hdr, 0)
                 total = _f.XTC_HDR + h["extent"]
                 if cursor + total > filesize:
-                    break                       # truncated final dgram
+                    # Header at `cursor` declares an on-disk size running past
+                    # EOF: the file was cut inside this dgram (FAIL-04).
+                    if not tolerate_truncation:
+                        raise _truncated(
+                            chunk_path, cursor, filesize,
+                            f"dgram header declares size {total} (ending at "
+                            f"{cursor + total}) past the file end")
+                    break                       # tolerate: keep intact prefix
                 if h["service"] == _f.SERVICE_L1ACCEPT:
                     records.append((h["ts"], chunk_path, cursor, total))
                 elif env_out is not None and h["service"] in _ENV_SERVICE_STORE:
@@ -1683,6 +1767,16 @@ def _scan_bigdata_stream(bd_c000_path, env_out=None):
                     env_out.setdefault(store, []).append(
                         (h["ts"], chunk_path, cursor, total))
                 cursor += total
+            else:
+                # Loop ended on the while-condition (not a break): fewer than a
+                # header's worth of bytes remain at `cursor`.  cursor == filesize
+                # is a CLEAN end; leftover bytes are a partial header ->
+                # truncation (FAIL-04).
+                if cursor < filesize and not tolerate_truncation:
+                    raise _truncated(
+                        chunk_path, cursor, filesize,
+                        f"trailing {filesize - cursor} byte(s) too few for a "
+                        f"{_f.DGRAM_HDR}-byte dgram header")
         finally:
             os.close(fd)
     return records, bytes_read, chunk_paths
