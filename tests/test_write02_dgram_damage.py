@@ -40,8 +40,10 @@ Self-contained
 stdlib + numpy only -- NO psana, NO SLAC data.  It hand-builds synthetic xtc2
 dgrams (byte-for-byte to the header layout in ``src/psdata/format.py``): a stream
 whose DGRAM-TOP damage word is nonzero (a DroppedContribution bit) while its
-ShapesData-level damage is 0, drives the real ``psdata.stream.events`` k-way
-merge, and checks the assertions below.
+ShapesData-level damage is 0, then drives BOTH read paths the fix threads the
+damage through -- the forward ``psdata.stream.events`` k-way merge AND the
+random-access ``RunIndex.read_event_at`` (single) / ``read_events`` (batch) over
+a hand-built index on the same on-disk file -- and checks the assertions below.
 
 Fail on parent / pass on fix
 ----------------------------
@@ -74,6 +76,7 @@ if _SRC not in sys.path:
 
 import psdata.format as fmt      # noqa: E402
 import psdata.stream as pstream  # noqa: E402
+import psdata.index as pidx      # noqa: E402
 
 # DroppedContribution is value 1 in the xtc2 Damage enum -- the bit the DAQ sets
 # on the top-level dgram Xtc when a detector's contribution is dropped (psana:
@@ -154,17 +157,24 @@ def _healthy_table():
 def build_run(tmpdir, ts_list, healthy_damage, dropped_damage, frame):
     """A synthetic two-stream run.
 
-    HEALTHY_STREAM (0) carries ``detHealthy`` with a real ShapesData frame; its
-    top-level dgram damage is ``healthy_damage``.  DROPPED_STREAM (16) carries
-    ``detDropped`` whose contribution is DROPPED (empty payload -> no ShapesData)
-    with top-level dgram damage ``dropped_damage``.  Returns ``(files, rc)`` for
-    ``psdata.stream.events``.
+    HEALTHY_STREAM (0) carries ``detHealthy`` with a real ShapesData frame;
+    DROPPED_STREAM (16) carries ``detDropped`` whose contribution is DROPPED
+    (empty payload -> no ShapesData).  Each stream's top-level dgram damage is
+    ``healthy_damage`` / ``dropped_damage`` -- either a single int (same for
+    every event) or a per-event list aligned with ``ts_list`` (so a mix of
+    damaged and clean events can share one on-disk file, for the random-access
+    index reads).  Returns ``(files, rc)`` for ``psdata.stream.events`` and for
+    a hand-built :class:`psdata.index.RunIndex` (:func:`_build_index`).
     """
+    def _per_event(d):
+        return list(d) if isinstance(d, (list, tuple)) else [d] * len(ts_list)
+    hd = _per_event(healthy_damage)
+    dd = _per_event(dropped_damage)
     p0 = os.path.join(tmpdir, "synth-r0001-s000.xtc2")
     p16 = os.path.join(tmpdir, "synth-r0001-s016.xtc2")
-    _write(p0, [_make_l1(ts, healthy_damage, _make_shapesdata(0, frame))
-                for ts in ts_list])
-    _write(p16, [_make_l1(ts, dropped_damage, b"") for ts in ts_list])
+    _write(p0, [_make_l1(ts, h, _make_shapesdata(0, frame))
+                for ts, h in zip(ts_list, hd)])
+    _write(p16, [_make_l1(ts, d, b"") for ts, d in zip(ts_list, dd)])
 
     rc = fmt.RunConfig()
     rc.stream_files = {HEALTHY_STREAM: p0, DROPPED_STREAM: p16}
@@ -200,6 +210,40 @@ def _damage_by_stream(evt):
 def _is_detector_damaged(evt, det):
     fn = getattr(evt, "is_detector_damaged", None)
     return None if fn is None else fn(det)
+
+
+def _build_index(files, rc):
+    """A :class:`psdata.index.RunIndex` over the synthetic on-disk streams,
+    populated by hand (no SMD sidecar needed): walk each stream file's dgrams,
+    keying every L1Accept's (path, offset, size) by timestamp into
+    ``entries[k]`` with ``timestamps[k]`` ascending -- exactly the shape the
+    real SMD/bigdata scan produces.  ``read_event_at`` / ``read_events`` then
+    pread these offsets and assemble Events through the SAME
+    ``_assemble_stream_dgram`` the fix threads dgram-top damage through.  Works
+    identically on parent and fix (both build/serve the index the same way);
+    only the damage the assembled Event exposes differs."""
+    ridx = pidx.RunIndex(rc)
+    per_stream = {}
+    for stream, path in rc.stream_files.items():
+        with open(path, "rb") as fh:
+            data = fh.read()
+        recs, off = [], 0
+        while off + fmt.DGRAM_HDR <= len(data):
+            h = fmt.parse_dgram_header(data, off)
+            size = fmt.XTC_HDR + h["extent"]
+            recs.append((h["ts"], off, size))
+            off += size
+        per_stream[stream] = recs
+    all_ts = sorted({ts for recs in per_stream.values() for (ts, _, _) in recs})
+    for ts in all_ts:
+        entry = {}
+        for stream, recs in per_stream.items():
+            for (t, o, sz) in recs:
+                if t == ts:
+                    entry[stream] = (rc.stream_files[stream], o, sz)
+        ridx.timestamps.append(ts)
+        ridx.entries.append(entry)
+    return ridx
 
 
 FRAME = np.arange(6, dtype=np.uint16).reshape(2, 3)   # known, byte-checkable
@@ -344,7 +388,88 @@ def test_clean_run_is_undamaged():
 
 
 # ===========================================================================
-# 4. import purity: the streaming path pulls in no framework.
+# 4. RANDOM ACCESS: read_event_at (single) and read_events (batch) surface the
+#    SAME dgram-top damage the forward path does -- WRITE-02 threads it through
+#    both random-access read paths (RunIndex._assemble_stream_dgram), so the
+#    regression must exercise them, not just pstream.events().
+# ===========================================================================
+def test_random_access_dgram_damage():
+    # One on-disk run with a MIX of clean and damaged events so a stop-short /
+    # cross-event bug is catchable: only k=1 (ts=200) carries dgram-top damage
+    # (on BOTH streams -- so detHealthy's own frame rides a damaged stream yet
+    # must read back byte-exact); k=0 and k=2 are clean.
+    ts_list = [100, 200, 300]
+    hdmg = [0, DROPPED_CONTRIBUTION, 0]       # stream 0 (detHealthy) per event
+    ddmg = [0, DROPPED_CONTRIBUTION, 0]       # stream 16 (detDropped) per event
+    with tempfile.TemporaryDirectory() as td:
+        files, rc = build_run(td, ts_list, healthy_damage=hdmg,
+                              dropped_damage=ddmg, frame=FRAME)
+        ridx = _build_index(files, rc)
+        assert ridx.timestamps == ts_list, ridx.timestamps
+
+        # --- read_event_at (single random access) -------------------------
+        e_dmg = ridx.read_event_at(1)         # the damaged event
+        e_clean = ridx.read_event_at(0)       # a clean event
+
+        # frame VALUES unchanged (parent AND fix): damaged frame == clean FRAME.
+        assert np.array_equal(e_dmg.stack("detHealthy")[0], FRAME)
+        assert np.array_equal(e_dmg.raw("detHealthy")[0], FRAME)
+        assert e_dmg.stack("detDropped") is None          # dropped contribution
+        # legacy ShapesData level stays 0 on the random-access read too.
+        assert e_dmg.damage("detHealthy") == {0: (0, 0)}
+
+        # THE WRITE-02 ASSERTIONS on the random-access read (fail on parent).
+        assert _whole_event_damaged(e_dmg) is True, (
+            "WRITE-02: read_event_at must surface DGRAM-TOP damage; got "
+            f"{_whole_event_damaged(e_dmg)!r} (parent's random-access Event is "
+            "blind -- it reads only ShapesData damage).")
+        assert _damage_by_stream(e_dmg) == {0: (DROPPED_CONTRIBUTION, 0),
+                                            16: (DROPPED_CONTRIBUTION, 0)}, \
+            _damage_by_stream(e_dmg)
+        assert _is_detector_damaged(e_dmg, "detDropped") is True
+        assert _is_detector_damaged(e_dmg, "detHealthy") is True
+
+        # a clean event reads back UNDAMAGED (on the fix; parent -> None).
+        assert np.array_equal(e_clean.stack("detHealthy")[0], FRAME)
+        if _damage_by_stream(e_clean) is not None:        # API present == fix
+            assert _whole_event_damaged(e_clean) is False
+            assert _is_detector_damaged(e_clean, "detDropped") is False
+            assert all(v == (0, 0)
+                       for v in _damage_by_stream(e_clean).values())
+        else:
+            assert _whole_event_damaged(e_clean) is None  # parent (tolerated)
+
+        # --- read_events (batch) ------------------------------------------
+        # Cover the damaged k=1 in a multi-event batch with k=1 NOT first/only,
+        # so a batch assembly that stopped short or crossed events is caught.
+        batch = ridx.read_events([0, 1, 2])
+        assert [e.timestamp for e in batch] == ts_list, \
+            [e.timestamp for e in batch]
+
+        b_clean0, b_dmg, b_clean2 = batch
+        # the damaged event in the batch surfaces the damage identically...
+        assert _whole_event_damaged(b_dmg) is True, (
+            "WRITE-02: read_events (batch) must surface DGRAM-TOP damage on the "
+            f"damaged event; got {_whole_event_damaged(b_dmg)!r}.")
+        assert _damage_by_stream(b_dmg) == {0: (DROPPED_CONTRIBUTION, 0),
+                                            16: (DROPPED_CONTRIBUTION, 0)}, \
+            _damage_by_stream(b_dmg)
+        assert _is_detector_damaged(b_dmg, "detDropped") is True
+        # ...its frame is still byte-exact (damage is a side-channel)...
+        assert np.array_equal(b_dmg.stack("detHealthy")[0], FRAME)
+        assert b_dmg.stack("detDropped") is None
+        # ...and the batch's clean neighbours are not spuriously flagged (fix).
+        if _damage_by_stream(b_clean0) is not None:       # API present == fix
+            assert _whole_event_damaged(b_clean0) is False
+            assert _whole_event_damaged(b_clean2) is False
+
+    print("[ok] WRITE-02: read_event_at (single) AND read_events (batch) surface "
+          "the same DGRAM-TOP damage the forward path does -- damaged event "
+          "flagged, clean events not, frames byte-exact")
+
+
+# ===========================================================================
+# 5. import purity: the streaming path pulls in no framework.
 # ===========================================================================
 def test_import_purity():
     pstream.assert_no_framework_imports()
@@ -360,6 +485,7 @@ def main():
     test_dropped_contribution_surfaced()
     test_shapesdata_zero_but_dgramtop_set()
     test_clean_run_is_undamaged()
+    test_random_access_dgram_damage()
     test_import_purity()
     print()
     print("ALL WRITE-02 CHECKS PASSED")
