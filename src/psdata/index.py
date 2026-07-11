@@ -652,15 +652,50 @@ class RunIndex:
         some detector streams kept writing after the timing/master streams
         closed; ``pulseId=None``).  Pass ``include_shutdown_tail=True`` to keep
         that tail -- the full set of physical L1Accepts on disk."""
-        # gather the union of timestamps, then for each ts collect the streams
+        # Gather the union of timestamps, then for each ts collect the streams.
+        # STR-03 -- the ts-keyed merge is hardened against timestamp collisions:
+        #   * Records from DIFFERENT streams that share a ts are the SAME event
+        #     and combine into one entry -- the normal cross-stream merge, kept
+        #     exactly (a ts collision ACROSS streams is not a collision at all).
+        #   * A duplicate L1Accept ts WITHIN one stream is a DAQ/clock anomaly:
+        #     the entry shape ((chunk_path, off, size) per stream) holds only one
+        #     dgram per (ts, stream) and the ts-unique bisect index
+        #     (_position_of) cannot address two events at one ts, so a second
+        #     event landing on an already-filled (ts, stream) slot is RAISED,
+        #     never silently overwritten -- an event is never lost without a word.
+        #   * A transition dgram (is_event=False) that happens to share a ts with
+        #     an L1Accept must NOT flip the event's classification: the L1Accept
+        #     wins and stays indexed, the transition is additive-only and never
+        #     becomes -- nor displaces -- an event.
+        # A record is either (ts, chunk_path, off, size) -- always an L1Accept
+        # event, the only shape the scans emit, so the no-collision production
+        # path is byte-for-byte unchanged -- or (ts, chunk_path, off, size,
+        # is_event) whose is_event=False marks a non-event transition.
         merged = {}   # ts -> {stream: (chunk_path, off, size)}
         for stream, recs in per_stream.items():
-            for ts, chunk_path, off, size in recs:
-                merged.setdefault(ts, {})[stream] = (chunk_path, off, size)
+            for rec in recs:
+                if len(rec) == 5:
+                    ts, chunk_path, off, size, is_event = rec
+                else:
+                    ts, chunk_path, off, size = rec
+                    is_event = True
+                slot = merged.setdefault(ts, {})
+                if not is_event:
+                    continue   # transition: shares the ts but is not an event
+                if stream in slot:
+                    raise ValueError(
+                        "psdata index: duplicate L1Accept timestamp %d in "
+                        "stream %r -- two events share one 64-bit ts (DAQ/clock "
+                        "anomaly); the ts-keyed random-access index cannot "
+                        "address both. Refusing to silently drop an event."
+                        % (ts, stream))
+                slot[stream] = (chunk_path, off, size)
         timing_streams = (frozenset() if include_shutdown_tail
                           else self._timing_streams())
         for ts in sorted(merged):
             entry = merged[ts]
+            if not entry:
+                continue   # only transition(s) carried this ts -> not an event
             if timing_streams and not (timing_streams & entry.keys()):
                 continue   # shutdown-tail event: lacks the timing/master stream
             self.timestamps.append(ts)
@@ -1331,8 +1366,8 @@ def _read_chunkinfo(buf, dg_off, dg_hdr, tables):
 # ==========================================================================
 def _enumerate_bd_chunks(bd_c000_path):
     """Ordered bigdata chunk files for a stream, from its ``c000`` path, by the
-    ``-c000``/``-c001``/... filename convention (stops at the first missing
-    chunk id).  A single-chunk stream returns ``[c000]``.
+    ``-c000``/``-c001``/... filename convention.  A single-chunk stream returns
+    ``[c000]``.
 
     Enumerating by the on-disk filename convention -- rather than following the
     ``chunkinfo`` carried on each Enable (the SMD path's mechanism) -- keeps the
@@ -1340,6 +1375,18 @@ def _enumerate_bd_chunks(bd_c000_path):
     chunkinfo and no SMD.  The chunk filenames ``chunkinfo`` would name are
     exactly these ``-c00N`` siblings in the same directory, so the set walked is
     identical to the one the SMD-following path rolls through.
+
+    STR-04: the chunk set is discovered by ENUMERATING the ``-c00N`` siblings
+    that actually exist on disk (not by incrementing until the first miss), then
+    checked for contiguity.  Incrementing until the first miss silently
+    TRUNCATES a non-contiguous set: if ``c001`` is absent but ``c002`` exists
+    (a partial copy, a filesystem hiccup, a stray deletion), the old walk
+    stopped at ``c001`` and indexed only ``c000``, dropping every event in
+    ``c002+`` with no error -- a silently short index the caller never sees.
+    An interior hole is therefore a HARD ERROR here: we fail closed and name the
+    stream, the missing chunk(s), and the higher chunk(s) that exist.  Reaching
+    the last chunk (``max`` id present, nothing above it) is the legitimate end
+    condition, not a hole, and returns the full ordered set.
     """
     d = os.path.dirname(bd_c000_path)
     base = os.path.basename(bd_c000_path)
@@ -1348,15 +1395,47 @@ def _enumerate_bd_chunks(bd_c000_path):
         return [bd_c000_path]
     prefix = base[:m.start()]            # '<exp>-rNNNN-sMMM'
     width = len(m.group(1))              # zero-pad width (3 -> c000)
-    chunks = []
-    cid = 0
-    while True:
-        cand = os.path.join(d, f"{prefix}-c{cid:0{width}d}.xtc2")
-        if not os.path.exists(cand):
-            break
-        chunks.append(cand)
-        cid += 1
-    return chunks if chunks else [bd_c000_path]
+
+    # Enumerate the chunk ids that ACTUALLY exist for this stream by matching
+    # the c000's ``<prefix>-c<id>.xtc2`` siblings in its directory, rather than
+    # assuming contiguity by incrementing until the first miss.
+    sibling_re = re.compile(r"^" + re.escape(prefix) + r"-c(\d+)\.xtc2$")
+    listing = d if d else os.curdir
+    try:
+        names = os.listdir(listing)
+    except OSError:
+        names = []
+    found = set()                        # chunk ids present on disk
+    for name in names:
+        sm = sibling_re.match(name)
+        if sm:
+            found.add(int(sm.group(1)))
+    if not found:
+        # Not even c000 turned up (unusual path form, or the file vanished);
+        # fall back to the caller's own c000 path unchanged, as before.
+        return [bd_c000_path]
+
+    hi = max(found)
+    missing = [cid for cid in range(hi + 1) if cid not in found]
+    if missing:
+        # A true interior hole (a missing -c00N with a higher chunk present):
+        # refuse to silently index a truncated run -- fail closed, loudly.
+        sm = re.search(r"-s(\d+)$", prefix)
+        stream = sm.group(1) if sm else "?"
+        fmt = lambda c: f"c{c:0{width}d}"
+        miss_lo = min(missing)
+        higher = sorted(c for c in found if c > miss_lo)
+        raise ValueError(
+            f"non-contiguous bigdata chunk set for stream s{stream}: "
+            f"missing chunk(s) {[fmt(c) for c in missing]} while higher "
+            f"chunk(s) {[fmt(c) for c in higher]} exist (prefix {prefix!r} in "
+            f"{listing!r}); refusing to silently index a truncated run "
+            f"(dropping {fmt(hi)} and below the gap) -- STR-04")
+
+    # Contiguous set 0..hi: build the ordered paths exactly as before
+    # (byte-identical to the old first-miss walk for a normal chunk set).
+    return [os.path.join(d, f"{prefix}-c{cid:0{width}d}.xtc2")
+            for cid in range(hi + 1)]
 
 
 def _scan_bigdata_stream(bd_c000_path, env_out=None):
