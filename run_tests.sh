@@ -146,19 +146,32 @@ for t in "${TESTS[@]}"; do
     status=$rc
     failed=$((failed + 1))
   fi
-  # collect this file's skip records: '##SKIP## <name> :: <reason>'
+  # collect this file's skip records: '##SKIP## <name> :: <reason>'.
+  # tests/_skips.py ALWAYS prints the marker at the START of the line, so anchor
+  # the match there (leading whitespace tolerated) -- a line that merely mentions
+  # ##SKIP## in prose (e.g. test_torch's "see the ##SKIP## records above")
+  # is NOT a record and must not be collected.
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     rec="${line#*"$SKIP_MARKER"}"                       # drop everything up to+incl marker
     rec="${rec#"${rec%%[![:space:]]*}"}"                # ltrim
+    # A real record has a '::' separator; without it the line is malformed
+    # (e.g. '##SKIP## garbage') and must not become a phantom skip.
+    if [[ "$rec" != *"::"* ]]; then
+      echo "WARNING: malformed skip record (no '::' separator), ignoring: ${line}" >&2
+      continue
+    fi
     name="${rec%%::*}"
     reason="${rec#*::}"
     name="${name#"${name%%[![:space:]]*}"}"; name="${name%"${name##*[![:space:]]}"}"
     reason="${reason#"${reason%%[![:space:]]*}"}"; reason="${reason%"${reason##*[![:space:]]}"}"
-    [[ -n "$name" ]] || continue
+    if [[ -z "$name" ]]; then
+      echo "WARNING: malformed skip record (empty name), ignoring: ${line}" >&2
+      continue
+    fi
     skip_names+=("$name")
     skip_reasons+=("$reason")
-  done < <(grep -F "$SKIP_MARKER" "$out" || true)
+  done < <(grep -E "^[[:space:]]*${SKIP_MARKER}[[:space:]]" "$out" || true)
   # UNMARKED skips: skip-looking lines that are NOT ##SKIP## records.  Two grep
   # passes (case-insensitive spellings + case-sensitive uppercase SKIP token),
   # de-duplicated, with the ##SKIP## marker lines excluded last.
