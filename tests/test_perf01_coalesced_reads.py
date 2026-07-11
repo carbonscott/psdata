@@ -113,8 +113,11 @@ def _build_reader(tmpdir, n_streams, k_count, size, gap, capture):
         for k in range(k_count)
     ]
 
-    def _capturing_assemble(stream, chunk_path, offset, size_, raw, ts, seg_index):
+    def _capturing_assemble(stream, chunk_path, offset, size_, raw, ts, seg_index,
+                            stream_damage=None):
         # snapshot the bytes actually handed to assembly for this (k, stream)
+        # (stream_damage is the WRITE-02 side-channel arg; the byte-capture
+        # oracle ignores it -- this stub only records the raw dgram bytes)
         k = int(ts)                      # timestamps are 0..k_count-1 here
         assert len(raw) == size_, (
             "assembly got %d bytes, indexed size is %d" % (len(raw), size_))
@@ -229,7 +232,8 @@ def test_batch_coalesces_and_is_byte_identical():
 def _rebind_capture(ridx, capture):
     """A fresh capturing assembler bound to ``capture`` (reused for the serial
     oracle so it observes the same per-dgram bytes the batch did)."""
-    def _cap(stream, chunk_path, offset, size_, raw, ts, seg_index):
+    def _cap(stream, chunk_path, offset, size_, raw, ts, seg_index,
+             stream_damage=None):
         capture[(int(ts), stream)] = bytes(raw)
         return ST.SERVICE_L1ACCEPT
     return _cap
