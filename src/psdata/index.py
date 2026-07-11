@@ -65,10 +65,13 @@ Like the rest of ``psdata``, this module imports **no** psana / mpi4py / h5py
 -- only the standard library and numpy.
 """
 
+import base64
 import bisect
+import hashlib
+import json
 import os
-import pickle
 import re
+import struct
 import time
 
 import numpy as np
@@ -106,6 +109,161 @@ def _decode_chunk_filename(arr):
     """``chunkinfo.filename`` is a rank-1 CHARSTR (uint8) field, null-padded.
     Return it as a ``str`` (the bare basename of the next bigdata chunk)."""
     return _f.decode_charstr(arr)
+
+
+# ==========================================================================
+# Safe, versioned on-disk index format (IDX-02)
+# ==========================================================================
+# The persisted index is a shareable artifact re-read off a multi-user
+# analysis filesystem, so its on-disk format MUST NOT be a pickle:
+# ``pickle.load`` executes arbitrary code baked into the file (an RCE vector --
+# any user who can write the directory a victim's job loads from would get code
+# execution in that job), and a bare pickle also has no magic, no format
+# version, and no integrity check (a truncated/corrupt/drifted file crashes
+# inscrutably, or silently loads wrong data).
+#
+# Instead ``RunIndex.save``/``load`` write a self-describing container:
+#   magic + version + a JSON header (checksum) + a JSON payload,
+# where the payload is ``_persist_state()`` rendered by :func:`_index_encode`
+# and read back by :func:`_index_decode`.  The decoder dispatches on a FIXED
+# whitelist of type tags and can reconstruct ONLY plain data (dict/list/tuple/
+# set/str/int/float/bool/None, plus numpy dtype/ndarray) and the three psdata
+# config classes (RunConfig/DetectorInfo/FieldInfo) -- there is no tag that
+# imports or calls an arbitrary object, so loading a file can never execute
+# embedded code the way ``pickle.load`` does.  The encoder REFUSES any type it
+# does not recognise (rather than falling back to pickle or to a numpy object
+# array), which also forecloses the "ragged list-of-lists silently becomes an
+# object/pickled array" trap: the ragged per-event ``entries`` are encoded as
+# explicit tagged lists/dicts, never handed to ``np.array``/``np.savez``.
+_INDEX_MAGIC = b"PSDATIDX"          # 8 bytes; identifies a psdata index file
+_INDEX_FORMAT_VERSION = 1           # bump on ANY incompatible layout change
+_INDEX_CHECKSUM_ALGO = "sha256"     # over the payload bytes, checked on load
+
+
+def _index_encode(obj):
+    """Encode ``obj`` (a ``_persist_state`` dict) to a JSON-safe, type-tagged
+    document.  Strings are pooled (repeated chunk paths cost one entry).  Raises
+    ``TypeError`` on any type outside the supported set -- so nothing is ever
+    silently dropped, coerced to a numpy object array, or pickled."""
+    pool = []
+    interned = {}
+
+    def sref(s):
+        i = interned.get(s)
+        if i is None:
+            i = len(pool)
+            pool.append(s)
+            interned[s] = i
+        return {"t": "s", "i": i}
+
+    def enc(o):
+        # bool BEFORE int (bool is an int subclass); None/bool/int/float are
+        # JSON natives and pass through unwrapped.
+        if o is None or isinstance(o, bool):
+            return o
+        if isinstance(o, int):
+            return o
+        if isinstance(o, float):
+            return o
+        if isinstance(o, str):
+            return sref(o)
+        if isinstance(o, np.integer):
+            return int(o)
+        if isinstance(o, np.floating):
+            return float(o)
+        if isinstance(o, np.bool_):
+            return bool(o)
+        if isinstance(o, dict):
+            return {"t": "dict", "d": [[enc(k), enc(v)] for k, v in o.items()]}
+        if isinstance(o, list):
+            return {"t": "list", "d": [enc(x) for x in o]}
+        if isinstance(o, tuple):
+            return {"t": "tuple", "d": [enc(x) for x in o]}
+        if isinstance(o, frozenset):
+            return {"t": "frozenset", "d": [enc(x) for x in o]}
+        if isinstance(o, set):
+            return {"t": "set", "d": [enc(x) for x in o]}
+        if isinstance(o, np.dtype):
+            return {"t": "dtype", "v": o.str}
+        if isinstance(o, np.ndarray):
+            return {"t": "ndarray", "dtype": o.dtype.str,
+                    "shape": list(o.shape),
+                    "b64": base64.b64encode(
+                        np.ascontiguousarray(o).tobytes()).decode("ascii")}
+        if isinstance(o, _f.RunConfig):
+            return {"t": "RunConfig", "s": enc(o.__dict__)}
+        if isinstance(o, _f.DetectorInfo):
+            return {"t": "DetectorInfo", "s": enc(o.__dict__)}
+        if isinstance(o, _f.FieldInfo):
+            # reconstructed via its constructor (recomputes np_dtype), so only
+            # the three defining scalars are stored.
+            return {"t": "FieldInfo", "name": enc(o.name),
+                    "type_code": int(o.type_code), "rank": int(o.rank)}
+        raise TypeError(
+            "psdata index save: refusing to serialize unsupported type %r -- a "
+            "safe self-describing index stores only plain data and the psdata "
+            "config classes (no arbitrary objects, no pickle)." % (type(o),))
+
+    return {"strings": pool, "root": enc(obj)}
+
+
+def _index_decode(doc):
+    """Inverse of :func:`_index_encode`.  Dispatches on a FIXED whitelist of
+    type tags; an unknown tag (or a malformed node) raises ``ValueError``.  The
+    only classes it can ever instantiate are the three psdata config classes --
+    there is NO tag that imports or calls an arbitrary object, so decoding a
+    hostile file cannot execute embedded code."""
+    if (not isinstance(doc, dict) or "strings" not in doc
+            or "root" not in doc):
+        raise ValueError("psdata index: malformed payload envelope")
+    strings = doc["strings"]
+    if not isinstance(strings, list) or not all(
+            isinstance(s, str) for s in strings):
+        raise ValueError("psdata index: malformed string pool")
+
+    def dec(n):
+        # JSON natives pass straight through.
+        if n is None or isinstance(n, bool) or isinstance(n, (int, float)):
+            return n
+        if not isinstance(n, dict):
+            raise ValueError(
+                "psdata index: unexpected JSON node of type %r" % (type(n),))
+        t = n.get("t")
+        if t == "s":
+            i = n["i"]
+            if not isinstance(i, int) or not (0 <= i < len(strings)):
+                raise ValueError("psdata index: bad string reference")
+            return strings[i]
+        if t == "dict":
+            return {dec(k): dec(v) for k, v in n["d"]}
+        if t == "list":
+            return [dec(x) for x in n["d"]]
+        if t == "tuple":
+            return tuple(dec(x) for x in n["d"])
+        if t == "set":
+            return set(dec(x) for x in n["d"])
+        if t == "frozenset":
+            return frozenset(dec(x) for x in n["d"])
+        if t == "dtype":
+            return np.dtype(n["v"])
+        if t == "ndarray":
+            arr = np.frombuffer(base64.b64decode(n["b64"]),
+                                dtype=np.dtype(n["dtype"]))
+            return arr.reshape(n["shape"]).copy()
+        if t == "RunConfig":
+            obj = _f.RunConfig.__new__(_f.RunConfig)
+            obj.__dict__.update(dec(n["s"]))
+            return obj
+        if t == "DetectorInfo":
+            obj = _f.DetectorInfo.__new__(_f.DetectorInfo)
+            obj.__dict__.update(dec(n["s"]))
+            return obj
+        if t == "FieldInfo":
+            return _f.FieldInfo(dec(n["name"]), n["type_code"], n["rank"])
+        raise ValueError(
+            "psdata index: unknown/unsafe type tag %r in payload" % (t,))
+
+    return dec(doc["root"])
 
 
 # ==========================================================================
@@ -651,12 +809,31 @@ class RunIndex:
                 f"build_seconds={self.build_seconds:.3f}, "
                 f"scan_MB={self.scan_bytes_read / 1e6:.1f})")
 
-    # -- serialization & disk persistence (US-008) ------------------------
+    # -- serialization & disk persistence (US-008; disk format IDX-02) ----
     #
     # The once-built index can be (a) saved to a single file and reloaded
     # instantly with NO SMD rescan (a single-process benefit), and (b) shipped
     # to parallel workers in-memory via pickle / ``to_dict``.  Both paths share
-    # ONE state-stripping helper so they cannot drift.
+    # ONE state-stripping helper (``_persist_state``) so they cannot drift.
+    #
+    # TWO DIFFERENT trust boundaries, TWO DIFFERENT formats:
+    #   * (a) the DISK artifact (:meth:`save`/:meth:`load`) is written once and
+    #     re-read by many, possibly OTHER users', jobs off a shared analysis
+    #     filesystem (``/sdf``).  ``pickle.load`` executes arbitrary code baked
+    #     into the file it reads, so a bare-pickle index on a shared path is a
+    #     remote-code-execution vector (any user who can write the directory a
+    #     victim's job loads from gets code execution in that job).  The disk
+    #     format is therefore NOT pickle: it is a self-describing, versioned,
+    #     checksummed container (magic + version + a JSON header + a JSON
+    #     payload) decoded by a strict WHITELIST codec (:func:`_index_encode` /
+    #     :func:`_index_decode`) that can reconstruct ONLY plain data and the
+    #     three psdata config classes -- never an arbitrary callable.  See
+    #     :meth:`save` / :meth:`load`.
+    #   * (b) the IN-MEMORY ship-to-workers path (``to_dict``/``from_dict`` and
+    #     the pickle protocol ``__getstate__``/``__setstate__``) stays pickle:
+    #     it is a trusted, in-process hand-off (e.g. Ray's object store) of an
+    #     object THIS process just built -- not an untrusted file off disk -- so
+    #     the RCE surface the disk format closes does not apply to it.
     #
     # THE gotcha (load-bearing): ``_bd_fds`` caches raw OS file-descriptor
     # integers from ``os.open``.  ``pickle`` does NOT refuse a bare int, so an
@@ -759,24 +936,115 @@ class RunIndex:
         """Write the built index to a single file at ``path`` so it can be
         reloaded later (or in another process) WITHOUT rescanning SMD.
 
-        On-disk format is **pickle** (protocol 4): the state is nested
-        plain-Python containers plus a :class:`psdata.format.RunConfig` (itself
-        only strings / ints / dicts / ``numpy.dtype``) -- pickle gives full
-        fidelity for the 64-bit ints and the nested config with no bespoke
-        schema, and the blob (entries dominate) is smaller than the SMD bytes it
-        replaces.  Only the fd-safe ``_persist_state`` is written.
+        On-disk format (IDX-02): a self-describing, versioned, checksummed
+        container -- explicitly **not** a pickle, because the index is a
+        shareable artifact re-read off a multi-user filesystem and
+        ``pickle.load`` runs arbitrary code baked into the file (an RCE vector).
+        Layout::
+
+            magic   = b"PSDATIDX"                         (8 bytes)
+            version = uint32 LE (== _INDEX_FORMAT_VERSION)
+            hlen    = uint32 LE
+            header  = <hlen> bytes UTF-8 JSON
+                      {"checksum_algo","checksum","payload_len"}
+            payload = <payload_len> bytes UTF-8 JSON
+
+        The ``payload`` is :meth:`_persist_state` rendered by
+        :func:`_index_encode` -- a strict, type-tagged, self-describing encoding
+        of plain data (and only the three psdata config classes), string-pooled
+        so repeated chunk paths cost one entry.  ``checksum`` is the
+        ``sha256`` of the payload bytes, verified on load.  Only the fd-safe
+        ``_persist_state`` is written.
         """
+        payload = json.dumps(_index_encode(self._persist_state()),
+                             separators=(",", ":")).encode("utf-8")
+        digest = hashlib.new(_INDEX_CHECKSUM_ALGO, payload).hexdigest()
+        header = json.dumps(
+            {"checksum_algo": _INDEX_CHECKSUM_ALGO,
+             "checksum": digest,
+             "payload_len": len(payload)},
+            separators=(",", ":")).encode("utf-8")
         with open(path, "wb") as fh:
-            pickle.dump(self._persist_state(), fh, protocol=4)
+            fh.write(_INDEX_MAGIC)
+            fh.write(struct.pack("<I", _INDEX_FORMAT_VERSION))
+            fh.write(struct.pack("<I", len(header)))
+            fh.write(header)
+            fh.write(payload)
 
     @classmethod
     def load(cls, path):
         """Reload an index written by :meth:`save`.  Opens ONLY the index file
         (no SMD files, no rescan): ``smd_bytes_read`` is whatever the original
         build measured, but no new SMD I/O happens here.  Fds into the bigdata
-        files reopen lazily on the first :meth:`read_event_at`."""
+        files reopen lazily on the first :meth:`read_event_at`.
+
+        The magic + version + checksum are all verified before any content is
+        interpreted, and the payload is decoded by the whitelist codec
+        (:func:`_index_decode`) -- so a corrupt, truncated, format-drifted, or
+        (crucially) an old bare-**pickle** index is REFUSED with a clear error
+        instead of being trusted.  ``load`` never executes code embedded in the
+        file: unlike ``pickle.load`` there is no path to an arbitrary callable.
+        """
         with open(path, "rb") as fh:
-            state = pickle.load(fh)
+            magic = fh.read(len(_INDEX_MAGIC))
+            if magic != _INDEX_MAGIC:
+                raise ValueError(
+                    "%r is not a psdata index file: expected magic %r, found "
+                    "%r.  A bare-pickle index written by an older psdata is "
+                    "refused on purpose (loading a pickle executes arbitrary "
+                    "code embedded in the file -- an RCE vector on a shared "
+                    "filesystem); rebuild it with build_index(...).save(...)."
+                    % (path, _INDEX_MAGIC, magic))
+            vbytes = fh.read(4)
+            if len(vbytes) < 4:
+                raise ValueError(
+                    "%r: truncated psdata index (no format version)" % (path,))
+            version = struct.unpack("<I", vbytes)[0]
+            if version != _INDEX_FORMAT_VERSION:
+                raise ValueError(
+                    "%r: unsupported psdata index format version %d -- this "
+                    "psdata reads version %d.  Rebuild the index with the "
+                    "current psdata (build_index(...).save(...))."
+                    % (path, version, _INDEX_FORMAT_VERSION))
+            hlen_bytes = fh.read(4)
+            if len(hlen_bytes) < 4:
+                raise ValueError(
+                    "%r: truncated psdata index (no header length)" % (path,))
+            hlen = struct.unpack("<I", hlen_bytes)[0]
+            header_bytes = fh.read(hlen)
+            if len(header_bytes) < hlen:
+                raise ValueError(
+                    "%r: truncated psdata index (short header)" % (path,))
+            try:
+                header = json.loads(header_bytes.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError) as e:
+                raise ValueError(
+                    "%r: corrupt psdata index header (%s)" % (path, e))
+            algo = header.get("checksum_algo")
+            want_digest = header.get("checksum")
+            plen = header.get("payload_len")
+            if not isinstance(algo, str) or algo not in hashlib.algorithms_available:
+                raise ValueError(
+                    "%r: psdata index header names an unknown checksum "
+                    "algorithm %r" % (path, algo))
+            payload = fh.read()
+        if not isinstance(plen, int) or len(payload) != plen:
+            raise ValueError(
+                "%r: psdata index payload length mismatch (header says %r "
+                "bytes, file holds %d) -- the file is truncated or padded; "
+                "rebuild the index." % (path, plen, len(payload)))
+        got_digest = hashlib.new(algo, payload).hexdigest()
+        if not isinstance(want_digest, str) or got_digest != want_digest:
+            raise ValueError(
+                "%r: psdata index integrity check FAILED (%s mismatch: header "
+                "%r, computed %r) -- the file is corrupt or was modified; "
+                "rebuild the index." % (path, algo, want_digest, got_digest))
+        try:
+            doc = json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            raise ValueError(
+                "%r: corrupt psdata index payload (%s)" % (path, e))
+        state = _index_decode(doc)
         idx = cls.__new__(cls)
         return idx._restore_state(state)
 
