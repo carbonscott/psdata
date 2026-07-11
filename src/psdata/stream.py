@@ -26,6 +26,22 @@ The missing-segment rule mirrors ``DetectorImpl._segments``
 received segment set does not match the full set declared in its Configure
 Names table is reported as ``None`` for that event.
 
+A detector can be ``None`` for two very different reasons, and STR-02 keeps them
+apart.  A *genuine absence* is the missing-segment rule above -- the stream is
+present but the detector did not contribute a (complete) frame this event.  A
+*stream drop-out* is a data-quality fault: a bigdata stream that was producing
+dgrams stops (hits EOF -- a killed DAQ / transport dropout) while other streams
+carry the run on, so every detector on that stream is silently absent from then
+on.  On the k-way merge the two are indistinguishable at the value level (both
+yield ``None``), which is exactly psana's ``DroppedContribution`` condition
+surfacing as an unnamed hole.  :func:`events` therefore records the streams that
+had stopped by the time each event was assembled on the :class:`Event`
+(``Event.dropped_streams``); :meth:`Event.detector_status` reports ``"dropped"``
+vs ``"absent"`` so a consumer can tell the fault from a legitimate absence
+instead of seeing an indistinguishable ``None``.  The frame VALUES are unchanged
+-- a healthy run drops no stream, so ``dropped_streams`` is always empty and the
+new signal never fires.
+
 Like :mod:`psdata.format`, this module imports **no** psana / mpi4py / h5py --
 only the standard library and numpy.
 """
@@ -337,9 +353,10 @@ class Event:
     """
 
     __slots__ = ("timestamp", "service", "_run_config", "_seg_index",
-                 "_pulseid_cache")
+                 "_pulseid_cache", "_dropped_streams")
 
-    def __init__(self, timestamp, service, run_config, seg_index):
+    def __init__(self, timestamp, service, run_config, seg_index,
+                 dropped_streams=frozenset()):
         self.timestamp = timestamp
         self.service = service
         self._run_config = run_config
@@ -347,6 +364,15 @@ class Event:
         #                                          table)}}
         self._seg_index = seg_index
         self._pulseid_cache = None
+        # STR-02: stream indices that were producing dgrams earlier in the run
+        # but had stopped (hit EOF) by the time this event was assembled from
+        # the streams still live.  Empty for a healthy run and for a
+        # random-access read (which observes one event in isolation and cannot
+        # witness a run-scale drop-out).  A detector carried on such a stream is
+        # absent for a *data-quality* reason (a DAQ/transport dropout), distinct
+        # from a detector legitimately not present this event -- see
+        # :meth:`detector_status`.
+        self._dropped_streams = frozenset(dropped_streams)
 
     # -- identity ----------------------------------------------------------
     @property
@@ -379,6 +405,18 @@ class Event:
         # timing data comes from one segment (psana assumes seg 0/first).
         raw_pid = int(segs[sorted(segs)[0]])
         return raw_pid & ~_PULSEID_LCLS1_BIT
+
+    # -- stream drop-out (STR-02) ------------------------------------------
+    @property
+    def dropped_streams(self):
+        """The stream indices that had **dropped out** by the time this event
+        was assembled: streams that were producing dgrams earlier in the run but
+        had hit EOF while other streams carried the run on (a DAQ/transport
+        dropout).  A ``frozenset`` -- empty for a healthy run (and for any
+        random-access read).  Detectors carried on these streams are absent this
+        event for a data-quality reason, not because they were legitimately not
+        present; :meth:`detector_status` classifies which is which."""
+        return self._dropped_streams
 
     # -- detector access ---------------------------------------------------
     def detector_names(self, include_bookkeeping=False):
@@ -419,6 +457,57 @@ class Event:
                                                    field)
             out[seg] = arr
         return out
+
+    def _alg_complete(self, det_name, alg):
+        """True if ``(det_name, alg)`` contributed its FULL declared segment set
+        this event (the same completeness test :meth:`_extract_segments` applies,
+        without decoding any field bytes)."""
+        captured = self._seg_index.get((det_name, alg))
+        if not captured:
+            return False
+        expected = self._expected_segments(det_name, alg)
+        return expected is not None and sorted(captured) == expected
+
+    def detector_status(self, det_name, alg="raw"):
+        """Classify why :meth:`raw`/:meth:`stack` returns data or ``None`` for
+        ``(det_name, alg)`` this event -- the STR-02 discriminator.  One of:
+
+          * ``"present"`` -- the detector contributed its full segment set (a
+            non-``None`` frame).
+          * ``"dropped"`` -- the detector is ``None`` because at least one of the
+            streams that carry it had **dropped out** of the run by this event
+            (a DAQ/transport dropout; see :attr:`dropped_streams`).  A
+            *data-quality* fault.
+          * ``"absent"`` -- the detector is ``None`` for a legitimate reason: its
+            streams are all still live but it did not contribute a complete
+            frame this event (missing-segment rule / simply not present).
+          * ``"unknown"`` -- no such detector in the run config.
+
+        This is what a healthy ``None`` (``"absent"``) and a drop-out ``None``
+        (``"dropped"``) differ by: on the raw arrays alone they are
+        indistinguishable, which is the bug STR-02 fixes."""
+        det = self._run_config.detectors.get(det_name)
+        if det is None:
+            return "unknown"
+        if self._alg_complete(det_name, alg):
+            return "present"
+        streams = set(det.streams_for(alg)) if alg in det.segments else set()
+        if streams & self._dropped_streams:
+            return "dropped"
+        return "absent"
+
+    def dropped_detectors(self, alg="raw", include_bookkeeping=False):
+        """Sorted names of the detectors that are ``None`` this event **because a
+        stream carrying them dropped out** (``detector_status == "dropped"``) --
+        the run's data-quality casualties for this event, as opposed to detectors
+        that are simply, legitimately absent.  Empty for a healthy event."""
+        out = []
+        for name, det in self._run_config.detectors.items():
+            if not include_bookkeeping and det.is_bookkeeping:
+                continue
+            if self.detector_status(name, alg=alg) == "dropped":
+                out.append(name)
+        return sorted(out)
 
     def raw(self, det_name, field="raw", alg="raw"):
         """Return ``{segment: ndarray}`` for ``(det_name, alg).field`` this
@@ -576,6 +665,14 @@ def events(stream_files, run_config=None):
         _cfg, cfg_end = rc.stream_configs[stream]
         cursors.append(_StreamCursor(stream, rc.stream_files[stream], cfg_end))
 
+    # STR-02 drop-out tracking.  ``ever_live`` = streams that have produced at
+    # least one head; ``dropped`` = streams that were live but have since hit EOF
+    # while the run keeps yielding events from other streams.  ``dropped`` grows
+    # monotonically and is empty for a healthy run (every stream runs to the
+    # run's end and all heads go None together on the final iteration, which
+    # yields nothing), so the frame values are byte-unchanged.
+    ever_live = set()
+    dropped = set()
     try:
         while True:
             # --- find min head ts across live streams (k-way merge key) ---
@@ -583,7 +680,15 @@ def events(stream_files, run_config=None):
             for cur in cursors:
                 ts = cur.head_ts()
                 if ts is None:
+                    # A stream at EOF that WAS producing dgrams has dropped out
+                    # (STR-02): it stopped before the run's end.  Recorded so the
+                    # assembled event can distinguish this data-quality fault from
+                    # a detector that is legitimately absent.  A stream that was
+                    # never live (empty file) is not a drop-out.
+                    if cur.stream in ever_live:
+                        dropped.add(cur.stream)
                     continue
+                ever_live.add(cur.stream)
                 if min_ts is None or ts < min_ts:
                     min_ts = ts
             if min_ts is None:
@@ -623,7 +728,8 @@ def events(stream_files, run_config=None):
                 cur.advance()
 
             if is_event:
-                yield Event(min_ts, service, rc, seg_index)
+                yield Event(min_ts, service, rc, seg_index,
+                            dropped_streams=frozenset(dropped))
             # else: a transition (Configure/BeginRun/Enable/SlowUpdate/...) --
             # consumed across all matching streams above, but not yielded.
     finally:
