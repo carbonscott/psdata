@@ -280,6 +280,18 @@ def extract_field(buf, shapesdata_off, shapesdata_hdr, table, field_name):
             f"({len(buf)} bytes)")
     data_extent = data_end - data_off
 
+    # Bound the Shapes child's DECLARED extent to the enclosing ShapesData and
+    # the buffer too, so an over-long Shapes.extent surfaces as a clean
+    # XtcFormatError rather than a bare struct.error from the Shape read below:
+    # once shapes_end fits, the per-field `so + SHAPE_SZ > shapes_end` check
+    # keeps every struct.unpack_from within the buffer.  (No-op on valid input,
+    # where the Shapes child fits within both.)
+    if shapes_off is not None and shapes_end > min(sd_end, len(buf)):
+        raise XtcFormatError(
+            f"ShapesData Xtc at offset {shapesdata_off}: Shapes child declares "
+            f"extent ending at byte {shapes_end}, past the ShapesData extent "
+            f"(sd_end={sd_end}) or the buffer end ({len(buf)} bytes)")
+
     names = table["names"]
     # Walk fields, accumulating byte offsets and consuming Shapes for rank>0.
     offset = 0
