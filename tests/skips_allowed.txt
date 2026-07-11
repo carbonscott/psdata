@@ -1,0 +1,24 @@
+# Allowlist of JUSTIFIED skips for the psdata acceptance suite (HYG-03).
+#
+# Format (one record per line):    <skip name> :: <justification>
+# Blank lines and '#' comments are ignored.
+#
+# run_tests.sh counts every '##SKIP## <name> :: <reason>' line a test emits and
+# EXITS NONZERO if a name is not listed here.  A skip is not a pass.
+#
+# The bar for an entry: the skipped check cannot run in the production
+# environment for a reason that is by DESIGN, and no coverage the suite claims
+# is lost by it.  A missing oracle ground truth is NOT a justification -- capture
+# the ground truth (tools/gt_capture.py) instead of allowlisting the skip.
+#
+# Only the torch-dependent checks qualify today.  torch is a declared OPTIONAL
+# extra of psdata (pyproject [project.optional-dependencies] torch) and is not
+# installed in the production psconda env on sdfiana025, where `import torch`
+# genuinely fails.  The psdata.torch adapter is a demonstrator over the same
+# index machinery the (torch-free) US-003/US-008/US-009 tests already cover
+# byte-exactly, and test_torch_us011's import-purity check -- the one assertion
+# that constrains the CORE package -- runs regardless of torch.
+
+torch_absent_correctness :: torch is an OPTIONAL psdata extra and is not installed in the production psconda env; the XTCDataset __getitem__ byte-equality check cannot run without it. The underlying read_event_at(k).stack(det) path it wraps is covered byte-exactly by test_index_us003 / test_batch_us009, which need no torch.
+torch_absent_dataloader_fork_safety :: torch is an OPTIONAL psdata extra and is not installed in the production psconda env; DataLoader(num_workers=2) cannot be constructed without it. Install the 'torch' extra to exercise this check.
+torch_absent_fd_reuse_deterministic :: the deterministic fork/fd-reuse backstop for the DataLoader check is deliberately grouped with the torch block (it asserts the adapter's fd discipline, whose only consumer is psdata.torch); torch is an OPTIONAL extra absent from the production psconda env. Install the 'torch' extra to exercise this check.

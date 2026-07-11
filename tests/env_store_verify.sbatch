@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --partition=milano
-#SBATCH --account=lcls:prjcwang31
+#SBATCH --account=lcls:prjdat21
 #SBATCH --qos=normal
 #SBATCH --job-name=env-store-verify
 #SBATCH --output=/sdf/data/lcls/ds/prj/prjcwang31/results/fun/psdata/env-store-verify-%j.out
@@ -8,7 +8,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=16g
-#SBATCH --time=01:30:00
+#SBATCH --time=03:00:00
 #
 # At-scale no-regression verification for psdata's env store
 # (branch feature/env-store, commit 15c1335). Two stages on a milano compute
@@ -21,8 +21,12 @@
 #       pointing at <repo>/src) -- default bigdata index == SMD exactly,
 #       include_shutdown_tail recovers the untimed superset, and the new
 #       env_records field persists/round-trips.
-# The slow full-forward-pass test in test_stream_us002.py stays skipped
-# (PSDATA_SKIP_SLOW=1) to keep the job bounded.
+# Stage [1] runs the FULL suite: the slow full-forward-pass test in
+# test_stream_us002.py is NOT skipped.  The PSDATA_SKIP_SLOW escape hatch that
+# used to bound this job is gone (GATE-02 removed its only reader), and
+# run_tests.sh now fails on any skip that is not justified in
+# tests/skips_allowed.txt (HYG-03) -- so budget the wall time for a full pass
+# rather than skipping a regression to fit the box.
 set -uo pipefail
 echo "host=$(hostname) jobid=${SLURM_JOB_ID:-?} start=$(date -Is)"
 SW=/sdf/data/lcls/ds/prj/prjcwang31/results/software/psdata
@@ -33,7 +37,7 @@ echo "===== [1] psana-oracle regression suite ====="
   set +u   # psconda's conda activate scripts reference unbound vars (ADDR2LINE)
   source /sdf/group/lcls/ds/ana/sw/conda2/manage/bin/psconda.sh
   cd "$SW"
-  PSDATA_SKIP_SLOW=1 bash run_tests.sh
+  bash run_tests.sh
 )
 suite_rc=$?
 echo "suite_rc=$suite_rc"
