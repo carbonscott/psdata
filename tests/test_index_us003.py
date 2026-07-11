@@ -39,6 +39,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG_PARENT = os.path.join(os.path.dirname(_HERE), "src")  # .../<repo>/src (holds psdata/)
 if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
+if _HERE not in sys.path:                          # for _skips (sibling module)
+    sys.path.insert(0, _HERE)
+
+from _skips import skip   # noqa: E402  (machine-readable skip records, HYG-03)
 
 # Reference dataset -- lives in the TEST, never in the library.
 EXP = "mfx100848724"
@@ -291,13 +295,17 @@ def test_unknown_ts_raises():
 # --------------------------------------------------------------------------
 def test_random_matches_psana():
     """Spot-check that random-access raw equals psana's det.raw.raw(evt) for a
-    couple of events (the byte-exact oracle).  Skipped cleanly if psana is not
-    importable."""
+    couple of events (the byte-exact oracle).  SKIPs if psana is not importable
+    -- and that skip is not allowlisted, so it fails the suite (HYG-03): an
+    oracle that does not run is not a passing oracle."""
     try:
         from psana import DataSource
     except Exception as e:                      # pragma: no cover
-        print(f"[psana] skipped (psana not importable: {e})")
-        return
+        return skip(
+            "index_random_read_psana_oracle",
+            f"psana is not importable in this environment ({e!r}); source "
+            f"psconda.sh. The byte-exact check that random-access raw equals "
+            f"psana's det.raw.raw(evt) -- the US-003 oracle -- did not run")
     import psdata
     from psdata import index as psindex
 

@@ -30,9 +30,10 @@ Run it on host sdfiana025 (via ``psdata/run_tests.sh``, which sets PYTHONPATH so
 
 The import-purity check (criterion 1) is asserted BEFORE psana is imported and
 again in a fresh subprocess, so a later psana import in this process cannot mask
-a leak.  The byte-exact checks need psana and are skipped cleanly if it is not
-importable (with a clear message), so the package-API checks still run without
-the prod env.
+a leak.  The byte-exact checks need psana; without it they emit a SKIP record
+(``tests/_skips.py``) and the package-API checks still run -- but that skip is
+NOT allowlisted, so it FAILS the suite (HYG-03).  A regression check that did
+not run is not a passing regression check.
 """
 
 import os
@@ -46,6 +47,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG_PARENT = os.path.join(os.path.dirname(_HERE), "src")  # .../<repo>/src (holds psdata/)
 if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
+if _HERE not in sys.path:                          # for _skips (sibling module)
+    sys.path.insert(0, _HERE)
+
+from _skips import skip   # noqa: E402  (machine-readable skip records, HYG-03)
 
 # Reference dataset -- lives in the TEST, never in the library.
 EXP = "mfx100848724"
@@ -217,9 +222,12 @@ def test_regression_byte_identical_vs_psana():
     try:
         from psana import DataSource  # noqa: F401  (probe availability)
     except Exception as e:                            # pragma: no cover
-        print(f"[regression] SKIPPED (psana not importable: {e}). "
-              f"Source psconda.sh and re-run to exercise the regression check.")
-        return
+        return skip(
+            "psana_unimportable_regression",
+            f"psana is not importable in this environment ({e!r}); source "
+            f"psconda.sh. The US-005 regression -- psdata's public streaming AND "
+            f"random-access raw arrays byte-identical to freshly regenerated "
+            f"psana ground truth, plus pulseId parity -- did not run")
 
     import psdata
 

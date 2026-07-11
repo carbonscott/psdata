@@ -3,6 +3,9 @@ __pycache__/
 .venv/
 *.npy
 *.png
+# psana ground truth captured by tools/gt_capture.py (the .npy arrays are already
+# ignored above) -- regenerate it, never commit it.
+gt_*_manifest.json
 .pkgroot/
 .rundir/
 *.egg-info/
