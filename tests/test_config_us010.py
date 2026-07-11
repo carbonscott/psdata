@@ -42,6 +42,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG_PARENT = os.path.join(os.path.dirname(_HERE), "src")  # .../<repo>/src
 if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
+if _HERE not in sys.path:                          # for _skips (sibling module)
+    sys.path.insert(0, _HERE)
+
+from _skips import skip   # noqa: E402  (machine-readable skip records, HYG-03)
 
 # Reference datasets -- live in the TEST, never in the library.
 EPIX_EXP = "ued1010667"
@@ -97,11 +101,12 @@ def test_import_purity_in_proc():
 
     A *sibling* test in this same process generates ground truth by importing
     psana, which would then show up in ``sys.modules`` here through no fault of
-    psdata's import chain (see the note in ``psdata.format``).  So the in-proc
-    check only asserts what psdata's own import could have introduced: if psana
-    was already loaded by a sibling we skip the sys.modules assertion and defer
-    to the authoritative fresh-interpreter check
-    (:func:`test_import_purity_subprocess`).
+    psdata's import chain (see the note in ``psdata.format``).  This test is
+    therefore run FIRST (see ``_ordered_tests``), before any sibling has had a
+    chance to import psana, so the assertion really runs.  If psana is somehow
+    already loaded we cannot assert anything meaningful and must SKIP -- and that
+    skip is not allowlisted, so it fails the suite (HYG-03) rather than quietly
+    scoring as a pass, as it did before the test order was pinned.
     """
     import psdata
     assert hasattr(psdata.Run, "seg_configs"), "Run.seg_configs missing"
@@ -109,12 +114,17 @@ def test_import_purity_in_proc():
     assert callable(psdata.format.read_config_object), \
         "format.read_config_object missing"
     if any(m in sys.modules for m in ("psana", "mpi4py", "h5py")):
-        print("SKIP in-proc purity: a sibling test already imported psana; "
-              "the fresh-interpreter subprocess check is authoritative")
-        return
+        return skip(
+            "config_inproc_purity_sibling_psana",
+            "a sibling check already imported psana into this process, so the "
+            "in-proc sys.modules purity assertion cannot distinguish psdata's "
+            "import chain from the oracle's; the purity tests must run before "
+            "any psana-importing sibling (test order is pinned in "
+            "_ordered_tests -- if this fired, that pin broke)")
     psdata.format.assert_no_framework_imports()
     for m in ("psana", "mpi4py", "h5py"):
         assert m not in sys.modules, f"{m} leaked into sys.modules on import"
+    print("[ok] in-proc purity: psdata + config accessor are numpy-only")
 
 
 # --------------------------------------------------------------------------
@@ -152,8 +162,11 @@ def test_epix_seg_configs_byte_exact():
     """epixquad trbit (4,) + asicPixelConfig (4,176,192) u8 are np.array_equal
     to psana's _seg_configs() for every segment."""
     if not _have_psana():
-        print("SKIP byte-exact: psana not importable (source psconda.sh)")
-        return
+        return skip(
+            "config_epix_seg_configs_psana_oracle",
+            "psana is not importable in this environment (source psconda.sh); "
+            "the byte-exact epixquad trbit / asicPixelConfig gate against "
+            "det.raw._seg_configs() -- the whole point of US-010 -- cannot run")
 
     # psdata accessor (numpy only)
     r = _open(EPIX_EXP, EPIX_RUN, EPIX_DIR)
@@ -217,9 +230,12 @@ def test_epix_seg_configs_config_on_later_transition_byte_exact():
         default -- otherwise the gain decode diverges from psana's calib.
     """
     if not _have_psana():
-        print("SKIP later-transition regression: psana not importable "
-              "(source psconda.sh)")
-        return
+        return skip(
+            "config_later_transition_psana_oracle",
+            "psana is not importable in this environment (source psconda.sh); "
+            "the config-on-BeginStep (ACTIVE config, last-wins) byte-exact "
+            "regression vs psana cannot run -- this is the guard for the "
+            "stateful _seg_configs bug, so it must not silently pass")
 
     # psdata accessor (numpy only) -- the bug made this return {}.
     r = _open(EPIX_BS_EXP, EPIX_BS_RUN, EPIX_BS_DIR)
@@ -303,22 +319,46 @@ def test_jungfrau_config_coverage():
               f"firmwareVersion {my_fv} matches psana")
     else:
         print(f"jungfrau coverage: config alg read for {JF_NSEG} segments "
-              f"({len(cfg_fields)} fields) -- psana cross-check skipped")
+              f"({len(cfg_fields)} fields)")
+        skip("config_jungfrau_psana_crosscheck",
+             "psana is not importable in this environment (source psconda.sh); "
+             "the jungfrau firmwareVersion cross-check against psana's "
+             "_seg_configs() did not run (the psdata-side coverage checks above "
+             "did)")
+
+
+# --------------------------------------------------------------------------
+# runner: purity FIRST, then the psana oracles
+# --------------------------------------------------------------------------
+# The in-proc purity check asserts that psdata's OWN import chain pulls in no
+# framework -- an assertion that is only meaningful before some sibling check
+# imports psana into this process to build ground truth.  Plain sorted() order
+# put the epix oracle first, so the purity check saw psana in sys.modules and
+# skipped itself on every production run -- silently, and scored as a pass.  Pin
+# the order instead (HYG-03).
+_PURITY_FIRST = ("test_import_purity_in_proc", "test_import_purity_subprocess")
+
+
+def _ordered_tests():
+    names = [n for n in sorted(globals())
+             if n.startswith("test_") and callable(globals()[n])]
+    first = [n for n in _PURITY_FIRST if n in names]
+    rest = [n for n in names if n not in first]
+    return [(n, globals()[n]) for n in first + rest]
 
 
 if __name__ == "__main__":
     failures = []
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {name}")
-            except AssertionError as e:
-                failures.append((name, e))
-                print(f"FAIL {name}: {e}")
-            except Exception as e:  # pragma: no cover
-                failures.append((name, e))
-                print(f"ERROR {name}: {type(e).__name__}: {e}")
+    for name, fn in _ordered_tests():
+        try:
+            fn()
+            print(f"PASS {name}")
+        except AssertionError as e:
+            failures.append((name, e))
+            print(f"FAIL {name}: {e}")
+        except Exception as e:  # pragma: no cover
+            failures.append((name, e))
+            print(f"ERROR {name}: {type(e).__name__}: {e}")
     if failures:
         print(f"\n{len(failures)} test(s) failed")
         sys.exit(1)

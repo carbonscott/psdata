@@ -194,6 +194,31 @@ production env. Because the package now lives under `src/`, the project root no
 longer shadows either import, so the old `.pkgroot`/`.rundir` symlink workaround
 is gone.
 
+**A skip is not a pass.** Each test file is one pass/fail unit (its exit code),
+but a file may also skip an individual *check* — it says so with a
+machine-readable record (`tests/_skips.py`):
+
+```
+##SKIP## <name> :: <reason>
+```
+
+`run_tests.sh` counts those, prints them in the tally
+(`N passed, M failed, S skipped`), and **exits nonzero unless every skip name is
+justified in [`tests/skips_allowed.txt`](tests/skips_allowed.txt)** — today, only
+the `torch` ones (torch is an optional extra, absent from the psconda env).
+A psana oracle that could not run therefore *fails* the suite instead of quietly
+scoring as a pass. Two things the suite needs before it can go green:
+
+```bash
+source /sdf/group/lcls/ds/ana/sw/conda2/manage/bin/psconda.sh   # or every oracle SKIPs
+PYTHONPATH=src python3 tools/gt_capture.py --out-dir .          # multi-chunk ground truth
+```
+
+`tools/gt_capture.py` regenerates the psana ground truth
+(`gt_mc35_*.npy` + `gt_mc35_manifest.json`) that the multi-chunk chunk-roll
+oracle in `tests/test_robust_us004.py` compares against; without it that oracle
+skips, and the suite fails.
+
 ## Reference dataset
 
 The acceptance tests cross-check against:

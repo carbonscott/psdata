@@ -43,6 +43,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG_PARENT = os.path.join(os.path.dirname(_HERE), "src")  # .../<repo>/src
 if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
+if _HERE not in sys.path:                          # for _skips (sibling module)
+    sys.path.insert(0, _HERE)
+
+from _skips import skip   # noqa: E402  (machine-readable skip records, HYG-03)
 
 # Reference datasets -- live in the TEST, never in the library.
 JF_EXP = "mfx100848724"
@@ -90,10 +94,12 @@ def test_import_purity_in_proc():
 
     A *sibling* test in this same process generates ground truth by importing
     psana, which would then show up in ``sys.modules`` here through no fault of
-    psdata's import chain.  So the in-proc check only asserts what psdata's own
-    import could have introduced: if psana was already loaded by a sibling we
-    skip the sys.modules assertion and defer to the authoritative
-    fresh-interpreter check (:func:`test_import_purity_subprocess`).
+    psdata's import chain.  This test is therefore run FIRST (see
+    ``_ordered_tests``), before any sibling has had a chance to import psana, so
+    the assertion really runs.  If psana is somehow already loaded we cannot
+    assert anything meaningful and must SKIP -- and that skip is not allowlisted,
+    so it fails the suite (HYG-03) rather than quietly scoring as a pass, as it
+    did before the test order was pinned.
     """
     import psdata
     assert hasattr(psdata.Run, "uniqueid"), "Run.uniqueid missing"
@@ -106,12 +112,17 @@ def test_import_purity_in_proc():
 
     # A sibling test in this same process imports psana to generate ground
     # truth, which would then appear in sys.modules through no fault of psdata's
-    # import chain.  So skip the in-proc assertion if psana is already present
-    # and defer to the authoritative fresh-interpreter subprocess check.
+    # import chain.  The purity checks are pinned to run FIRST so that cannot
+    # happen; if it does, the assertion is unmakeable and we must SKIP -- loudly
+    # (the skip is not allowlisted, so it fails the suite).
     if any(m in sys.modules for m in ("psana", "mpi4py", "h5py")):
-        print("SKIP in-proc purity: a sibling test already imported psana; "
-              "the fresh-interpreter subprocess check is authoritative")
-        return
+        return skip(
+            "uniqueid_inproc_purity_sibling_psana",
+            "a sibling check already imported psana into this process, so the "
+            "in-proc sys.modules purity assertion cannot distinguish psdata's "
+            "import chain from the oracle's; the purity tests must run before "
+            "any psana-importing sibling (test order is pinned in "
+            "_ordered_tests -- if this fired, that pin broke)")
     psdata.format.assert_no_framework_imports()
     bad = [m for m in ("psana", "mpi4py", "h5py", "dgram", "pymongo")
            if m in sys.modules]
@@ -160,9 +171,11 @@ def test_jungfrau_uniqueid_byte_exact():
     assert len(det.seg_detids) == JF_NSEG, sorted(det.seg_detids)
 
     if not _have_psana():
-        print(f"SKIP byte-exact: psana not importable (source psconda.sh); "
-              f"psdata uniqueid[:40]={my_uid[:40]}...")
-        return
+        return skip(
+            "uniqueid_jungfrau_psana_oracle",
+            f"psana is not importable in this environment (source psconda.sh); "
+            f"the byte-exact jungfrau uniqueid gate vs det.raw._uniqueid did not "
+            f"run (psdata-side id built: {my_uid[:40]}...)")
     ps_uid = _psana_uniqueid(JF_EXP, JF_RUN, JF_DIR, JF_DET)
     assert my_uid == ps_uid, (
         f"jungfrau uniqueid differs:\n  psdata={my_uid}\n  psana ={ps_uid}")
@@ -185,9 +198,11 @@ def test_epix10ka_uniqueid_byte_exact():
     assert my_uid.count("_") == EPIX_NSEG, my_uid
 
     if not _have_psana():
-        print(f"SKIP byte-exact: psana not importable (source psconda.sh); "
-              f"psdata uniqueid[:40]={my_uid[:40]}...")
-        return
+        return skip(
+            "uniqueid_epix10ka_psana_oracle",
+            f"psana is not importable in this environment (source psconda.sh); "
+            f"the byte-exact epixquad uniqueid gate vs det.raw._uniqueid did not "
+            f"run (psdata-side id built: {my_uid[:40]}...)")
     ps_uid = _psana_uniqueid(EPIX_EXP, EPIX_RUN, EPIX_DIR, EPIX_DET)
     assert my_uid == ps_uid, (
         f"epixquad uniqueid differs:\n  psdata={my_uid}\n  psana ={ps_uid}")
@@ -211,8 +226,11 @@ def test_non_epix_coverage_is_byte_exact():
     my_uid = r.uniqueid(JF_DET)
     assert "epix" not in my_uid, my_uid
     if not _have_psana():
-        print("non-epix coverage: jungfrau id built; psana cross-check skipped")
-        return
+        return skip(
+            "uniqueid_nonepix_psana_crosscheck",
+            "psana is not importable in this environment (source psconda.sh); "
+            "the non-epix (jungfrau) uniqueid cross-check against psana did not "
+            "run -- only the psdata-side structural checks did")
     ps_uid = _psana_uniqueid(JF_EXP, JF_RUN, JF_DIR, JF_DET)
     assert my_uid == ps_uid, "jungfrau (non-epix) uniqueid != psana"
     print("non-epix coverage: jungfrau uniqueid byte-exact vs psana")
@@ -238,8 +256,11 @@ def test_accessor_is_generic_structurally():
     r = _open(EPIX_EXP, EPIX_RUN, EPIX_DIR)
     ts_names = r.find_detector_by_type(TS_DET_TYPE)
     if not ts_names:
-        print(f"SKIP: no det_type={TS_DET_TYPE!r} in {EPIX_EXP}/r{EPIX_RUN}")
-        return
+        return skip(
+            "uniqueid_ts_detector_absent",
+            f"no detector of det_type={TS_DET_TYPE!r} in {EPIX_EXP}/r{EPIX_RUN}, "
+            f"so the third (non-jungfrau, non-epix) detector family that proves "
+            f"the accessor is generic was never exercised")
     ts_det = ts_names[0]
     my_uid = r.uniqueid(ts_det)
     det = r.detector(ts_det)
@@ -251,19 +272,37 @@ def test_accessor_is_generic_structurally():
           f"uniqueid={my_uid!r} -- reconstructed from Names tables")
 
 
+# --------------------------------------------------------------------------
+# runner: purity FIRST, then the psana oracles
+# --------------------------------------------------------------------------
+# The in-proc purity check asserts that psdata's OWN import chain pulls in no
+# framework -- only meaningful before some sibling check imports psana into this
+# process to build ground truth.  Plain sorted() order put an oracle first, so
+# the purity check saw psana in sys.modules and skipped itself on every
+# production run -- silently, and scored as a pass.  Pin the order (HYG-03).
+_PURITY_FIRST = ("test_import_purity_in_proc", "test_import_purity_subprocess")
+
+
+def _ordered_tests():
+    names = [n for n in sorted(globals())
+             if n.startswith("test_") and callable(globals()[n])]
+    first = [n for n in _PURITY_FIRST if n in names]
+    rest = [n for n in names if n not in first]
+    return [(n, globals()[n]) for n in first + rest]
+
+
 if __name__ == "__main__":
     failures = []
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {name}")
-            except AssertionError as e:
-                failures.append((name, e))
-                print(f"FAIL {name}: {e}")
-            except Exception as e:  # pragma: no cover
-                failures.append((name, e))
-                print(f"ERROR {name}: {type(e).__name__}: {e}")
+    for name, fn in _ordered_tests():
+        try:
+            fn()
+            print(f"PASS {name}")
+        except AssertionError as e:
+            failures.append((name, e))
+            print(f"FAIL {name}: {e}")
+        except Exception as e:  # pragma: no cover
+            failures.append((name, e))
+            print(f"ERROR {name}: {type(e).__name__}: {e}")
     if failures:
         print(f"\n{len(failures)} test(s) failed")
         sys.exit(1)
