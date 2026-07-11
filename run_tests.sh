@@ -81,6 +81,7 @@ if [[ ${#TESTS[@]} -eq 0 && "${PSDATA_NO_DEFAULT_TESTS:-}" != "1" ]]; then
     "$REPO/tests/test_envstore_us013.py"
     "$REPO/tests/test_gate07_bench_committed.py"
     "$REPO/tests/test_gate06_detector_stream_covered.py"
+    "$REPO/tests/test_write02_dgram_damage.py"
     "$REPO/tests/test_runner_hygiene_hyg03.py"
   )
 fi

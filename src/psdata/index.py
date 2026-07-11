@@ -895,18 +895,21 @@ class RunIndex:
         entry = self.entries[k]
 
         seg_index = {}
+        stream_damage = {}                       # WRITE-02: dgram-top damage
         service = _s.SERVICE_L1ACCEPT
         for stream in sorted(entry):
             chunk_path, offset, size = entry[stream]
             fd = self._bd_fd(chunk_path)
             raw = os.pread(fd, size, offset)
             service = self._assemble_stream_dgram(
-                stream, chunk_path, offset, size, raw, ts, seg_index)
+                stream, chunk_path, offset, size, raw, ts, seg_index,
+                stream_damage)
 
-        return _s.Event(ts, service, self.run_config, seg_index)
+        return _s.Event(ts, service, self.run_config, seg_index,
+                        stream_damage=stream_damage)
 
     def _assemble_stream_dgram(self, stream, chunk_path, offset, size, raw, ts,
-                               seg_index):
+                               seg_index, stream_damage=None):
         """Validate one stream's ``pread``-ed bigdata dgram bytes for event
         ``ts`` and index its ShapesData into ``seg_index`` (in place).  Returns
         the dgram's service.
@@ -934,6 +937,11 @@ class RunIndex:
         snap_h["_total"] = size
         tables = self.run_config.raw_tables[stream]
         _s._index_dgram(buf, 0, snap_h, tables, seg_index)
+        # WRITE-02: record this stream's DGRAM-TOP Xtc.damage word so the
+        # assembled Event reports the same damage the forward path does (a
+        # random-access read must not be blind where streaming is not).
+        if stream_damage is not None:
+            stream_damage[stream] = h["damage"]
         return h["service"]
 
     # -- batch random read (US-009) ---------------------------------------
@@ -1143,6 +1151,7 @@ class RunIndex:
 
         # Per-event accumulators, filled as the coalesced reads complete.
         seg_indexes = {k: {} for k in order}
+        stream_damages = {k: {} for k in order}   # WRITE-02: dgram-top damage
         services = {k: _s.SERVICE_L1ACCEPT for k in order}
 
         for chunk_path in sorted(reads_by_chunk):
@@ -1176,16 +1185,19 @@ class RunIndex:
                 for offset, size, k, stream in group:
                     local = offset - start
                     raw = view[local:local + size]
+                    # WRITE-02: thread stream_damages[k] so the coalesced batch
+                    # path surfaces the dgram-top damage word exactly as the
+                    # serial read_event_at path does.
                     services[k] = self._assemble_stream_dgram(
                         stream, chunk_path, offset, size, raw,
-                        self.timestamps[k], seg_indexes[k])
+                        self.timestamps[k], seg_indexes[k], stream_damages[k])
                 # release the merged buffer promptly (peak transient O(span))
                 view.release()
                 del merged
 
         built = {
             k: _s.Event(self.timestamps[k], services[k], self.run_config,
-                        seg_indexes[k])
+                        seg_indexes[k], stream_damage=stream_damages[k])
             for k in order
         }
         return [built[k] for k in ks]
