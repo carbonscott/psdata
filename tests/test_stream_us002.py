@@ -20,9 +20,11 @@ Verifies the acceptance criteria:
   5. Importing psdata / psdata.stream does not import psana, mpi4py, or h5py.
   6. Forward streaming is gated to the SMD/psana event set: on the reference
      run's ragged DAQ-shutdown tail the ungated k-way merge would surface 17982
-     bigdata L1Accepts against the 17872 the SMD writer indexed.  This check is
-     SLOW (one full forward pass over a 10-stream Jungfrau run) and it ALWAYS
-     runs -- no environment variable can turn it off.
+     bigdata L1Accepts against the 17872 the SMD writer indexed.  The indexed
+     count is pinned to that absolute oracle value (N_INDEXED), so the check
+     cannot degrade into psdata agreeing with psdata.  It is SLOW (one full
+     forward pass over a 10-stream Jungfrau run) and it ALWAYS runs -- no
+     environment variable can turn it off.
 
 Needs the production psana env (psconda.sh) on host sdfiana025 to generate
 ground truth.
@@ -46,6 +48,11 @@ RUN = 51
 DIR = "/sdf/data/lcls/ds/prj/public01/xtc"
 N_EVENTS = 20
 JUNGFRAU = "jungfrau"
+# Oracle: the number of L1Accepts the SMD writer indexed for this run (psana
+# yields exactly these).  The bigdata streams carry 17982 -- 110 more -- because
+# of the ragged DAQ-shutdown tail.  Pinned as an absolute so the section-6 gate
+# is an ORACLE check and not psdata-vs-psdata self-consistency; see below.
+N_INDEXED = 17872
 
 
 def _stream_files():
@@ -242,6 +249,17 @@ def test_byte_exact_first_20_vs_psana():
 #    was still counted a pass.  The env var is no longer consulted here, and
 #    tests/test_gate02_gated_forward.py pins that: it sets PSDATA_SKIP_SLOW=1 and
 #    demands a real event count back from this function.
+#
+#    NOTE on what actually makes this a gate.  Run.events() filters the merge by
+#    frozenset(self.build_index().timestamps) -- the SAME cached index object this
+#    test reads.  So `evt.timestamp in valid` can never fire, and `n == nidx` is
+#    self-consistency, not truth: if build_index() ever regressed to a SUBSET
+#    (say 5 timestamps), then n == nidx == 5 and the check would sail through
+#    green.  The absolute pin against N_INDEXED below is what turns this from
+#    psdata-vs-psdata into an ORACLE check -- it is the only assertion here that
+#    consults a number psana produced.  It also catches build_index(source="auto")
+#    silently falling back to a bigdata scan when the SMD sidecars are missing,
+#    which would otherwise leave the gate validating that scan against itself.
 # --------------------------------------------------------------------------
 def test_forward_gated_to_index_event_set():
     """Walk the full gated forward pass; return the number of events walked.
@@ -253,6 +271,14 @@ def test_forward_gated_to_index_event_set():
     r = psdata.open(exp=EXP, run=RUN, dir=DIR)
     valid = set(r.build_index().timestamps)
     nidx = len(valid)
+    # ORACLE pin, checked BEFORE the (very expensive) forward pass: the index
+    # itself must still be the psana/SMD event set.  Without this the rest of the
+    # test only proves psdata agrees with psdata.  Fails fast -- no reason to
+    # stream the run if the set we would gate against has already regressed.
+    assert nidx == N_INDEXED, (
+        f"SMD index has {nidx} events, expected {N_INDEXED} for {EXP}/r{RUN} -- "
+        "the index itself regressed (a subset here would make the gate below "
+        "pass vacuously against its own shrunken event set)")
     n = 0
     last = None
     for evt in r.events():                       # default gate=True
@@ -271,10 +297,11 @@ def test_forward_gated_to_index_event_set():
     # If the gate were removed, Run.events() would yield the raw bigdata count
     # (17982 on this run) instead of the indexed 17872 -- so this single equality
     # decisively catches a gate regression without a second (slow) ungated pass.
+    # Pinned to N_INDEXED above, this is now an absolute, not a relative, claim.
     assert n == nidx, (
         f"gated forward yielded {n} events but the SMD index has {nidx} -- "
         "Run.events() is no longer gated to the SMD/psana event set")
-    print(f"gated forward == index event set ({n} events); "
+    print(f"gated forward == index event set ({n} events, oracle {N_INDEXED}); "
           "shutdown-tail stragglers excluded")
     return n
 
@@ -293,9 +320,14 @@ def main():
     print("[ok] byte-exact vs psana (ts + pulseId + raw, first 20)")
     # The (slow) full gated forward pass, driven exactly ONCE here.  It no longer
     # honours PSDATA_SKIP_SLOW; tests/test_gate02_gated_forward.py is the
-    # regression that pins that it cannot skip itself.
-    test_forward_gated_to_index_event_set()
-    print("[ok] forward streaming gated to SMD/psana event set")
+    # regression that pins that it cannot skip itself.  Check the returned count
+    # rather than discarding it: that is the whole point of returning n, and it
+    # is what stops this file sliding back to "printed SKIP, exited 0, counted a
+    # pass" if the escape hatch is ever re-added.  Costs no wall-clock.
+    n = test_forward_gated_to_index_event_set()
+    assert isinstance(n, int) and not isinstance(n, bool) and n > 0, \
+        f"gated-forward check did not run (returned {n!r}) -- see GATE-02"
+    print(f"[ok] forward streaming gated to SMD/psana event set ({n} events)")
     print("\nALL US-002 ACCEPTANCE CHECKS PASSED")
 
 
