@@ -43,6 +43,7 @@ imports **no** psana / mpi4py / h5py (only the standard library and numpy; see
 
 import glob
 import os
+import struct
 
 from . import format as _f
 from . import stream as _s
@@ -70,10 +71,19 @@ class GateBuildError(RuntimeError):
     """
 
 
-# Index-build failures we know how to explain.  Anything outside this set is a
-# genuinely unexpected error (e.g. a programming bug) and is deliberately left
-# to propagate raw -- which is still fail-closed -- rather than be swallowed.
-_INDEX_BUILD_ERRORS = (OSError, ValueError, KeyError, IndexError)
+# Index-build failures we know how to explain -- i.e. EXPECTED ways a gate
+# build can fail, each re-wrapped into a GateBuildError that names the
+# gate=False remedy.  This spans: I/O (OSError), malformed values / bad
+# ``source`` (ValueError), config/stream lookup mismatches (KeyError,
+# IndexError), a present-but-malformed SMD sidecar (index.py raises
+# ``RuntimeError`` when a sidecar has no smdinfo table), and a corrupt Configure
+# whose header unpack fails (``struct.error``).  ``RuntimeError`` also covers a
+# genuine programming bug, but that stays fully debuggable: it is re-raised as a
+# GateBuildError *chained* to the original (``raise ... from exc``), so the
+# traceback and cause survive.  Anything outside this set propagates raw --
+# still fail-closed, just unwrapped.
+_INDEX_BUILD_ERRORS = (
+    OSError, ValueError, KeyError, IndexError, RuntimeError, struct.error)
 
 
 class _AlgNamespace:
