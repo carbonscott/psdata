@@ -952,6 +952,72 @@ class RunIndex:
     #: ``max_bytes=None`` disables the guard).
     DEFAULT_READ_MEM_LIMIT = 2 * 1024 ** 3   # 2 GiB
 
+    # -- coalesced-read tunables (PERF-01) --------------------------------
+    # Within one bigdata chunk file the per-(event, stream) dgram reads are
+    # sorted by ascending offset (see :meth:`read_events`) and then MERGED into a
+    # single ``os.pread`` over the covering byte span, sliced back to the exact
+    # per-dgram bytes -- so K contiguous events over S streams cost far fewer than
+    # K x S syscalls (the pre-PERF-01 path issued exactly one ``pread`` per pair,
+    # no merge at all).  Two caps keep the merge bounded and byte-exact:
+    #
+    #   * ``_COALESCE_MAX_GAP`` -- the largest run of *unwanted* bytes (a
+    #     transition dgram, or a hole between non-consecutive events) the merge
+    #     will read-and-discard to bridge two needed dgrams.  A wider hole splits
+    #     the reads, so a SPARSE random batch never reads big holes -- only
+    #     genuinely near-adjacent dgrams (consecutive events in a stream, which
+    #     are contiguous on disk) coalesce.  Bounds wasted I/O per merge.
+    #   * ``_COALESCE_MAX_SPAN`` -- the largest single merged ``pread`` buffer.
+    #     A long contiguous run is split into <=span-sized reads so peak transient
+    #     memory stays O(span) (a constant, on top of MEM-01's per-batch bound on
+    #     the *materialized* event bytes), never O(len(ks)).  A single dgram larger
+    #     than the cap is still read whole (one pread), since a dgram is the
+    #     indivisible unit -- the cap only limits how many are MERGED together.
+    _COALESCE_MAX_GAP = 1 << 16              # 64 KiB of bridgeable gap per merge
+    _COALESCE_MAX_SPAN = 128 * 1024 ** 2     # 128 MiB cap on one merged buffer
+
+    @classmethod
+    def _coalesce_reads(cls, reads):
+        """Group per-dgram reads whose byte ranges are contiguous or near-adjacent
+        into merge groups, each served by ONE ``os.pread``.
+
+        ``reads`` is a list of ``(offset, size, k, stream)`` for a SINGLE chunk
+        file (so all offsets index the same fd), pre-sorted ascending by offset
+        (dgrams within one chunk are disjoint, so offsets are strictly increasing
+        and never overlap).  Yields lists of the input tuples; every tuple in a
+        yielded group has its bytes inside the group's covering span
+        ``[group[0].offset, max(offset+size))`` and the spans of successive groups
+        are disjoint and ascending, so slicing one merged buffer per group
+        reconstructs each dgram's bytes exactly.
+
+        A read is appended to the current group iff the gap from the group's
+        current end to this read's offset is within ``_COALESCE_MAX_GAP`` AND the
+        resulting span stays within ``_COALESCE_MAX_SPAN``; otherwise the group is
+        flushed and a new one begins.  A lone dgram bigger than the span cap forms
+        its own single-read group (read whole, as before)."""
+        group = []
+        g_start = 0
+        g_end = 0
+        for r in reads:
+            off, size = r[0], r[1]
+            if not group:
+                group = [r]
+                g_start = off
+                g_end = off + size
+                continue
+            gap = off - g_end
+            new_end = off + size if off + size > g_end else g_end
+            if (0 <= gap <= cls._COALESCE_MAX_GAP
+                    and (new_end - g_start) <= cls._COALESCE_MAX_SPAN):
+                group.append(r)
+                g_end = new_end
+            else:
+                yield group
+                group = [r]
+                g_start = off
+                g_end = off + size
+        if group:
+            yield group
+
     def _estimate_read_bytes(self, ks, dedupe=True):
         """Cheap, index-only upper bound (NO I/O) on the bytes a single
         all-at-once materialization of ``ks`` will hold: the summed indexed
@@ -1081,11 +1147,41 @@ class RunIndex:
 
         for chunk_path in sorted(reads_by_chunk):
             fd = self._bd_fd(chunk_path)
-            for offset, size, k, stream in sorted(reads_by_chunk[chunk_path]):
-                raw = os.pread(fd, size, offset)
-                services[k] = self._assemble_stream_dgram(
-                    stream, chunk_path, offset, size, raw,
-                    self.timestamps[k], seg_indexes[k])
+            reads = sorted(reads_by_chunk[chunk_path])
+            # PERF-01: REAL coalescing.  Merge the ascending per-dgram reads into
+            # runs whose byte ranges are contiguous/near-adjacent, issue ONE
+            # ``os.pread`` over each run's covering span, then slice the returned
+            # buffer back to each dgram's exact bytes.  A merged slice
+            # ``span[off - start : off - start + size]`` is byte-for-byte the same
+            # as ``os.pread(fd, size, off)`` (a plain read of a covering region
+            # and a sub-read of it return identical bytes for a file that is not
+            # mutated during the batch), so the assembled events are byte-
+            # identical to the serial path -- only the syscall COUNT drops.
+            for group in self._coalesce_reads(reads):
+                start = group[0][0]
+                last_off, last_size = group[-1][0], group[-1][1]
+                span = (last_off + last_size) - start
+                merged = os.pread(fd, span, start)
+                if len(merged) != span:
+                    # A short read over the merged span means at least one dgram
+                    # in the group is truncated on disk; surface it per dgram
+                    # (with the offset/size context) exactly as a serial short
+                    # read would, rather than reporting the whole span.
+                    raise RuntimeError(
+                        f"short read at offset {start} of "
+                        f"{os.path.basename(chunk_path)} (coalesced span "
+                        f"{span}, got {len(merged)}) -- a batched dgram is "
+                        f"truncated")
+                view = memoryview(merged)
+                for offset, size, k, stream in group:
+                    local = offset - start
+                    raw = view[local:local + size]
+                    services[k] = self._assemble_stream_dgram(
+                        stream, chunk_path, offset, size, raw,
+                        self.timestamps[k], seg_indexes[k])
+                # release the merged buffer promptly (peak transient O(span))
+                view.release()
+                del merged
 
         built = {
             k: _s.Event(self.timestamps[k], services[k], self.run_config,
