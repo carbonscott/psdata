@@ -25,20 +25,37 @@ event, ``searchsorted(begin_ts, ts, 'right') - 1``):
 while the default single-value ``run.seg_configs(det)`` is UNCHANGED (byte-exact
 for a single-step run, where the config is constant).
 
-SELF-CONTAINED: stdlib + numpy only -- NO psana, NO SLAC data.  Building a
-multi-step xtc2 file byte-for-byte (Configure Names tables + per-BeginStep
-config ShapesData + interleaved L1Accepts) is out of proportion for a tight,
-targeted probe, so -- per the task's stated fallback -- this exercises the
-per-step active-config SELECTION logic DIRECTLY: it constructs a ``Run`` and
-pre-populates its per-step config table (the exact structure ``run.py`` builds
-from the run's BeginStep dgrams -- ``[(begin_step_ts, {seg: {field: value}}),
-...]`` ordered by step), then drives the PUBLIC accessors and asserts they pick
-the right step.  The file I/O that fills that table on a real run is covered by
-the psana oracle (``tests/test_config_us010.py``); here we pin the selection.
+This file has TWO complementary legs:
+
+A. A LOCAL SYNTHETIC leg (stdlib + numpy only -- NO psana, NO SLAC data) that
+   pins the per-step active-config SELECTION logic.  Building a multi-step xtc2
+   file byte-for-byte (Configure Names tables + per-BeginStep config ShapesData
+   + interleaved L1Accepts) is out of proportion for a tight probe, so -- per
+   the task's stated fallback -- it constructs a ``Run`` and pre-populates its
+   per-step config table (the exact structure ``run.py`` builds from the run's
+   BeginStep dgrams -- ``[(begin_step_ts, {seg: {field: value}}), ...]`` ordered
+   by step), then drives the PUBLIC accessors and asserts they pick the right
+   step.  This leg exercises the SELECTION only, NOT the table-BUILDING I/O.
+
+B. A PSANA-ORACLE leg (``test_cal02_psana_oracle_uedcom103_r7``) that exercises
+   the table-BUILDING I/O end-to-end -- ``_seg_config_steps`` /
+   ``_read_config_dgram``, the ``env_records`` BeginStep read, the overlay
+   accumulation, the ``is_begin_step`` gate, and ``n_config_steps``' real count
+   -- by opening the KNOWN multi-step run ``uedcom103 / r7`` and comparing
+   ``seg_configs(det, step=k)`` (built from the REAL BeginStep dgrams, cache NOT
+   pre-populated) against psana's stateful ``det.raw._seg_configs()`` advanced to
+   each step.  It is gated on psana availability via the suite skip protocol
+   (``tests/_skips.py``): it SKIPS cleanly when psana is absent (local runs) and
+   RUNS on the milano gate / full suite, where psana + the r7 data are present.
+   (Leg A does NOT cover this I/O, and the single-value ``seg_configs`` oracle in
+   ``test_config_us010.py`` does not touch the per-step path -- so without leg B
+   a BeginStep dgram that failed to carry this detector's config ShapesData would
+   silently collapse every step to step 0's config, uncaught.  Leg B closes
+   that gap: the run's two distinct ``trbit`` values would expose the collapse.)
 
 cwd-robust; ``main()`` / ``__main__``.
 
-Parent vs fix (the probe's discriminating power):
+Parent vs fix (the probe's discriminating power, leg A):
   * On the FIX, ``seg_configs(det, step=2)`` / ``seg_configs_at`` /
     ``seg_configs(det, evt=...)`` return step 2's ``trbit=(1,1,1,1)`` -- NOT
     step 1's ``(0,0,0,0)`` -- and the single-step case returns its one config
@@ -61,11 +78,25 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(os.path.dirname(_HERE), "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
+if _HERE not in sys.path:                      # for _skips (sibling module)
+    sys.path.insert(0, _HERE)
 
 from psdata.run import Run  # noqa: E402
+from _skips import skip     # noqa: E402  (machine-readable skip records, HYG-03)
 
 _DET = "epixquad"
 _ALG = "config"
+
+# Reference multi-step dataset -- lives in the TEST, never in the library.
+# uedcom103/r7: an epixquad run whose active trbit takes TWO distinct values
+# across its DAQ steps ([(0,0,0,0),(1,1,1,1)]); the same run test_config_us010
+# uses for the single-value BeginStep-override regression (EPIX_BS_*), here
+# driven PER STEP.  (Matrix / EXEC:31300389.)
+ORACLE_EXP = "uedcom103"
+ORACLE_RUN = 7
+ORACLE_DIR = "/sdf/data/lcls/ds/prj/public01/xtc"
+ORACLE_DET = "epixquad"
+ORACLE_SEGS = [0, 1, 2, 3]
 
 
 def _u8(values):
@@ -254,16 +285,128 @@ def test_argument_hygiene():
           "ValueError")
 
 
+# ==========================================================================
+# 7. PSANA ORACLE (milano gate / full suite only -- SKIPS cleanly if psana is
+#    absent): the REAL per-step table, built end-to-end from the run's BeginStep
+#    dgrams, must match psana's stateful _seg_configs advanced to each step.
+#
+#    This is the ONLY end-to-end check of CAL-02's table BUILD -- it drives
+#    _seg_config_steps / _read_config_dgram / the env_records BeginStep read /
+#    the overlay accumulation / the is_begin_step gate / n_config_steps, none of
+#    which the synthetic legs above (which pre-populate the cache) or the
+#    single-value oracle in test_config_us010.py touch.  The cache is NOT
+#    pre-populated here: the public accessors do the real file I/O.
+# ==========================================================================
+def test_cal02_psana_oracle_uedcom103_r7():
+    """Per-step active config built from REAL BeginStep dgrams == psana's
+    stateful ``det.raw._seg_configs()`` advanced to each step, for every segment.
+
+    ``_seg_configs()`` is stateful (see test_config_us010): it starts at the
+    Configure default and each ``BeginStep`` the DataSource crosses overrides it
+    (last-wins).  So the config ACTIVE for step k -- the value psana's per-event
+    ``det.raw.calib`` uses -- is what ``_seg_configs()`` reports once advanced to
+    a step-k event.  uedcom103/r7's active ``trbit`` takes two distinct values
+    across its steps, so this genuinely distinguishes a correct per-step build
+    from a table that silently collapsed every step to step 0's config.
+    """
+    try:
+        import psana  # noqa: F401
+    except Exception:
+        return skip(
+            "cal02_multistep_psana_oracle",
+            "psana is not importable in this environment (source psconda.sh); "
+            "the per-step table-BUILD oracle for CAL-02 -- the REAL "
+            "_seg_config_steps / _read_config_dgram / env_records path vs "
+            "psana's stateful _seg_configs advanced per step, the only "
+            "end-to-end check of the multi-step config build -- cannot run and "
+            "must not silently pass")
+
+    import psdata
+    from psana import DataSource
+
+    # -- psana ground truth: the ACTIVE (trbit, asicPixelConfig) per DAQ step --
+    # Fully iterate each step's events (the documented psana2 nesting) but pin
+    # the active config on the FIRST event of the step; draining keeps the step
+    # boundaries clean rather than breaking mid-step.
+    ds = DataSource(exp=ORACLE_EXP, run=ORACLE_RUN, dir=ORACLE_DIR)
+    prun = next(ds.runs())
+    det = prun.Detector(ORACLE_DET)
+
+    psana_steps = []            # per step: (first_event_ts, {seg: (trbit, apc)})
+    for pstep in prun.steps():
+        active = None
+        first_ts = None
+        for i, pevt in enumerate(pstep.events()):
+            if i == 0:
+                det.raw.calib(pevt)        # advance stateful _seg_configs here
+                sc = det.raw._seg_configs()
+                active = {seg: (np.asarray(sc[seg].config.trbit).copy(),
+                                np.asarray(sc[seg].config.asicPixelConfig).copy())
+                          for seg in sorted(sc)}
+                first_ts = int(pevt.timestamp)
+            # keep draining this step's events (no work) to stay step-aligned
+        if active is not None:
+            psana_steps.append((first_ts, active))
+
+    assert psana_steps, "psana yielded no steps/events for uedcom103/r7"
+
+    # The run MUST show a real config change across steps, else the oracle can't
+    # tell a correct per-step build from a collapse-to-step-0 (all identical).
+    distinct_trbit = {tuple(int(x) for x in active[ORACLE_SEGS[0]][0])
+                      for _ts, active in psana_steps}
+    assert len(distinct_trbit) >= 2, (
+        f"uedcom103/r7 no longer shows >1 distinct trbit across steps "
+        f"(saw {sorted(distinct_trbit)}); the per-step oracle is toothless -- "
+        f"choose a run whose config actually changes across steps")
+
+    # -- psdata: build the REAL per-step table via the PUBLIC accessors --------
+    # (cache is NOT pre-populated -- this drives _seg_config_steps end-to-end.)
+    r = psdata.open(exp=ORACLE_EXP, run=ORACLE_RUN, dir=ORACLE_DIR)
+    n = r.n_config_steps(ORACLE_DET)
+    assert n == len(psana_steps), (
+        f"psdata found {n} config step(s) but psana iterated "
+        f"{len(psana_steps)} -- the BeginStep gate/count disagree")
+
+    for k, (ts, active) in enumerate(psana_steps):
+        by_step = r.seg_configs(ORACLE_DET, step=k)          # by step index
+        by_evt = r.seg_configs(ORACLE_DET, evt=ts)           # as-of a real event
+        assert sorted(by_step) == ORACLE_SEGS, (k, sorted(by_step))
+        assert sorted(by_evt) == ORACLE_SEGS, (k, sorted(by_evt))
+        for seg in ORACLE_SEGS:
+            ps_trbit, ps_apc = active[seg]
+            for label, scfg in (("step=%d" % k, by_step), ("evt@ts", by_evt)):
+                my_trbit = np.asarray(scfg[seg].config.trbit)
+                my_apc = np.asarray(scfg[seg].config.asicPixelConfig)
+                assert np.array_equal(my_trbit, ps_trbit), (
+                    f"step {k} seg {seg} [{label}]: psdata trbit {my_trbit} != "
+                    f"psana active {ps_trbit} -- the per-step table build is "
+                    f"WRONG (this is the CAL-02 collapse-to-step-0 bug)")
+                assert np.array_equal(my_apc, ps_apc), (
+                    f"step {k} seg {seg} [{label}]: asicPixelConfig differs "
+                    f"from psana's active config")
+        print(f"[ok] step {k}: trbit "
+              f"{tuple(int(x) for x in active[ORACLE_SEGS[0]][0])} matches psana "
+              f"active (step= and evt= agree, all {len(ORACLE_SEGS)} segs)")
+
+    print(f"[ok] uedcom103/r7 PSANA ORACLE: {n} steps, "
+          f"{len(distinct_trbit)} distinct trbit value(s) across steps; the "
+          f"REAL per-step build is byte-exact vs psana _seg_configs "
+          f"(step= and evt= paths)")
+
+
 def main():
     print("=" * 72)
     print("CAL-02: per-step ACTIVE detector config must be addressable")
     print("=" * 72)
+    # Local synthetic leg -- pins the SELECTION logic (no psana, no data).
     test_step2_event_uses_step2_trbit()
     test_per_step_access()
     test_asof_event_to_step()
     test_single_step_unchanged()
     test_return_shape_matches_single_value()
     test_argument_hygiene()
+    # Cluster oracle leg -- pins the real table BUILD (skips cleanly w/o psana).
+    test_cal02_psana_oracle_uedcom103_r7()
     print()
     print("ALL CAL-02 CHECKS PASSED")
 
