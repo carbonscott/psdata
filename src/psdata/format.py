@@ -25,12 +25,29 @@ The format constants and the five functions named in the acceptance criteria
 ``parse_configure``, ``extract_field``) are the same as in ``psdata.py``.
 """
 
+import math
 import os
 import re
 import struct
 import sys
 
 import numpy as np
+
+
+class XtcFormatError(ValueError):
+    """Raised when on-disk xtc2 bytes are inconsistent with the format.
+
+    This is the always-on validation error for *untrusted input*.  Unlike a
+    bare ``assert`` -- which ``python -O`` / ``PYTHONOPTIMIZE`` strips, leaving
+    the parser with **no** validation at all -- an :class:`XtcFormatError` is
+    raised unconditionally, on every run and every optimization level.  Its
+    message names the offending field / byte offset and the expected-vs-found
+    values so it can be pasted straight into a bug report.
+
+    It subclasses :class:`ValueError` so existing ``except ValueError`` /
+    ``except Exception`` handlers keep degrading exactly as before.
+    """
+
 
 # ==========================================================================
 # xtc2 byte-layout constants (little-endian, verified) -- from psdata.py
@@ -199,7 +216,14 @@ def parse_configure(buf):
     :func:`iter_shapesdata` uses for ShapesData -- so no declared detector
     (e.g. ``scan``) is missed.  Return signature is unchanged."""
     cfg = parse_dgram_header(buf, 0)
-    assert cfg["service"] == SERVICE_CONFIGURE, "front dgram is not Configure"
+    # Validate untrusted input with an always-on check, never a bare `assert`
+    # (which `python -O` strips): the front dgram of every stream MUST be a
+    # Configure transition, else the Names-table walk below is meaningless.
+    if cfg["service"] != SERVICE_CONFIGURE:
+        raise XtcFormatError(
+            f"front dgram at offset 0 is not a Configure transition: "
+            f"service field = {cfg['service']} "
+            f"(expected SERVICE_CONFIGURE = {SERVICE_CONFIGURE})")
     top_payload = DGRAM_HDR                       # 24
     top_end = XTC_HDR + cfg["extent"]             # dgram total on-disk size
     tables = {}
@@ -239,7 +263,22 @@ def extract_field(buf, shapesdata_off, shapesdata_hdr, table, field_name):
             data_off, data_end = coff + XTC_HDR, coff + ch["extent"]
         elif t == TID_SHAPES:
             shapes_off, shapes_end = coff + XTC_HDR, coff + ch["extent"]
-    assert data_off is not None, "no Data child in ShapesData"
+    # Always-on validation of untrusted input (never a bare `assert`, which
+    # `python -O` strips): a ShapesData with no Data child cannot yield a field.
+    if data_off is None:
+        raise XtcFormatError(
+            f"ShapesData Xtc at offset {shapesdata_off} has no Data "
+            f"(TID_DATA) child within its declared extent "
+            f"[{sd_payload}, {sd_end})")
+
+    # The Data child's DECLARED extent is the tight upper bound for every field
+    # view; a corrupt Xtc.extent must not let a view read past the buffer.
+    if data_end > len(buf):
+        raise XtcFormatError(
+            f"ShapesData Xtc at offset {shapesdata_off}: Data child declares "
+            f"extent ending at byte {data_end}, past the buffer end "
+            f"({len(buf)} bytes)")
+    data_extent = data_end - data_off
 
     names = table["names"]
     # Walk fields, accumulating byte offsets and consuming Shapes for rank>0.
@@ -253,18 +292,40 @@ def extract_field(buf, shapesdata_off, shapesdata_hdr, table, field_name):
             count = 1
             field_bytes = esz
         else:
-            # read this field's Shape (one Shape per rank>0 field, in order)
-            so = shapes_off + shape_idx * SHAPE_SZ
+            # read this field's Shape (one Shape per rank>0 field, in order).
+            # Bound the Shape read to the Shapes child's declared extent, so a
+            # block that declares more rank>0 fields than the Shapes child
+            # holds cannot pull dims out of an unrelated, following Xtc.
+            so = None if shapes_off is None else shapes_off + shape_idx * SHAPE_SZ
+            if so is None or so + SHAPE_SZ > (shapes_end or 0):
+                raise XtcFormatError(
+                    f"ShapesData at offset {shapesdata_off}: field "
+                    f"{nm['name']!r} (rank {rank}) needs Shape #{shape_idx} at "
+                    f"offset {so}, past the Shapes child extent "
+                    f"[{shapes_off}, {shapes_end})")
             dims = struct.unpack_from("<5I", buf, so)[:rank]
             shape = tuple(int(d) for d in dims)
-            count = int(np.prod(shape)) if shape else 1
+            # Pure-Python product (no int64 wrap on a hostile huge shape).
+            count = math.prod(shape) if shape else 1
             field_bytes = count * esz
             shape_idx += 1
+        # Bound this field's bytes by the Data child's DECLARED extent before
+        # constructing any view: a corrupt shape/count must not make the array
+        # read past this dgram's Data payload into the following bytes (the
+        # next Xtc / next dgram).  Cheap integer check -- no allocation, no
+        # per-element work -- so the hot path stays fast.
+        field_end = offset + field_bytes
+        if field_bytes < 0 or offset < 0 or field_end > data_extent:
+            raise XtcFormatError(
+                f"ShapesData at offset {shapesdata_off}: field {nm['name']!r} "
+                f"(count {count} x {esz}B = {field_bytes}B at data offset "
+                f"{offset}) overruns the Data child extent of {data_extent}B "
+                f"(data bytes [{data_off}, {data_end})); declared shape={shape}")
         if nm["name"] == field_name:
             arr = np.frombuffer(buf, dtype=DTYPE_NP[nm["type"]],
                                 count=count, offset=data_off + offset)
             return arr.reshape(shape) if shape else arr[0], shape, nm
-        offset += field_bytes
+        offset = field_end
     raise KeyError(f"field {field_name!r} not found in Names table")
 
 
