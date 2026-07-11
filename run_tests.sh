@@ -57,6 +57,7 @@ if [[ ${#TESTS[@]} -eq 0 && "${PSDATA_NO_DEFAULT_TESTS:-}" != "1" ]]; then
     "$REPO/tests/test_hostile_bytes_fail06.py"
     "$REPO/tests/test_stream_us002.py"
     "$REPO/tests/test_str01_multichunk_forward.py"
+    "$REPO/tests/test_str02_stream_dropout.py"
     "$REPO/tests/test_gate02_gated_forward.py"
     "$REPO/tests/test_gate_failclosed_fail02.py"
     "$REPO/tests/test_index_us003.py"
@@ -70,6 +71,7 @@ if [[ ${#TESTS[@]} -eq 0 && "${PSDATA_NO_DEFAULT_TESTS:-}" != "1" ]]; then
     "$REPO/tests/test_persist_us008.py"
     "$REPO/tests/test_idx04_invalidation.py"
     "$REPO/tests/test_batch_us009.py"
+    "$REPO/tests/test_perf01_coalesced_reads.py"
     "$REPO/tests/test_mem01_bounded_read.py"
     "$REPO/tests/test_config_us010.py"
     "$REPO/tests/test_cal02_multistep_config.py"
@@ -77,6 +79,7 @@ if [[ ${#TESTS[@]} -eq 0 && "${PSDATA_NO_DEFAULT_TESTS:-}" != "1" ]]; then
     "$REPO/tests/test_bigdata_scan_us012.py"
     "$REPO/tests/test_uniqueid_us011.py"
     "$REPO/tests/test_envstore_us013.py"
+    "$REPO/tests/test_gate07_bench_committed.py"
     "$REPO/tests/test_runner_hygiene_hyg03.py"
   )
 fi
