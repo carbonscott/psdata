@@ -41,6 +41,7 @@ imports **no** psana / mpi4py / h5py (only the standard library and numpy; see
 :func:`assert_no_framework_imports`).
 """
 
+import bisect
 import glob
 import os
 import struct
@@ -233,6 +234,7 @@ class Run:
         self._smd_files = smd_files            # explicit SMD map, or None
         self._index = None                     # lazily built RunIndex
         self._env = None                       # lazily built EnvStoreManager
+        self._seg_cfg_steps = {}               # (det, alg) -> per-step configs
 
     # -- streaming ---------------------------------------------------------
     def events(self, gate=True):
@@ -425,12 +427,20 @@ class Run:
         return self.config.uniqueid(detname)
 
     # -- CONFIGURE-block accessor -----------------------------------------
-    def seg_configs(self, detname, alg="config"):
+    @staticmethod
+    def _wrap_seg_configs(per_seg, alg):
+        """Wrap ``{segment_id: {field: value}}`` as ``{segment_id: seg_cfg}``
+        with ``seg_cfg.<alg>.<field>`` access (the public shape of
+        :meth:`seg_configs`)."""
+        return {seg: _SegConfig({alg: _AlgNamespace(fld_map)})
+                for seg, fld_map in per_seg.items()}
+
+    def seg_configs(self, detname, alg="config", step=None, evt=None):
         """Per-segment CONFIGURE-block object for ``detname``.
 
         Returns ``{segment_id: seg_cfg}`` where ``seg_cfg.<alg>.<field>`` reads
-        a static settings field written into the Configure dgram (not an
-        L1Accept event field) -- e.g. for epix10ka::
+        a static settings field written into the Configure/BeginStep dgram (not
+        an L1Accept event field) -- e.g. for epix10ka::
 
             scfg = run.seg_configs("epixquad")          # {0: ..., 1: ..., ...}
             trbit = scfg[0].config.trbit                # (4,)   uint8
@@ -446,10 +456,182 @@ class Run:
         Field names that are not valid Python identifiers (jungfrau's dotted /
         enum-suffixed config fields) are reachable from
         ``seg_cfg.<alg>.fields[name]`` rather than by attribute syntax.
+
+        **Multi-step runs (CAL-02).**  An epix10ka config field -- notably
+        ``trbit``, which selects the gain-decode branch -- can CHANGE across DAQ
+        steps: a fresh config rides on each ``BeginStep`` transition and, like
+        psana's *stateful* ``det.raw._seg_configs()``, overrides the value in
+        effect for that step's events (last-wins per segment).  The default,
+        single-value form (``step``/``evt`` both ``None``) returns the config
+        active up to the FIRST L1Accept -- i.e. step 0's -- and is **byte-exact
+        for a single-step run** (the config is constant, so there is nothing to
+        pick).  On a MULTI-step run that one value is WRONG for later steps, so a
+        calibration consumer must address the active config per step/event:
+
+        * ``run.seg_configs(det, step=k)`` -- the config ACTIVE during DAQ step
+          ``k`` (0-based); equivalently :meth:`seg_configs_at`.
+        * ``run.seg_configs(det, evt=e)`` -- the config active AT event ``e``
+          (an :class:`~psdata.stream.Event` or a raw 64-bit timestamp),
+          resolved with psana's as-of rule: the most recent ``BeginStep``
+          override at/before the event (``searchsorted(begin_ts, ts, 'right') -
+          1``).  This is the value psana's per-event ``det.raw.calib`` uses.
+
+        See :meth:`n_config_steps` for the number of steps.
         """
-        per_seg = _f.read_config_object(self.config, detname, alg=alg)
-        return {seg: _SegConfig({alg: _AlgNamespace(fld_map)})
-                for seg, fld_map in per_seg.items()}
+        if step is None and evt is None:
+            # Backward-compatible single-value path -- UNCHANGED (byte-exact for
+            # a single-step run, where the config is constant across the run).
+            per_seg = _f.read_config_object(self.config, detname, alg=alg)
+            return self._wrap_seg_configs(per_seg, alg)
+        if step is not None and evt is not None:
+            raise ValueError("pass at most one of step= or evt=")
+
+        steps = self._seg_config_steps(detname, alg=alg)
+        if step is not None:
+            if not 0 <= step < len(steps):
+                raise IndexError(
+                    f"config step {step} out of range for {detname!r} "
+                    f"(run has {len(steps)} config step(s))")
+            return self._wrap_seg_configs(steps[step][1], alg)
+
+        # evt given: resolve to the active step by the as-of rule (side='right'
+        # then -1), matching psana's stateful _seg_configs / EnvStore semantics.
+        ts = getattr(evt, "timestamp", evt)
+        if ts is None:
+            raise ValueError(
+                "seg_configs(evt=...): event has no timestamp (an unindexed "
+                "shutdown-tail event); cannot resolve its DAQ step")
+        ts = int(ts)
+        begin_ts = [bts for bts, _cfg in steps if bts is not None]
+        if not begin_ts:
+            pos = 0                            # no BeginStep -> the sole step
+        else:
+            pos = bisect.bisect_right(begin_ts, ts) - 1
+            if pos < 0:
+                pos = 0                        # event precedes the first step
+        return self._wrap_seg_configs(steps[pos][1], alg)
+
+    def _seg_config_steps(self, detname, alg="config"):
+        """Ordered per-step ACTIVE config for ``(detname, alg)``.
+
+        Returns a list ``[(begin_step_ts, {segment: {field: value}}), ...]``
+        ordered by step, where each entry is the config ACTIVE for that step --
+        psana's stateful ``_seg_configs`` as of that step's ``BeginStep`` (the
+        Configure default, then every ``BeginStep`` override up to and including
+        that step, last-wins per segment).  Element 0 is byte-identical to the
+        single-value :meth:`seg_configs`; each later element folds in that
+        step's override.  Cached on the run.
+
+        The BeginStep dgrams were already located, with zero extra I/O, by the
+        index build and bucketed into the ``scan`` env store as ``{stream:
+        [(ts, path, offset, size), ...]}``; each holds the whole broadcast
+        BeginStep dgram (byte-identical whether sourced from the SMD sidecar or
+        the bigdata), so the config ShapesData that rides on a BeginStep is read
+        straight from there -- no walk of the GB-scale bigdata.
+        """
+        key = (detname, alg)
+        cached = self._seg_cfg_steps.get(key)
+        if cached is not None:
+            return cached
+
+        det = self.config.detector(detname)
+        if alg not in det.algs:
+            raise KeyError(f"detector {detname!r} has no alg {alg!r} "
+                           f"(have {det.alg_names()})")
+        want_fields = det.field_names(alg)
+
+        # Base = the step-0 / Configure-default active config (walks the front
+        # transitions up to the first L1Accept, last-wins).  Byte-identical to
+        # the single-value accessor; the running state the later steps fold into.
+        active = {seg: dict(fld_map)
+                  for seg, fld_map in _f.read_config_object(
+                      self.config, detname, alg=alg).items()}
+
+        streams = det.streams_for(alg)
+        nkey_to_seg = {}
+        for stream in streams:
+            tables = self.config.raw_tables[stream]
+            nkey_to_seg[stream] = {
+                nkey: tbl["segment"] for nkey, tbl in tables.items()
+                if tbl["det_name"] == detname and tbl["alg_name"] == alg}
+
+        # A BeginStep is broadcast to every stream with the SAME timestamp, so
+        # one step == one ts, merging each owning stream's segments.
+        scan_recs = self.build_index().env_records.get("scan", {})
+        per_ts = {}                            # ts -> {stream: (path, off, sz)}
+        for stream in streams:
+            for (ts, path, offset, size) in scan_recs.get(stream, ()):
+                per_ts.setdefault(int(ts), {})[stream] = (path, offset, size)
+
+        steps = []
+        for ts in sorted(per_ts):
+            is_begin_step = False
+            for stream, (path, offset, size) in per_ts[ts].items():
+                overlay = self._read_config_dgram(
+                    path, offset, size, self.config.raw_tables[stream],
+                    nkey_to_seg[stream], want_fields)
+                if overlay is None:
+                    continue                   # a BeginRun the scan store holds
+                is_begin_step = True
+                active.update(overlay)         # stateful last-wins per segment
+            if is_begin_step:
+                steps.append((ts, {seg: dict(m) for seg, m in active.items()}))
+
+        if not steps:
+            # No BeginStep at all (unusual) -> the run is one step whose config
+            # is the Configure default.
+            steps = [(None, {seg: dict(m) for seg, m in active.items()})]
+
+        self._seg_cfg_steps[key] = steps
+        return steps
+
+    @staticmethod
+    def _read_config_dgram(path, offset, size, tables, nkey_to_seg,
+                           want_fields):
+        """Extract this detector's per-segment config from ONE BeginStep dgram.
+
+        Reads the dgram bytes at ``(path, offset, size)`` and decodes each
+        ``want_fields`` value for every segment whose config ShapesData rides on
+        it -- the same primitives (:func:`~psdata.format.iter_shapesdata` /
+        :func:`~psdata.format.extract_field`) the single-value accessor uses.
+        Returns ``{segment: {field: value}}`` (``{}`` if a BeginStep carries no
+        config for this detector), or ``None`` if the dgram is not a
+        ``BeginStep`` (a ``BeginRun`` the scan store also holds -- it never
+        overrides config)."""
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            buf = bytearray(os.pread(fd, size, offset))
+        finally:
+            os.close(fd)
+        hdr = _f.parse_dgram_header(buf, 0)
+        if hdr["service"] != _f.SERVICE_BEGINSTEP:
+            return None
+        out = {}
+        for xoff, xh in _f.iter_shapesdata(buf, 0, hdr):
+            nkey = _f.namesid_of(xh["src"])
+            seg = nkey_to_seg.get(nkey)
+            if seg is None:
+                continue
+            table = tables[nkey]
+            out[seg] = {fld: _f.extract_field(buf, xoff, xh, table, fld)[0]
+                        for fld in want_fields}
+        return out
+
+    def seg_configs_at(self, detname, step, alg="config"):
+        """The per-segment CONFIGURE object ACTIVE during DAQ ``step`` (0-based)
+        -- ``seg_configs(detname, alg, step=step)``.
+
+        For a multi-step run whose config changes across steps (e.g. epix10ka
+        ``trbit`` differing per step), this is the config a calibration consumer
+        must apply to that step's events; the single-arg :meth:`seg_configs`
+        returns only step 0's, which silently mis-decodes later steps' gain."""
+        return self.seg_configs(detname, alg=alg, step=step)
+
+    def n_config_steps(self, detname, alg="config"):
+        """Number of DAQ steps that carry a (possibly re-overridden) ``(detname,
+        alg)`` config -- ``1`` for a single-step run, ``>1`` when the config is
+        re-emitted on later ``BeginStep`` transitions."""
+        return len(self._seg_config_steps(detname, alg=alg))
 
     def config_object(self, detname, alg="config"):
         """Alias for :meth:`seg_configs` -- the per-segment CONFIGURE object
