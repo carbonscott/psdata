@@ -18,9 +18,11 @@ path:
     arrays), for ``ks`` in non-contiguous / shuffled / repeated order;
   * ``read_stack(ks, 'jungfrau')`` must equal
     ``np.stack([read_event_at(k).stack('jungfrau') for k in ks])``;
-  * a coalesced batch must issue exactly ``sum over ks of contributing
-    streams`` ``os.pread``s -- no extra scan -- and open each chunk file at most
-    once, mirroring ``test_index_us003.test_random_read_uses_pread_no_scan``.
+  * a coalesced batch must issue STRICTLY FEWER ``os.pread``s than the serial
+    ``sum over ks of contributing streams`` (PERF-01: adjacent per-stream dgrams
+    are merged into one syscall over the covering span), while every indexed
+    dgram is still covered by exactly one issued span -- no extra scan -- and each
+    chunk file is opened at most once.
 
 No psana is required.
 
@@ -226,9 +228,11 @@ def test_read_stack_matches_per_event():
 # and each chunk file opened at most once
 # --------------------------------------------------------------------------
 def test_batch_coalesces_pread_no_scan():
-    """The whole batch must issue exactly ``sum over ks of contributing
-    streams`` ``os.pread``s -- the same total as the serial path -- and open
-    each distinct chunk file at most once (lazy ``_bd_fd`` reuse)."""
+    """The whole batch must issue STRICTLY FEWER ``os.pread``s than the serial
+    ``sum over ks of contributing streams`` (PERF-01: adjacent per-stream dgrams
+    coalesce into one syscall), while every indexed dgram is still covered by
+    exactly one issued span (no stray reads, no scan), and each distinct chunk
+    file is opened at most once (lazy ``_bd_fd`` reuse)."""
     import psdata
     from psdata import index as psindex
 
@@ -254,12 +258,12 @@ def test_batch_coalesces_pread_no_scan():
             expected_chunk_paths.add(path)
     expected_n = len(expected_pairs)
 
-    preads = []
+    preads = []                      # (fd, off, n) in call order
     opens = []
     real_pread, real_open = os.pread, os.open
 
     def spy_pread(fd, n, off):
-        preads.append((off, n))
+        preads.append((fd, off, n))
         return real_pread(fd, n, off)
 
     def spy_open(path, *a, **kw):
@@ -274,11 +278,61 @@ def test_batch_coalesces_pread_no_scan():
     finally:
         os.pread, os.open = real_pread, real_open
 
-    assert len(preads) == expected_n, (
-        f"{len(preads)} preads for {len(distinct)} distinct events; expected "
-        f"{expected_n} (sum of contributing streams) -- extra reads / a scan?")
-    assert sorted(preads) == sorted(expected_pairs), \
-        "pread (offset,size) pairs != the indexed pairs (wrong/extra reads)"
+    # Attribute each pread / expected dgram to the chunk file (fd) it belongs to;
+    # offsets restart per chunk file so they are only comparable within one fd.
+    path_to_fd = dict(ridx._bd_fds)          # {chunk_path: fd} opened this batch
+    fd_to_path = {fd: p for p, fd in path_to_fd.items()}
+
+    # PERF-01: the batch now COALESCES adjacent per-stream reads (contiguous /
+    # near-adjacent dgrams merged into ONE pread over the covering span, sliced
+    # back), so it issues STRICTLY FEWER syscalls than the serial K*S path.  Two
+    # of the requested positions -- events 0 and 1 -- are adjacent, and their
+    # per-stream dgrams are contiguous on disk in every stream that carries both,
+    # so at least those merge; the whole batch is therefore < the serial sum.
+    #
+    # [UPDATED for PERF-01.  The pre-fix assertions here were
+    #    assert len(preads) == expected_n                 # 80 for 8 events
+    #    assert sorted(preads) == sorted(expected_pairs)
+    # which ENCODED the no-coalescing behaviour PERF-01 fixes (one pread per
+    # (event, stream), byte ranges never merged).  They are replaced by the
+    # strictly-fewer count PLUS the real coalescing contract below (every indexed
+    # dgram covered by exactly one merged pread span, spans disjoint & ascending
+    # per chunk, no stray reads).  End-to-end byte-exactness of the coalesced
+    # bytes is proven separately by test_read_events_matches_serial.]
+    assert len(preads) < expected_n, (
+        f"{len(preads)} preads for {len(distinct)} distinct events -- expected "
+        f"STRICTLY FEWER than the serial K*S={expected_n} (sum of contributing "
+        f"streams): the batch must COALESCE adjacent per-stream reads (PERF-01), "
+        f"not issue one pread per (event, stream).")
+
+    # Group the issued preads and the expected dgram ranges by chunk file (fd).
+    expected_by_fd = {}
+    for k in distinct:
+        for stream, (path, off, size) in ridx.entries[k].items():
+            expected_by_fd.setdefault(path_to_fd[path], []).append((off, size))
+    issued_by_fd = {}
+    for fd, off, n in preads:
+        issued_by_fd.setdefault(fd, []).append((off, off + n))
+
+    for fd, spans in issued_by_fd.items():
+        base = os.path.basename(fd_to_path[fd])
+        ordered = spans[:]                                  # call order per fd
+        assert ordered == sorted(ordered), \
+            f"{base}: preads not issued in ascending offset order: {ordered}"
+        # merged spans must be disjoint (a dgram is never read twice)
+        for (s0, e0), (s1, e1) in zip(ordered, ordered[1:]):
+            assert e0 <= s1, f"{base}: issued pread spans overlap: {ordered}"
+        # every indexed dgram range is covered by EXACTLY ONE issued span, and
+        # every issued span covers at least one requested dgram (no stray reads).
+        exp = expected_by_fd.get(fd, [])
+        for off, size in exp:
+            covering = [(s, e) for (s, e) in ordered if s <= off and off + size <= e]
+            assert len(covering) == 1, (
+                f"{base}: indexed dgram [{off},{off + size}) covered by "
+                f"{len(covering)} pread spans (want exactly 1): {covering}")
+        for s, e in ordered:
+            assert any(s <= o and o + sz <= e for (o, sz) in exp), \
+                f"{base}: issued pread span [{s},{e}) covers no requested dgram"
 
     # each distinct chunk file opened at most once during the batch.
     opened_chunks = [p for p in opens if p in expected_chunk_paths]
@@ -287,16 +341,10 @@ def test_batch_coalesces_pread_no_scan():
     assert set(opened_chunks) <= expected_chunk_paths, \
         f"opened unexpected files: {set(opened_chunks) - expected_chunk_paths}"
 
-    # ascending-offset-per-chunk: with a single chunk file here, the issued
-    # offsets must be non-decreasing (the coalescing contract).
-    if len(expected_chunk_paths) == 1:
-        offs = [off for (off, _n) in preads]
-        assert offs == sorted(offs), \
-            f"preads not issued in ascending offset order: {offs}"
-
     ridx.close()
-    print(f"[ok] batch of {len(KS)} ks ({len(distinct)} distinct) issued "
-          f"{len(preads)} preads (== sum of contributing streams), no scan, "
+    print(f"[ok] batch of {len(KS)} ks ({len(distinct)} distinct) COALESCED the "
+          f"serial K*S={expected_n} reads into {len(preads)} preads "
+          f"(< K*S; PERF-01), every indexed dgram covered by exactly one span, "
           f"{len(set(opened_chunks))} chunk file(s) opened once, ascending offset")
 
 
