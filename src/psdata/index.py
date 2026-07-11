@@ -1187,8 +1187,8 @@ def _read_chunkinfo(buf, dg_off, dg_hdr, tables):
 # ==========================================================================
 def _enumerate_bd_chunks(bd_c000_path):
     """Ordered bigdata chunk files for a stream, from its ``c000`` path, by the
-    ``-c000``/``-c001``/... filename convention (stops at the first missing
-    chunk id).  A single-chunk stream returns ``[c000]``.
+    ``-c000``/``-c001``/... filename convention.  A single-chunk stream returns
+    ``[c000]``.
 
     Enumerating by the on-disk filename convention -- rather than following the
     ``chunkinfo`` carried on each Enable (the SMD path's mechanism) -- keeps the
@@ -1196,6 +1196,18 @@ def _enumerate_bd_chunks(bd_c000_path):
     chunkinfo and no SMD.  The chunk filenames ``chunkinfo`` would name are
     exactly these ``-c00N`` siblings in the same directory, so the set walked is
     identical to the one the SMD-following path rolls through.
+
+    STR-04: the chunk set is discovered by ENUMERATING the ``-c00N`` siblings
+    that actually exist on disk (not by incrementing until the first miss), then
+    checked for contiguity.  Incrementing until the first miss silently
+    TRUNCATES a non-contiguous set: if ``c001`` is absent but ``c002`` exists
+    (a partial copy, a filesystem hiccup, a stray deletion), the old walk
+    stopped at ``c001`` and indexed only ``c000``, dropping every event in
+    ``c002+`` with no error -- a silently short index the caller never sees.
+    An interior hole is therefore a HARD ERROR here: we fail closed and name the
+    stream, the missing chunk(s), and the higher chunk(s) that exist.  Reaching
+    the last chunk (``max`` id present, nothing above it) is the legitimate end
+    condition, not a hole, and returns the full ordered set.
     """
     d = os.path.dirname(bd_c000_path)
     base = os.path.basename(bd_c000_path)
@@ -1204,15 +1216,47 @@ def _enumerate_bd_chunks(bd_c000_path):
         return [bd_c000_path]
     prefix = base[:m.start()]            # '<exp>-rNNNN-sMMM'
     width = len(m.group(1))              # zero-pad width (3 -> c000)
-    chunks = []
-    cid = 0
-    while True:
-        cand = os.path.join(d, f"{prefix}-c{cid:0{width}d}.xtc2")
-        if not os.path.exists(cand):
-            break
-        chunks.append(cand)
-        cid += 1
-    return chunks if chunks else [bd_c000_path]
+
+    # Enumerate the chunk ids that ACTUALLY exist for this stream by matching
+    # the c000's ``<prefix>-c<id>.xtc2`` siblings in its directory, rather than
+    # assuming contiguity by incrementing until the first miss.
+    sibling_re = re.compile(r"^" + re.escape(prefix) + r"-c(\d+)\.xtc2$")
+    listing = d if d else os.curdir
+    try:
+        names = os.listdir(listing)
+    except OSError:
+        names = []
+    found = set()                        # chunk ids present on disk
+    for name in names:
+        sm = sibling_re.match(name)
+        if sm:
+            found.add(int(sm.group(1)))
+    if not found:
+        # Not even c000 turned up (unusual path form, or the file vanished);
+        # fall back to the caller's own c000 path unchanged, as before.
+        return [bd_c000_path]
+
+    hi = max(found)
+    missing = [cid for cid in range(hi + 1) if cid not in found]
+    if missing:
+        # A true interior hole (a missing -c00N with a higher chunk present):
+        # refuse to silently index a truncated run -- fail closed, loudly.
+        sm = re.search(r"-s(\d+)$", prefix)
+        stream = sm.group(1) if sm else "?"
+        fmt = lambda c: f"c{c:0{width}d}"
+        miss_lo = min(missing)
+        higher = sorted(c for c in found if c > miss_lo)
+        raise ValueError(
+            f"non-contiguous bigdata chunk set for stream s{stream}: "
+            f"missing chunk(s) {[fmt(c) for c in missing]} while higher "
+            f"chunk(s) {[fmt(c) for c in higher]} exist (prefix {prefix!r} in "
+            f"{listing!r}); refusing to silently index a truncated run "
+            f"(dropping {fmt(hi)} and below the gap) -- STR-04")
+
+    # Contiguous set 0..hi: build the ordered paths exactly as before
+    # (byte-identical to the old first-miss walk for a normal chunk set).
+    return [os.path.join(d, f"{prefix}-c{cid:0{width}d}.xtc2")
+            for cid in range(hi + 1)]
 
 
 def _scan_bigdata_stream(bd_c000_path, env_out=None):
