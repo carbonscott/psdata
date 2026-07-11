@@ -501,6 +501,15 @@ class RunIndex:
         self.include_shutdown_tail = False  # True iff the raw end-of-run tail
         #   (events lacking the timing/master stream; pulseId=None) is kept;
         #   default False clamps to the canonical (SMD-equivalent) event set.
+        # IDX-04 invalidation fingerprint: {bigdata_chunk_path: (size,
+        #   mtime_ns)} captured at build time for every file the index's offsets
+        #   point into (the union of chunk_files).  Verified up front on load()
+        #   so a persisted index whose xtc files changed under it (re-transfer,
+        #   truncation, a different run reusing the path) is REFUSED before it
+        #   can serve stale offsets, rather than only tripping the read-time ts
+        #   re-check.  Empty for a directly-constructed index (no build scan);
+        #   an empty map disables the check (nothing was measured to compare).
+        self.file_fingerprints = {}
         # private: open bigdata fds, lazily, cached per chunk path
         self._bd_fds = {}
         self._ts_to_k = None          # built lazily for read_event(ts)
@@ -557,6 +566,7 @@ class RunIndex:
         # second-guess SMD, and the (still-open) damaged-data policy is not
         # silently decided on this path.
         idx._merge_streams(per_stream, include_shutdown_tail=True)
+        idx._record_file_fingerprints()
         idx.build_seconds = time.monotonic() - t0
         idx.scan_source = "smd"
         idx.scan_bytes_read = idx.smd_bytes_read
@@ -616,6 +626,7 @@ class RunIndex:
 
         idx._merge_streams(per_stream,
                            include_shutdown_tail=include_shutdown_tail)
+        idx._record_file_fingerprints()
         idx.build_seconds = time.monotonic() - t0
         return idx
 
@@ -700,6 +711,89 @@ class RunIndex:
                 continue   # shutdown-tail event: lacks the timing/master stream
             self.timestamps.append(ts)
             self.entries.append(entry)
+
+    # -- file-fingerprint invalidation (IDX-04) ---------------------------
+    # A persisted index records byte OFFSETS into the bigdata chunk files.  If
+    # those files are modified/replaced/regrown after the index is built (a
+    # re-transfer, a truncation, a different run reusing the path), the offsets
+    # no longer correspond -- yet nothing PROACTIVELY refuses the stale index;
+    # the only backstop is the read-time ts re-check in _assemble_stream_dgram
+    # (which raises rather than returning garbage -- safe by accident, not a
+    # deliberate invalidation, and only per-event on the events you happen to
+    # read).  These two helpers turn that accident into an up-front check: build
+    # records a cheap fingerprint (size + mtime) of every indexed file, and
+    # load() verifies it (a stat per file) BEFORE serving any offset.
+    @staticmethod
+    def _stat_fingerprint(path):
+        """The cheap (no re-read) identity of one file: ``(size, mtime_ns)``.
+        A truncation/regrow changes ``size``; a re-transfer/replace changes
+        ``mtime_ns`` (and usually ``size``).  Nanosecond mtime is stored as an
+        int so the comparison is exact (no float rounding)."""
+        st = os.stat(path)
+        return (int(st.st_size), int(st.st_mtime_ns))
+
+    def _record_file_fingerprints(self):
+        """Capture ``{chunk_path: (size, mtime_ns)}`` for every bigdata file the
+        index's offsets point into (the union of ``chunk_files``), so a later
+        :meth:`load` can detect the files changing underneath the index.  A
+        chunk that cannot be stat'd at build time is simply left unfingerprinted
+        (no baseline to compare against later); the read-time re-check still
+        guards it."""
+        fps = {}
+        for chunks in self.chunk_files.values():
+            for p in chunks:
+                if p is None or p in fps:
+                    continue
+                try:
+                    fps[p] = self._stat_fingerprint(p)
+                except OSError:
+                    pass
+        self.file_fingerprints = fps
+
+    def _verify_file_fingerprints(self, strict=True):
+        """Proactively invalidate the index if any fingerprinted file's
+        ``(size, mtime_ns)`` no longer matches what was recorded at build time.
+
+        Raises a clear ``ValueError`` naming every changed file (with its old
+        and current size/mtime) BEFORE any offset is served, so a stale index is
+        refused up front instead of tripping the read-time ts re-check later (or,
+        worse, only on the subset of events a caller happens to read).
+
+        Cheap: one ``os.stat`` per distinct chunk file, never a re-read, so an
+        UNCHANGED run costs a handful of stats and NEVER fires (byte-exact reads
+        are unaffected).  A file that is absent at verify time is skipped, not
+        flagged: a portable index (IDX-03) may resolve to the original paths when
+        the data is momentarily offline, and that genuine miss must keep
+        surfacing at read time exactly as before -- only files that EXIST but
+        DIFFER are an IDX-04 invalidation.  ``strict=False`` bypasses the check
+        entirely for a caller who knows the change is benign."""
+        if not strict or not self.file_fingerprints:
+            return
+        mismatches = []
+        for path, recorded in self.file_fingerprints.items():
+            try:
+                current = self._stat_fingerprint(path)
+            except OSError:
+                continue   # absent/offline -> let read time handle it (IDX-03)
+            if tuple(current) != tuple(recorded):
+                mismatches.append((path, tuple(recorded), current))
+        if not mismatches:
+            return
+        lines = []
+        for path, (osz, omt), (csz, cmt) in mismatches:
+            lines.append(
+                "  %s\n      built: size=%d mtime_ns=%d\n      now:   "
+                "size=%d mtime_ns=%d" % (path, osz, omt, csz, cmt))
+        raise ValueError(
+            "psdata index invalidated: %d indexed file(s) changed since the "
+            "index was built -- the recorded byte offsets no longer correspond "
+            "to these files (a re-transfer, truncation, or a different run "
+            "reusing the path).  Refusing to serve stale offsets.\n%s\n"
+            "Rebuild the index for the current files (build_index(...).save"
+            "(...)), or -- if you KNOW the change is benign (e.g. a metadata-"
+            "only touch) -- reload with RunIndex.load(..., verify_files=False) "
+            "to bypass this check."
+            % (len(mismatches), "\n".join(lines)))
 
     # -- lookup ------------------------------------------------------------
     @property
@@ -1029,6 +1123,7 @@ class RunIndex:
         "scan_source",
         "scan_bytes_read",
         "include_shutdown_tail",
+        "file_fingerprints",
     )
 
     # Defaults for fields absent from an older persisted blob (back-compat:
@@ -1045,6 +1140,11 @@ class RunIndex:
         # works).  A fresh dict is installed per instance in _restore_state so
         # the mutable default is never shared.
         "env_records": {},
+        # An index persisted before IDX-04 has no fingerprints -- load it as an
+        # empty map, which disables the invalidation check (nothing was measured
+        # to compare against), so older blobs keep loading unchanged.  A fresh
+        # dict is installed per instance in _restore_state (never the shared one).
+        "file_fingerprints": {},
     }
 
     def _persist_state(self):
@@ -1069,6 +1169,9 @@ class RunIndex:
         # aliased across restored instances.
         if "env_records" not in state:
             self.env_records = {}
+        # Same fresh-dict discipline for the IDX-04 fingerprints of an old blob.
+        if "file_fingerprints" not in state:
+            self.file_fingerprints = {}
         self._bd_fds = {}        # MUST be a fresh empty cache -- never the
         self._ts_to_k = None     # serialized one (would carry stale fds)
         return self
@@ -1144,11 +1247,27 @@ class RunIndex:
             fh.write(payload)
 
     @classmethod
-    def load(cls, path, dir=None):
+    def load(cls, path, dir=None, verify_files=True):
         """Reload an index written by :meth:`save`.  Opens ONLY the index file
         (no SMD files, no rescan): ``smd_bytes_read`` is whatever the original
         build measured, but no new SMD I/O happens here.  Fds into the bigdata
         files reopen lazily on the first :meth:`read_event_at`.
+
+        ``verify_files`` (default ``True``, IDX-04) checks up front that every
+        indexed bigdata file still matches the ``(size, mtime)`` fingerprint
+        recorded when the index was built (one ``os.stat`` per chunk file, never
+        a re-read).  If a file changed under the index -- a re-transfer,
+        truncation, or a different run reusing the path -- the recorded byte
+        offsets no longer correspond, so ``load`` raises a clear ``ValueError``
+        naming the changed file(s) BEFORE any offset is served, instead of the
+        change only tripping the per-event read-time re-check later.  An
+        UNCHANGED run never fires (byte-exact reads are unaffected), and an
+        indexed file that is momentarily absent is skipped (a portable index may
+        resolve to the original paths when the data is offline -- that genuine
+        miss keeps surfacing at read time as before).  Pass
+        ``verify_files=False`` to bypass the check when a change is known benign
+        (or for an index built before IDX-04, which carries no fingerprints and
+        so is a no-op either way).
 
         ``dir`` (optional) is the directory that holds the run's xtc2 files at
         THIS location -- pass it to relocate a portable index whose data now
@@ -1234,7 +1353,12 @@ class RunIndex:
             _index_resolve_paths(doc, path, dir)
         state = _index_decode(doc)
         idx = cls.__new__(cls)
-        return idx._restore_state(state)
+        idx._restore_state(state)
+        # IDX-04: proactively refuse a stale index (files changed under it)
+        # BEFORE serving any offset -- layered in FRONT of the read-time ts
+        # re-check, which stays as the last-line backstop.
+        idx._verify_file_fingerprints(strict=verify_files)
+        return idx
 
 
 # ==========================================================================
