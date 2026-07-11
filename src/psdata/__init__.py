@@ -54,10 +54,10 @@ from .format import discover, filter_c000, stream_index_of, decode_damage
 from .stream import Event, events
 from .index import RunIndex, build_index, smd_files_for
 from .envstore import EnvStore, EnvStoreManager
-from .run import Run, open
+from .run import Run, open, GateBuildError
 
 __all__ = ["format", "stream", "index", "envstore", "run",
-           "open", "Run", "discover", "events", "Event",
+           "open", "Run", "GateBuildError", "discover", "events", "Event",
            "RunIndex", "build_index", "smd_files_for",
            "EnvStore", "EnvStoreManager",
            "filter_c000", "stream_index_of", "decode_damage"]

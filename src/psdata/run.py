@@ -50,6 +50,32 @@ from . import index as _i
 from . import envstore as _e
 
 
+class GateBuildError(RuntimeError):
+    """The SMD gate index could not be built, so ``Run.events()`` refuses to
+    stream.
+
+    Raised by :meth:`Run.events` (default ``gate=True``) when
+    :meth:`Run.build_index` fails.  The gate is the reader's single safety net:
+    it filters the ungated bigdata k-way merge down to the SMD-defined
+    (psana-equivalent) event set, dropping the ragged DAQ shutdown-tail
+    L1Accepts that the smalldata writer never indexed (observed on
+    mfx100848724/r51: 17982 raw vs 17872 real -> 110 phantom events).
+
+    If that net cannot be built the reader **fails closed**: it raises this
+    instead of silently degrading to the unsafe ungated merge.  A caller who
+    genuinely wants the ungated stream (e.g. a run with no SMD sidecars *and*
+    no bigdata-scan gate) must ask for it explicitly with
+    ``Run.events(gate=False)``.  The original cause is chained
+    (``raise ... from``) so it is never lost.
+    """
+
+
+# Index-build failures we know how to explain.  Anything outside this set is a
+# genuinely unexpected error (e.g. a programming bug) and is deliberately left
+# to propagate raw -- which is still fail-closed -- rather than be swallowed.
+_INDEX_BUILD_ERRORS = (OSError, ValueError, KeyError, IndexError)
+
+
 class _AlgNamespace:
     """Attribute view over one algorithm's CONFIGURE-block fields of a segment.
 
@@ -205,8 +231,8 @@ class Run:
         ``pulseId``, and lazy raw detector arrays (``evt.stack(name)`` /
         ``evt.raw(name)`` / ``evt.as_dict()``).
 
-        By default the event set is **gated to the SMD-defined index**, so
-        forward streaming yields exactly the events psana and
+        By default (``gate=True``) the event set is **gated to the SMD-defined
+        index**, so forward streaming yields exactly the events psana and
         :meth:`read_event_at` do.  Why: on a run with a ragged DAQ-shutdown tail,
         some bigdata streams carry trailing L1Accepts the SMD writer never
         indexed (it stopped first); the raw k-way merge over the bigdata would
@@ -215,32 +241,54 @@ class Run:
         indexed).  Gating filters the merge to the indexed timestamps so the
         forward, random-access, and psana event sets coincide.
 
-        Pass ``gate=False`` for the ungated, SMD-independent merge straight over
-        the bigdata (the same as the low-level :func:`psdata.events`); it may
-        surface unindexed shutdown-tail events on a truncated run.  If the SMD
-        sidecars are absent, ``build_index`` transparently falls back to a
-        bigdata scan, so gating still applies; only a genuine index-build
-        failure degrades to ungated (with a ``RuntimeWarning``).
+        **Fail-closed.**  The gate is this reader's single safety net.  If it
+        cannot be built -- :meth:`build_index` raises -- ``events()`` does NOT
+        fall back to the ungated merge; it raises :class:`GateBuildError`
+        (chaining the original cause).  A silent degrade would let the phantom
+        shutdown-tail events leak back in with no signal, which is exactly the
+        defect this guards against.
+
+        Opting out is explicit and loud: pass ``gate=False`` for the ungated,
+        SMD-independent merge straight over the bigdata (the same as the
+        low-level :func:`psdata.events`).  That may surface unindexed
+        shutdown-tail events on a truncated run -- you are asking for the raw
+        bigdata set, on purpose.  There is no automatic, silent path to an
+        ungated stream: the only way to get one is to name ``gate=False``.
+
+        Note on the gate's *source*.  ``build_index(source="auto")`` uses the
+        SMD sidecars when present and otherwise reconstructs the same canonical
+        event set by scanning the bigdata dgram headers directly
+        (``scan_source == "bigdata"``).  The bigdata scan still applies the
+        timing/master-stream clamp that drops the shutdown tail, so the gate
+        remains effective against the FAIL-01 phantom-event bug even with no
+        SMD; it is weaker only in that it is no longer an *independent* witness
+        of the bigdata (a truncation shared by scan and merge would not be
+        caught).  Inspect ``run.build_index().scan_source`` if that distinction
+        matters to you.
         """
         merged = _s.events(self.files, run_config=self.config)
         if not gate:
             return merged
         try:
-            valid = frozenset(self.build_index().timestamps)
-        except Exception as exc:
-            # build_index(source="auto") already falls back to a bigdata scan
-            # when the SMD sidecars are absent, so a *legitimate* SMD-absence
-            # does NOT land here -- anything caught here is a real index-build
-            # failure.  Preserve the ungated degrade (don't break iteration),
-            # but warn so the failure is surfaced rather than silently masked.
-            import warnings
-            warnings.warn(
-                f"Run.events(): could not build the SMD index "
-                f"({type(exc).__name__}: {exc}); degrading to the ungated "
-                f"bigdata merge, which may surface unindexed shutdown-tail "
-                f"events. Pass gate=False to silence, or fix the index build.",
-                RuntimeWarning, stacklevel=2)
-            return merged
+            index = self.build_index()
+        except _INDEX_BUILD_ERRORS as exc:
+            # Fail closed: the safety net could not be built, so refuse to
+            # stream rather than silently degrade to the ungated merge (which
+            # would resurrect the phantom shutdown-tail events with no signal).
+            # build_index(source="auto") already covers a *legitimate* SMD
+            # absence by scanning the bigdata, so reaching here is a real
+            # build failure.  A caller who truly wants the ungated set must say
+            # so explicitly with gate=False.
+            raise GateBuildError(
+                f"Run.events(gate=True): could not build the SMD gate index "
+                f"for this run ({type(exc).__name__}: {exc}). Refusing to "
+                f"stream: an ungated bigdata merge may surface unindexed "
+                f"DAQ-shutdown-tail events that psana and read_event_at() do "
+                f"not have. Fix the index build, or -- if you genuinely want "
+                f"the raw, ungated bigdata event set -- call "
+                f"Run.events(gate=False) explicitly."
+            ) from exc
+        valid = frozenset(index.timestamps)
         return (evt for evt in merged if evt.timestamp in valid)
 
     # -- random access -----------------------------------------------------
