@@ -28,7 +28,9 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # project root
 SRC="$REPO/src"                                        # holds only psdata/
-SKIPS_ALLOWED="$REPO/tests/skips_allowed.txt"          # name :: justification
+# PSDATA_SKIPS_ALLOWED overrides the allowlist path (used by the hygiene test to
+# drive malformed-allowlist cases); a real caller never sets it.
+SKIPS_ALLOWED="${PSDATA_SKIPS_ALLOWED:-$REPO/tests/skips_allowed.txt}"  # name :: justification
 SKIP_MARKER="##SKIP##"                                 # must match tests/_skips.py
 
 PYPARTS="$SRC"
@@ -85,6 +87,14 @@ allowed_justification() {
     name="${name#"${name%%[![:space:]]*}"}"; name="${name%"${name##*[![:space:]]}"}"
     just="${just#"${just%%[![:space:]]*}"}"; just="${just%"${just##*[![:space:]]}"}"
     if [[ "$name" == "$want" ]]; then
+      # An entry with an EMPTY justification is malformed -- do NOT treat it as
+      # allowed (that would let a bare 'name ::' rubber-stamp a skip).  Warn and
+      # keep looking; if nothing else matches, the skip stays unjustified.
+      if [[ -z "$just" ]]; then
+        echo "WARNING: malformed allowlist entry for '${name}' in ${SKIPS_ALLOWED}:" \
+             "empty justification -- ignoring (a skip is not a pass)" >&2
+        continue
+      fi
       printf '%s' "$just"
       return 0
     fi
@@ -103,14 +113,22 @@ skip_reasons=()
 bare_skip_files=()          # test files that emitted an UNMARKED skip line
 bare_skip_lines=()          # the offending line, verbatim
 
-# Lines that look like the OLD skip idiom -- 'print("[skip] ..."); return' and
-# friends -- but carry NO ##SKIP## marker.  A future author who writes one of
-# these exits 0 with no marker, so the counter above never sees it and it scores
-# as a PASS: exactly the pre-fix bug.  We grep each test's log for these and fail
-# the suite, telling the author to route the skip through tests/_skips.py.  The
-# ##SKIP## marker lines are excluded (they are the SANCTIONED form), so a real
-# skip record -- even one whose reason text says "skipped" -- never trips this.
-BARE_SKIP_RE='\[skip\]|skipping|SKIPPED'
+# Lines that look like the OLD skip idiom -- 'print("[skip] ..."); return',
+# 'print("SKIP ...")', 'print("SKIPPED: ...")' and friends -- but carry NO
+# ##SKIP## marker.  A future author who writes one of these exits 0 with no
+# marker, so the counter above never sees it and it scores as a PASS: exactly the
+# pre-fix bug (this repo's old test_config_us010 / test_uniqueid_us011 used the
+# 'SKIP ...' form verbatim).  Two passes, then the ##SKIP## marker lines are
+# excluded (they are the SANCTIONED form):
+#   * case-INSENSITIVE for bracketed/-ing/-ed spellings: [skip], [ skip ],
+#     skipping, skipped (so a real record whose reason says "skipped" is only
+#     safe because it rides on a ##SKIP## line, which we drop);
+#   * case-SENSITIVE for a standalone uppercase SKIP token (\bSKIP\b) -- catches
+#     "SKIP ", "SKIP:", "##SKIP##" (dropped by the exclusion).  The word boundary
+#     means it does NOT match inside PSDATA_SKIP_SLOW (underscores are word
+#     chars) and does NOT flag lowercase "skip" in ordinary prose.
+BARE_SKIP_RE_CI='\[[[:space:]]*skip[[:space:]]*\]|skipping|skipped'
+BARE_SKIP_RE_CS='\bSKIP\b'
 
 for t in "${TESTS[@]}"; do
   echo "### running $t"
@@ -141,12 +159,16 @@ for t in "${TESTS[@]}"; do
     skip_names+=("$name")
     skip_reasons+=("$reason")
   done < <(grep -F "$SKIP_MARKER" "$out" || true)
-  # UNMARKED skips: skip-looking lines that are NOT ##SKIP## records.
+  # UNMARKED skips: skip-looking lines that are NOT ##SKIP## records.  Two grep
+  # passes (case-insensitive spellings + case-sensitive uppercase SKIP token),
+  # de-duplicated, with the ##SKIP## marker lines excluded last.
   while IFS= read -r bline; do
     [[ -n "$bline" ]] || continue
     bare_skip_files+=("$t")
     bare_skip_lines+=("$bline")
-  done < <(grep -iE "$BARE_SKIP_RE" "$out" 2>/dev/null | grep -vF "$SKIP_MARKER" || true)
+  done < <( { grep -iE "$BARE_SKIP_RE_CI" "$out"
+              grep -E  "$BARE_SKIP_RE_CS" "$out"; } 2>/dev/null \
+            | grep -vF "$SKIP_MARKER" | awk '!seen[$0]++' || true)
   rm -f "$out"
 done
 

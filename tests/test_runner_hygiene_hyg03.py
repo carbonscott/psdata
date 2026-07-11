@@ -23,8 +23,19 @@ The contract this test pins
    to be declared.
 4. A genuinely failing test file still fails the suite (no regression in the
    original behaviour), and a clean run still exits 0.
-5. Every ``tests/test_*.py`` on disk is registered in ``run_tests.sh``'s default
-   TESTS list -- an unregistered test file is another way for a check to not run.
+4b. An UNMARKED skip -- the OLD idiom, a printed ``[skip]`` / ``[ skip ]`` /
+   ``skipping`` / ``skipped`` line OR a standalone uppercase ``SKIP`` token
+   (``SKIP ...`` / ``SKIP:``), exiting 0 with no ``##SKIP##`` marker -- also
+   fails the suite.  This backstops a future author reverting to the idiom this
+   repo actually used (old ``test_config_us010`` / ``test_uniqueid_us011`` wrote
+   ``print("SKIP ...")``).  The word boundary means ``PSDATA_SKIP_SLOW`` is not
+   flagged.
+4c. A run that executes zero test files fails ("ran 0 tests") -- no vacuous green.
+5. The default TESTS list and the on-disk ``tests/test_*.py`` files agree BOTH
+   ways: an on-disk test not registered never runs; a registered entry with no
+   file on disk is named clearly (not left to degrade into a runtime FAILED).
+6. An allowlist entry with an empty justification (``name ::``) is malformed and
+   does not rubber-stamp a skip.
 
 This test is SELF-CONTAINED: no psana, no psdata, no SLAC data.  It synthesizes
 fake test scripts in a temp dir and drives the real ``run_tests.sh`` over them,
@@ -105,6 +116,17 @@ def _fake_bare_skip_test(tmp, fname="fake_bare_skip.py"):
         "raise SystemExit(0)\n"))
 
 
+def _fake_skip_token_test(tmp, fname="fake_skip_token.py"):
+    """The OTHER pre-fix idiom, and the one this repo actually used: a printed
+    'SKIP ...' line (uppercase token) and exit 0, no ##SKIP## marker.  The old
+    test_config_us010 / test_uniqueid_us011 wrote exactly this."""
+    return _write(os.path.join(tmp, fname), (
+        "#!/usr/bin/env python3\n"
+        "print('SKIP in-proc purity: a sibling test already imported psana')\n"
+        "print('ALL CHECKS PASSED')\n"
+        "raise SystemExit(0)\n"))
+
+
 def _fake_failing_test(tmp, fname="fake_fail.py"):
     return _write(os.path.join(tmp, fname), (
         "#!/usr/bin/env python3\n"
@@ -163,10 +185,12 @@ def test_unlisted_skip_fails_the_suite():
     # the skip's reason is surfaced, not just its name
     assert "synthetic skip emitted by the HYG-03 self-test" in out, \
         "the runner must print each skip's reason\n" + out
-    # (do not echo the literal 'S skipped' summary word here -- this test's own
-    #  stdout is itself scanned by the outer suite's unmarked-skip check)
+    # (this test's own stdout is itself scanned by the outer suite's
+    #  unmarked-skip check, so do not print 'S skipped' or a standalone
+    #  uppercase SKIP token here -- keep the words lowercase)
     print(f"[ok] unlisted skip -> runner exit {rc} (nonzero); summary carried "
-          f"an explicit skip count (S={n_skip}); UNJUSTIFIED SKIP named")
+          f"an explicit skip count (S={n_skip}); the unjustified-skip flag "
+          f"named it")
 
 
 # --------------------------------------------------------------------------
@@ -269,6 +293,37 @@ def test_bare_unmarked_skip_fails_the_suite():
 
 
 # --------------------------------------------------------------------------
+# 4b'. the uppercase 'SKIP ...' idiom -- the one THIS REPO actually used -- too
+# --------------------------------------------------------------------------
+def test_bare_skip_token_fails_the_suite():
+    """A test printing an old-style uppercase 'SKIP ...' line and exiting 0 (no
+    ##SKIP## marker) must redden the run.
+
+    This is the exact pre-fix idiom of this repo's own test_config_us010 /
+    test_uniqueid_us011 -- 'print("SKIP in-proc purity: ...")'.  The first cut of
+    the unmarked-skip regex (\\[skip\\]|skipping|SKIPPED) MISSED it: 'SKIP ' is
+    not '[skip]'/'skipping'/'SKIPPED'.  The broadened scan (a standalone
+    uppercase SKIP token) catches it.  Fails on the parent AND on that first cut.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tok = _fake_skip_token_test(tmp, "fake_skip_token.py")
+        clean = _fake_clean_test(tmp)
+        rc, out = _run_suite(tok, clean)
+
+    assert rc != 0, (
+        "run_tests.sh exited 0 on a bare 'SKIP ...' line -- the repo's own "
+        "pre-fix idiom is being scored as a pass (HYG-03).  Output was:\n" + out)
+    assert "UNMARKED SKIP" in out, "the runner must flag the line\n" + out
+    assert tok in out, "the runner must name the offending file\n" + out
+    n_pass, n_fail, n_skip = _summary_counts(out)
+    assert n_skip == 0, (
+        f"an unmarked skip must not be counted as a ##SKIP## record; summary "
+        f"said {n_skip}\n{out}")
+    print(f"[ok] an uppercase skip-token line reddens the run (exit {rc}) -- the "
+          f"repo's own pre-fix idiom no longer slips through")
+
+
+# --------------------------------------------------------------------------
 # 4c. a vacuous green -- zero test files executed -- must fail, not pass
 # --------------------------------------------------------------------------
 def test_zero_tests_fails():
@@ -290,21 +345,83 @@ def test_zero_tests_fails():
 
 
 # --------------------------------------------------------------------------
-# 5. every tests/test_*.py on disk is registered in the default TESTS list
+# 5. the default TESTS list and the on-disk test files agree BOTH ways
 # --------------------------------------------------------------------------
-def test_default_suite_registers_every_test_file():
-    """An unregistered test file never runs -- the same disease as a skip that
-    scores as a pass, one level up."""
+# test_gate02_gated_forward.py is registered here but arrives via the (already
+# merged to main) GATE-02 change, so it is absent on THIS branch and present
+# post-merge.  Exempt it from the registered->on-disk direction so this branch
+# stays green, while still failing clearly for any OTHER genuinely-missing file.
+_PENDING_MERGE = {"test_gate02_gated_forward.py"}
+
+
+def test_default_suite_matches_disk_both_ways():
+    """A completeness check in BOTH directions (aligning with HYG-05):
+
+      * on-disk -> registered: a test file that exists but is not in the default
+        TESTS list never runs -- the same disease as a skip scored as a pass;
+      * registered -> on-disk: a TESTS entry with no file on disk (deleted or
+        renamed) must fail with a clear message, not degrade to a runtime FAILED.
+    """
     with open(RUN_TESTS) as f:
         runner = f.read()
+
     on_disk = sorted(n for n in os.listdir(_HERE)
                      if n.startswith("test_") and n.endswith(".py"))
-    missing = [n for n in on_disk if n not in runner]
-    assert not missing, (
-        "these test files exist on disk but are NOT in run_tests.sh's default "
-        "TESTS list, so the suite never runs them: %s" % missing)
-    print(f"[ok] all {len(on_disk)} tests/test_*.py files are registered in "
-          f"run_tests.sh's default suite")
+    # registered entries = the 'tests/<name>.py' paths named in run_tests.sh
+    registered = sorted(set(re.findall(r"tests/(test_[A-Za-z0-9_]+\.py)", runner)))
+
+    # direction 1: on-disk => registered
+    unregistered = [n for n in on_disk if n not in registered]
+    assert not unregistered, (
+        "these test files exist on disk but are NOT registered in run_tests.sh's "
+        "default TESTS list, so the suite never runs them: %s" % unregistered)
+
+    # direction 2: registered => on-disk
+    absent = [n for n in registered
+              if not os.path.exists(os.path.join(_HERE, n))]
+    unexpected = [n for n in absent if n not in _PENDING_MERGE]
+    assert not unexpected, (
+        "these files are registered in run_tests.sh's TESTS list but do not "
+        "exist on disk (deleted? renamed? typo?): %s" % unexpected)
+    if absent:
+        print(f"[note] registered but not yet on this branch (arrives via a "
+              f"pending merge, exempted): {absent}")
+    print(f"[ok] default suite and disk agree both ways "
+          f"({len(on_disk)} on disk, {len(registered)} registered)")
+
+
+# --------------------------------------------------------------------------
+# 6. an allowlist entry with an EMPTY justification does not rubber-stamp a skip
+# --------------------------------------------------------------------------
+def test_empty_justification_is_not_allowed():
+    """A 'name ::' allowlist line with nothing after the '::' is malformed and
+    must NOT justify a skip -- the skip stays unjustified and fails the suite
+    (Finding 6).  Driven via the PSDATA_SKIPS_ALLOWED override so the real
+    allowlist is untouched."""
+    name = "hyg03_selftest_empty_just"
+    with tempfile.TemporaryDirectory() as tmp:
+        allow = os.path.join(tmp, "skips_allowed.txt")
+        with open(allow, "w") as f:
+            f.write("# malformed on purpose: empty justification below\n")
+            f.write("%s ::\n" % name)
+        skipper = _fake_skipping_test(tmp, "fake_skip_empty.py", name)
+        clean = _fake_clean_test(tmp)
+        proc = subprocess.run(
+            ["bash", RUN_TESTS, skipper, clean], cwd="/",
+            capture_output=True, text=True,
+            env={**os.environ, "PSDATA_SKIPS_ALLOWED": allow},
+        )
+        out = proc.stdout + proc.stderr
+
+    assert proc.returncode != 0, (
+        "an empty-justification allowlist entry must not justify a skip; runner "
+        "exited %d\n%s" % (proc.returncode, out))
+    assert "UNJUSTIFIED SKIP" in out, \
+        "the skip should be reported as unjustified\n" + out
+    assert "malformed" in out.lower(), \
+        "the runner should warn that the allowlist entry is malformed\n" + out
+    print("[ok] an empty-justification allowlist entry is rejected as malformed; "
+          "the skip stays unjustified")
 
 
 def main():
@@ -316,8 +433,10 @@ def main():
     test_clean_run_and_failure_still_work()
     test_runner_still_streams_test_output()
     test_bare_unmarked_skip_fails_the_suite()
+    test_bare_skip_token_fails_the_suite()
     test_zero_tests_fails()
-    test_default_suite_registers_every_test_file()
+    test_empty_justification_is_not_allowed()
+    test_default_suite_matches_disk_both_ways()
     print("\nALL HYG-03 RUNNER-HYGIENE CHECKS PASSED")
 
 
