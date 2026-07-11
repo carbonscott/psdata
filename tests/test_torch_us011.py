@@ -28,7 +28,11 @@ serializable and US-009 made batchable.  This suite checks three things:
            numbers.
 
 The torch-dependent tests SKIP (not fail) when torch is not installed, per the
-story; the import-purity test runs regardless.
+story; the import-purity test runs regardless.  Those skips are emitted as
+machine-readable records (``tests/_skips.py``) and are the ONLY skips in
+``tests/skips_allowed.txt``: torch is a declared optional extra of psdata and is
+genuinely absent from the production psconda env.  Every other skip fails the
+suite (HYG-03).
 
 Run (on sdfiana025, from the repo root):
     PYTHONPATH=src .venv/bin/python tests/test_torch_us011.py
@@ -48,6 +52,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(os.path.dirname(_HERE), "src")  # .../<repo>/src (holds psdata/)
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
+if _HERE not in sys.path:                           # for _skips (sibling module)
+    sys.path.insert(0, _HERE)
+
+from _skips import skip   # noqa: E402  (machine-readable skip records, HYG-03)
 
 # Reference dataset -- single-chunk primary run (kept in the TEST, never the lib).
 EXP = "mfx100848724"
@@ -130,8 +138,10 @@ def test_import_purity_subprocess():
 # ==========================================================================
 def test_getitem_byte_identical():
     if not _have_torch():
-        print("[skip] correctness: torch not installed")
-        return
+        return skip("torch_absent_correctness",
+                    "torch is not installed in this environment (optional "
+                    "psdata extra); ds[k] byte-equality vs read_event_at(k)"
+                    ".stack(det) cannot be exercised")
     import torch
     from psdata.torch import XTCDataset
 
@@ -166,8 +176,10 @@ def test_getitem_byte_identical():
 # ==========================================================================
 def test_dataloader_num_workers_fork_safe():
     if not _have_torch():
-        print("[skip] DataLoader fork-safety: torch not installed")
-        return
+        return skip("torch_absent_dataloader_fork_safety",
+                    "torch is not installed in this environment (optional "
+                    "psdata extra); DataLoader(num_workers=2) fork-safety "
+                    "cannot be exercised")
     import torch
     from torch.utils.data import DataLoader, Subset
     from psdata.torch import XTCDataset, worker_init_fn
@@ -217,8 +229,11 @@ def test_fork_fd_reuse_is_recovered():
         # This test exercises the fd discipline, not torch directly, but it is
         # the deterministic backstop for the DataLoader test -- group it with
         # the torch-dependent block so the suite has one clear skip story.
-        print("[skip] deterministic fd-reuse: grouped with torch tests")
-        return
+        return skip("torch_absent_fd_reuse_deterministic",
+                    "deliberately grouped with the torch block (it backstops "
+                    "the DataLoader fork-safety check and asserts psdata.torch's "
+                    "fd discipline); torch is not installed in this environment "
+                    "(optional psdata extra)")
     from psdata.torch import _drop_inherited_fds
 
     idx = _build_index()
@@ -282,5 +297,10 @@ if __name__ == "__main__":
     test_getitem_byte_identical()
     test_dataloader_num_workers_fork_safe()
     test_fork_fd_reuse_is_recovered()
+    # NB: do not print the word "skip"/"skipped" here -- the torch skips are
+    # already emitted as ##SKIP## records, and run_tests.sh treats any OTHER
+    # skip-looking line as an unmarked (unjustified) skip (HYG-03).
     print("\nALL US-011 TESTS PASSED" +
-          ("" if _have_torch() else " (torch-dependent tests SKIPPED)"))
+          ("" if _have_torch()
+           else " (torch not installed -- torch-dependent checks did not run; "
+                "see the ##SKIP## records above)"))
