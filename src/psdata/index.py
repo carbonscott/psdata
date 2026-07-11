@@ -138,6 +138,14 @@ def _decode_chunk_filename(arr):
 _INDEX_MAGIC = b"PSDATIDX"          # 8 bytes; identifies a psdata index file
 _INDEX_FORMAT_VERSION = 1           # bump on ANY incompatible layout change
 _INDEX_CHECKSUM_ALGO = "sha256"     # over the payload bytes, checked on load
+# The ONLY checksum algorithms load() will honor -- an explicit allowlist, not
+# ``hashlib.algorithms_available``.  That set also contains variable-length XOFs
+# (e.g. ``shake_128`` / ``shake_256``) whose ``hexdigest()`` REQUIRES a length
+# argument, so honoring one would raise an uncaught ``TypeError`` instead of a
+# clean integrity ``ValueError``.  Restrict to the fixed-length digest we
+# actually write; add an entry here (never a blanket ``algorithms_available``)
+# if a future format writes a different one.
+_INDEX_ALLOWED_CHECKSUM_ALGOS = frozenset({"sha256"})
 
 
 def _index_encode(obj):
@@ -1023,10 +1031,11 @@ class RunIndex:
             algo = header.get("checksum_algo")
             want_digest = header.get("checksum")
             plen = header.get("payload_len")
-            if not isinstance(algo, str) or algo not in hashlib.algorithms_available:
+            if not isinstance(algo, str) or algo not in _INDEX_ALLOWED_CHECKSUM_ALGOS:
                 raise ValueError(
-                    "%r: psdata index header names an unknown checksum "
-                    "algorithm %r" % (path, algo))
+                    "%r: psdata index header names an unsupported checksum "
+                    "algorithm %r -- this psdata accepts only %s."
+                    % (path, algo, sorted(_INDEX_ALLOWED_CHECKSUM_ALGOS)))
             payload = fh.read()
         if not isinstance(plen, int) or len(payload) != plen:
             raise ValueError(
