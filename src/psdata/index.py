@@ -531,15 +531,50 @@ class RunIndex:
         some detector streams kept writing after the timing/master streams
         closed; ``pulseId=None``).  Pass ``include_shutdown_tail=True`` to keep
         that tail -- the full set of physical L1Accepts on disk."""
-        # gather the union of timestamps, then for each ts collect the streams
+        # Gather the union of timestamps, then for each ts collect the streams.
+        # STR-03 -- the ts-keyed merge is hardened against timestamp collisions:
+        #   * Records from DIFFERENT streams that share a ts are the SAME event
+        #     and combine into one entry -- the normal cross-stream merge, kept
+        #     exactly (a ts collision ACROSS streams is not a collision at all).
+        #   * A duplicate L1Accept ts WITHIN one stream is a DAQ/clock anomaly:
+        #     the entry shape ((chunk_path, off, size) per stream) holds only one
+        #     dgram per (ts, stream) and the ts-unique bisect index
+        #     (_position_of) cannot address two events at one ts, so a second
+        #     event landing on an already-filled (ts, stream) slot is RAISED,
+        #     never silently overwritten -- an event is never lost without a word.
+        #   * A transition dgram (is_event=False) that happens to share a ts with
+        #     an L1Accept must NOT flip the event's classification: the L1Accept
+        #     wins and stays indexed, the transition is additive-only and never
+        #     becomes -- nor displaces -- an event.
+        # A record is either (ts, chunk_path, off, size) -- always an L1Accept
+        # event, the only shape the scans emit, so the no-collision production
+        # path is byte-for-byte unchanged -- or (ts, chunk_path, off, size,
+        # is_event) whose is_event=False marks a non-event transition.
         merged = {}   # ts -> {stream: (chunk_path, off, size)}
         for stream, recs in per_stream.items():
-            for ts, chunk_path, off, size in recs:
-                merged.setdefault(ts, {})[stream] = (chunk_path, off, size)
+            for rec in recs:
+                if len(rec) == 5:
+                    ts, chunk_path, off, size, is_event = rec
+                else:
+                    ts, chunk_path, off, size = rec
+                    is_event = True
+                slot = merged.setdefault(ts, {})
+                if not is_event:
+                    continue   # transition: shares the ts but is not an event
+                if stream in slot:
+                    raise ValueError(
+                        "psdata index: duplicate L1Accept timestamp %d in "
+                        "stream %r -- two events share one 64-bit ts (DAQ/clock "
+                        "anomaly); the ts-keyed random-access index cannot "
+                        "address both. Refusing to silently drop an event."
+                        % (ts, stream))
+                slot[stream] = (chunk_path, off, size)
         timing_streams = (frozenset() if include_shutdown_tail
                           else self._timing_streams())
         for ts in sorted(merged):
             entry = merged[ts]
+            if not entry:
+                continue   # only transition(s) carried this ts -> not an event
             if timing_streams and not (timing_streams & entry.keys()):
                 continue   # shutdown-tail event: lacks the timing/master stream
             self.timestamps.append(ts)
