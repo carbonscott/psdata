@@ -53,8 +53,10 @@ TESTS=("$@")
 if [[ ${#TESTS[@]} -eq 0 && "${PSDATA_NO_DEFAULT_TESTS:-}" != "1" ]]; then
   TESTS=(
     "$REPO/tests/test_format_us001.py"
+    "$REPO/tests/test_det10_unknown_version.py"
     "$REPO/tests/test_hostile_bytes_fail06.py"
     "$REPO/tests/test_stream_us002.py"
+    "$REPO/tests/test_str01_multichunk_forward.py"
     "$REPO/tests/test_gate02_gated_forward.py"
     "$REPO/tests/test_gate_failclosed_fail02.py"
     "$REPO/tests/test_index_us003.py"
@@ -62,10 +64,12 @@ if [[ ${#TESTS[@]} -eq 0 && "${PSDATA_NO_DEFAULT_TESTS:-}" != "1" ]]; then
     "$REPO/tests/test_index_format_idx02.py"
     "$REPO/tests/test_idx03_portable_index.py"
     "$REPO/tests/test_robust_us004.py"
+    "$REPO/tests/test_fail04_truncated_index.py"
     "$REPO/tests/test_str04_chunk_gap.py"
     "$REPO/tests/test_regression_us005.py"
     "$REPO/tests/test_persist_us008.py"
     "$REPO/tests/test_batch_us009.py"
+    "$REPO/tests/test_mem01_bounded_read.py"
     "$REPO/tests/test_config_us010.py"
     "$REPO/tests/test_torch_us011.py"
     "$REPO/tests/test_bigdata_scan_us012.py"

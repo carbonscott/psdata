@@ -31,6 +31,7 @@ only the standard library and numpy.
 """
 
 import os
+import re
 import sys
 
 import numpy as np
@@ -56,6 +57,55 @@ _TIMING_DET_TYPE = "ts"
 
 
 # ==========================================================================
+# Multi-chunk enumeration (STR-01): the -c00N chunk files one stream rolls
+# through, by the on-disk filename convention -- the SAME set the random-access
+# index path walks.
+# ==========================================================================
+def _enumerate_stream_chunks(c000_path):
+    """Ordered bigdata chunk files for one stream, from its ``-c000`` path, by
+    the ``-c000``/``-c001``/... filename convention (stopping at the first
+    missing chunk id).  A single-chunk stream returns ``[c000_path]``.
+
+    This mirrors :func:`psdata.index._enumerate_bd_chunks` **exactly** so the
+    forward streaming cursor (:class:`_StreamCursor`) rolls through the identical
+    set of chunk files the random-access index path walks in
+    ``index._scan_bigdata_stream``.  The two paths must agree on which bytes back
+    an event past a chunk roll (STR-01): the index followed the roll while the
+    forward path did not, so ``stack()`` went ``None`` past the boundary while
+    ``read_event_at`` returned full frames from the next chunk -- the reader
+    contradicting itself.
+
+    Enumerating by the on-disk ``-c00N`` convention -- rather than following the
+    ``chunkinfo`` carried on each Enable (the SMD path's mechanism) -- keeps
+    forward streaming self-contained: it needs only the bigdata files it already
+    opens, with no SMD file and no ``chunkinfo`` decode.  The chunk filenames
+    ``chunkinfo`` would name are exactly these ``-c00N`` siblings in the same
+    directory (see ``index._enumerate_bd_chunks``), so the set walked here is
+    identical to the one the SMD-following path rolls through.
+
+    A path that does not match the ``-c00N.xtc2`` convention (e.g. a synthetic
+    test fixture) is returned unchanged as a single-element list, so such runs
+    stream exactly as before.
+    """
+    d = os.path.dirname(c000_path)
+    base = os.path.basename(c000_path)
+    m = re.search(r"-c(\d+)\.xtc2$", base)
+    if not m:
+        return [c000_path]
+    prefix = base[:m.start()]            # '<exp>-rNNNN-sMMM'
+    width = len(m.group(1))              # zero-pad width (3 -> c000)
+    chunks = []
+    cid = 0
+    while True:
+        cand = os.path.join(d, f"{prefix}-c{cid:0{width}d}.xtc2")
+        if not os.path.exists(cand):
+            break
+        chunks.append(cand)
+        cid += 1
+    return chunks if chunks else [c000_path]
+
+
+# ==========================================================================
 # Per-stream cursor: lazily reads dgrams from one xtc2 file in order
 # ==========================================================================
 class _StreamCursor:
@@ -68,17 +118,36 @@ class _StreamCursor:
     To bound memory, the read buffer is periodically compacted: once the
     consumed prefix exceeds ``_trim_threshold`` bytes it is dropped and
     ``base`` (the absolute file offset of ``buf[0]``) is bumped.
+
+    Multi-chunk streams (STR-01): a long run's bigdata rolls from ``-c000`` to
+    ``-c001``/... at 250-500 GB, and per-chunk dgram offsets restart at 0.  The
+    cursor enumerates its stream's chunk files up front (by the same ``-c00N``
+    filename convention the random-access index path uses) and, when it exhausts
+    one chunk at a clean dgram boundary, transparently rolls to the next and
+    continues from offset 0.  So the forward path keeps yielding events past the
+    roll -- byte-identical to what the index path (``read_event_at``) serves for
+    the same timestamps -- instead of silently going dead there.  A single-chunk
+    stream has just one chunk and behaves exactly as before.
     """
 
     def __init__(self, stream, path, start_off, read_chunk=1 << 20,
                  trim_threshold=1 << 22):
         self.stream = stream
-        self.path = path
         self.read_chunk = read_chunk
         self._trim_threshold = trim_threshold
 
-        self._fd = os.open(path, os.O_RDONLY)
-        self.base = start_off              # abs file offset of buf[0]
+        # Chunk files this stream rolls through (STR-01).  ``path`` is the
+        # ``-c000`` bigdata file; enumerate its ``-c00N`` siblings the SAME way
+        # the index path does (:func:`_enumerate_stream_chunks` ==
+        # ``index._enumerate_bd_chunks``) so forward streaming and random access
+        # agree on the bytes past a roll.  A single-chunk stream yields
+        # ``[path]``.
+        self._chunks = _enumerate_stream_chunks(path)
+        self._chunk_idx = 0
+        self.path = self._chunks[0]        # the chunk file currently being read
+
+        self._fd = os.open(self._chunks[0], os.O_RDONLY)
+        self.base = start_off              # abs offset of buf[0] in `self.path`
         self.buf = bytearray()             # window starting at `base`
         self.pos = 0                       # cursor within buf (relative)
         self.eof = False
@@ -87,6 +156,13 @@ class _StreamCursor:
         # cached head (None until peek populates it)
         self._head = None                  # dict from parse_dgram_header
         self._head_total = 0               # on-disk size of head dgram
+
+        # STR-01 roll guard: ts of the last dgram consumed (across all chunks),
+        # and a one-shot flag set for the first peek after a roll -- so the
+        # forward path can fail closed (mirroring the index path's "chunk roll
+        # mismatch") rather than silently mis-decode if a roll is ill-formed.
+        self._last_ts = None
+        self._just_rolled = False
 
     # -- low-level buffer management ---------------------------------------
     def _fill_to(self, need_rel_end):
@@ -108,20 +184,95 @@ class _StreamCursor:
             self.base += self.pos
             self.pos = 0
 
+    # -- multi-chunk roll (STR-01) -----------------------------------------
+    def _has_next_chunk(self):
+        return self._chunk_idx + 1 < len(self._chunks)
+
+    def _roll_to_next_chunk(self):
+        """Advance to this stream's next bigdata chunk (``-c000`` -> ``-c001``
+        -> ...) after the current one is exhausted at a clean dgram boundary,
+        mirroring the index path's roll follow (``index._scan_bigdata_stream``
+        walking ``_enumerate_bd_chunks``, whose per-chunk offsets restart at 0).
+        Resets the intra-chunk offset to 0 and continues yielding from the new
+        chunk.  Returns ``True`` if a next chunk was opened, ``False`` if this
+        stream has no further chunk (a genuine end-of-stream).
+
+        Only called from :meth:`peek` when the current window is fully consumed
+        (``self.pos == len(self.buf)``), i.e. the chunk ended exactly on a dgram
+        boundary -- guaranteed because the DAQ never splits a dgram across a
+        chunk roll.
+        """
+        if not self._has_next_chunk():
+            return False
+        os.close(self._fd)
+        self._chunk_idx += 1
+        self.path = self._chunks[self._chunk_idx]
+        self._fd = os.open(self.path, os.O_RDONLY)
+        # Offsets restart at 0 in the new chunk; drop the (fully consumed)
+        # window and rebase.
+        self.base = 0
+        del self.buf[:]
+        self.pos = 0
+        self.eof = False
+        self._just_rolled = True
+        return True
+
     # -- head access -------------------------------------------------------
     def peek(self):
         """Return the head dgram header dict (with absolute ``_off`` and
-        on-disk ``_total``), or ``None`` at end of stream.  Does not consume."""
+        on-disk ``_total``), or ``None`` at end of stream.  Does not consume.
+
+        When the current chunk file is exhausted at a clean dgram boundary and
+        the stream rolled to a further ``-c00N`` chunk, transparently follow the
+        roll (STR-01) and continue from offset 0 of the next chunk -- so a
+        multi-chunk run keeps yielding events past the roll instead of the
+        cursor silently going dead (which left ``stack()`` returning ``None`` for
+        detectors on rolled streams past the boundary, while ``read_event_at``
+        returned full frames from the next chunk).  The k-way merge in
+        :func:`events` sees an uninterrupted head stream and needs no change;
+        single-chunk streams have no further chunk and behave exactly as before.
+        """
         if self._head is not None:
             return self._head
-        if not self._fill_to(self.pos + DGRAM_HDR):
-            return None
+        while not self._fill_to(self.pos + DGRAM_HDR):
+            # No further full dgram header available in the current chunk.
+            if self.pos != len(self.buf):
+                # Partial header bytes remain at the chunk's physical end.  With
+                # no further chunk this is a truncated tail (a killed DAQ) --
+                # treat as end-of-stream, exactly as before.  With a further
+                # chunk it means the chunk did NOT split on a dgram boundary,
+                # which must never happen: fail closed (mirroring the index
+                # path's "chunk roll mismatch") rather than silently mis-decode.
+                if self._has_next_chunk():
+                    raise RuntimeError(
+                        f"stream {self.stream}: {os.path.basename(self.path)} "
+                        f"ends {len(self.buf) - self.pos} byte(s) into a dgram "
+                        f"header but a further chunk exists; chunk roll "
+                        f"mismatch")
+                return None
+            # Clean dgram boundary: follow the roll to the next chunk if there
+            # is one; else this is the genuine end of the stream.
+            if not self._roll_to_next_chunk():
+                return None
         h = _f.parse_dgram_header(self.buf, self.pos)
         total = XTC_HDR + h["extent"]
         if not self._fill_to(self.pos + total):
             raise RuntimeError(
                 f"stream {self.stream}: truncated dgram at file offset "
-                f"{self.base + self.pos}")
+                f"{self.base + self.pos} of {os.path.basename(self.path)}")
+        if self._just_rolled:
+            # First dgram of a freshly-rolled chunk: ts must not go backward
+            # (dgrams stay in ascending ts across the roll -- the same ordering
+            # the index path and the k-way merge rely on).  A backward ts means
+            # the roll landed in the wrong file: fail closed rather than feed the
+            # merge an out-of-order, mis-decoded event.
+            self._just_rolled = False
+            if self._last_ts is not None and h["ts"] < self._last_ts:
+                raise RuntimeError(
+                    f"stream {self.stream}: first dgram of "
+                    f"{os.path.basename(self.path)} has ts {h['ts']} < last ts "
+                    f"{self._last_ts} of the previous chunk; chunk roll "
+                    f"mismatch")
         h["_off"] = self.pos
         h["_total"] = total
         self._head = h
@@ -137,6 +288,9 @@ class _StreamCursor:
         if self._head is None:
             if self.peek() is None:
                 return
+        # Remember this dgram's ts so a subsequent chunk roll can verify the
+        # next chunk continues in ascending ts order (STR-01 fail-closed guard).
+        self._last_ts = self._head["ts"]
         self.pos += self._head_total
         self._head = None
         self._head_total = 0

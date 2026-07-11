@@ -937,7 +937,71 @@ class RunIndex:
         return h["service"]
 
     # -- batch random read (US-009) ---------------------------------------
-    def read_events(self, ks):
+    #
+    # MEM-01: ``read_events``/``read_stack`` materialize the WHOLE requested
+    # slice at once -- ``read_events`` holds all K events, ``read_stack``
+    # allocates one ``(K, *frame)`` buffer (335 GB at K=10000 jungfrau).  For a
+    # bounded, streaming read use :meth:`iter_events` / :meth:`iter_stack`
+    # (peak memory ``O(batch_size)``); the whole-slice calls now REFUSE a
+    # request whose materialized size exceeds ``max_bytes`` instead of silently
+    # attempting the allocation.  The default batch size mirrors the ``32`` the
+    # cube example had to hand-roll to survive.
+    DEFAULT_READ_BATCH = 32
+    #: Whole-slice ``read_events``/``read_stack`` refuse to materialize more
+    #: than this many bytes in one call (override per call via ``max_bytes=``;
+    #: ``max_bytes=None`` disables the guard).
+    DEFAULT_READ_MEM_LIMIT = 2 * 1024 ** 3   # 2 GiB
+
+    def _estimate_read_bytes(self, ks, dedupe=True):
+        """Cheap, index-only upper bound (NO I/O) on the bytes a single
+        all-at-once materialization of ``ks`` will hold: the summed indexed
+        dgram ``size`` (the raw payload -- the dominant term of a decoded frame,
+        ``prod(shape) x itemsize``).
+
+        ``dedupe`` controls whether repeated positions are counted once, which
+        differs by caller:
+
+          * ``read_events`` returns the SAME :class:`Event` object for a
+            repeated ``k`` (built once, keyed by distinct position), so its live
+            memory is per-*distinct* position -> ``dedupe=True`` (default).
+          * ``read_stack`` allocates one ROW per requested position (``out`` has
+            ``len(ks)`` rows, repeats included), so a duplicate really does cost
+            another frame of buffer -> ``dedupe=False``.  Guarding on distinct
+            positions there would let ``read_stack([0] * K, det)`` estimate one
+            frame yet allocate ``K`` of them."""
+        total = 0
+        seen = set()
+        for k in ks:
+            k = int(k)
+            if dedupe:
+                if k in seen:
+                    continue
+                seen.add(k)
+            for stream in self.entries[k]:
+                total += self.entries[k][stream][2]   # (chunk_path, offset, size)
+        return total
+
+    def _check_read_budget(self, ks, max_bytes, stream_api, dedupe=True):
+        """Raise ``MemoryError`` if materializing ``ks`` in one call would
+        exceed ``max_bytes`` (``None`` disables the check), pointing the caller
+        at the bounded streaming API instead of silently attempting the
+        allocation.  Runs after ``ks`` has been range-validated.  ``dedupe`` is
+        forwarded to :meth:`_estimate_read_bytes` (``False`` for the
+        ``read_stack`` output buffer, which counts one row per position)."""
+        if max_bytes is None:
+            return
+        est = self._estimate_read_bytes(ks, dedupe=dedupe)
+        if est > max_bytes:
+            n = len({int(k) for k in ks}) if dedupe else len(ks)
+            raise MemoryError(
+                f"reading {n} events at once would materialize "
+                f"~{est / (1024 ** 3):.2f} GiB in memory, over the "
+                f"{max_bytes / (1024 ** 3):.2f} GiB limit -- refusing rather "
+                f"than attempt the allocation (MEM-01). Stream them in bounded "
+                f"memory with {stream_api} (peak O(batch_size)), or pass a "
+                f"larger max_bytes= (max_bytes=None disables the guard).")
+
+    def read_events(self, ks, *, max_bytes=DEFAULT_READ_MEM_LIMIT):
         """Read many events by position in ONE coalesced call.
 
         Equivalent to ``[self.read_event_at(k) for k in ks]`` but issues its
@@ -965,11 +1029,25 @@ class RunIndex:
         ks : sequence[int]
             Event positions (0-based).  Each is validated against the index
             range; an out-of-range position raises ``IndexError``.
+        max_bytes : int or None, keyword-only
+            Memory guard (MEM-01): if the estimated size of the K materialized
+            events exceeds this, ``read_events`` REFUSES (raises
+            ``MemoryError``) and points at :meth:`iter_events` rather than
+            attempting the allocation.  Defaults to
+            :data:`DEFAULT_READ_MEM_LIMIT`; ``None`` disables the guard.  For a
+            reasonable K (below the limit) nothing changes -- the returned list
+            is byte-identical to the un-guarded call.
 
         Returns
         -------
         list[psdata.stream.Event]
             One per requested ``k``, in ``ks`` order.
+
+        Raises
+        ------
+        MemoryError
+            If materializing all K events at once would exceed ``max_bytes``
+            (use :meth:`iter_events` to stream them in bounded memory).
         """
         ks = [int(k) for k in ks]
         n = len(self.timestamps)
@@ -977,6 +1055,9 @@ class RunIndex:
             if not (0 <= k < n):
                 raise IndexError(
                     f"event position {k} out of range [0, {n})")
+
+        # MEM-01 guard: refuse a catastrophic all-at-once materialization.
+        self._check_read_budget(ks, max_bytes, "iter_events(ks, batch_size=...)")
 
         # Collect every required read as (chunk_path, offset, size, k, stream),
         # then group by chunk file and read each file's dgrams in ascending
@@ -1013,7 +1094,8 @@ class RunIndex:
         }
         return [built[k] for k in ks]
 
-    def read_stack(self, ks, det, field="raw", alg="raw"):
+    def read_stack(self, ks, det, field="raw", alg="raw", *,
+                   max_bytes=DEFAULT_READ_MEM_LIMIT):
         """Batch-read events ``ks`` and stack one detector's segment arrays into
         ONE preallocated buffer of shape ``(len(ks), n_seg, *seg_shape)``.
 
@@ -1053,17 +1135,42 @@ class RunIndex:
             Shape ``(len(ks), n_seg, *seg_shape)``, ``out[i]`` the stack for
             ``ks[i]``.
 
+        max_bytes : int or None, keyword-only
+            Memory guard (MEM-01): if the estimated size of the ``(len(ks),
+            *frame)`` buffer exceeds this, ``read_stack`` REFUSES (raises
+            ``MemoryError``) and points at :meth:`iter_stack` rather than
+            attempting the allocation (335 GB for K=10000 jungfrau).  Defaults
+            to :data:`DEFAULT_READ_MEM_LIMIT`; ``None`` disables the guard.  For
+            a reasonable K (below the limit) the returned array is unchanged.
+
         Raises
         ------
         ValueError
             If ``ks`` is empty, or any requested event is missing a segment for
             ``det`` (so a dense stack cannot represent it).
+        MemoryError
+            If the ``(len(ks), *frame)`` buffer would exceed ``max_bytes`` (use
+            :meth:`iter_stack` to stream it in bounded memory).
         """
         ks = [int(k) for k in ks]
         if not ks:
             raise ValueError("read_stack requires at least one event position")
+        n = len(self.timestamps)
+        for k in ks:
+            if not (0 <= k < n):
+                raise IndexError(f"event position {k} out of range [0, {n})")
 
-        events = self.read_events(ks)
+        # MEM-01 guard: refuse the catastrophic (K, *frame) allocation up front,
+        # before read_events materializes anything.  Size by len(ks) rows, NOT
+        # distinct positions (dedupe=False): the output buffer has one row per
+        # requested position, so read_stack([0] * K, det) costs K frames even
+        # though it reads a single distinct event.
+        self._check_read_budget(ks, max_bytes,
+                                "iter_stack(ks, det, batch_size=...)",
+                                dedupe=False)
+
+        # Already budget-checked above -- don't re-guard the inner call.
+        events = self.read_events(ks, max_bytes=None)
 
         # Shape/dtype come from the first event's stack (segment shape is only
         # known at event time).  Allocate ONE buffer and fill it row by row.
@@ -1084,6 +1191,86 @@ class RunIndex:
                     f"!= first event's {out.shape[1:]}")
             out[i] = st
         return out
+
+    # -- bounded / streaming batch read (MEM-01) --------------------------
+    def iter_events(self, ks, batch_size=DEFAULT_READ_BATCH):
+        """Stream events for positions ``ks`` in fixed-size batches.
+
+        Bounded-memory counterpart to :meth:`read_events`.  Yields successive
+        ``list[Event]`` of at most ``batch_size`` events which together cover
+        ``ks`` in order, so peak memory is ``O(batch_size)`` frames -- never the
+        ``O(len(ks))`` of :meth:`read_events`, which builds one list holding all
+        K events (``K x frame``; e.g. 335 GB for K=10000 jungfrau).
+
+        Each batch is read by :meth:`read_events` (its coalesced,
+        ascending-offset ``pread`` grouping applied *within* the batch), so an
+        event yielded here is byte-identical to ``read_event_at(k)``; only the
+        coalescing is per-batch rather than global.  The per-batch read is not
+        size-guarded -- a batch is bounded by construction.
+
+        Parameters
+        ----------
+        ks : sequence[int]
+            Event positions (0-based); arbitrary / shuffled / repeated is fine.
+        batch_size : int
+            Maximum events materialized (and yielded) at once.  Must be > 0.
+
+        Yields
+        ------
+        list[psdata.stream.Event]
+            Consecutive slices of ``ks`` (in order), each of length
+            ``<= batch_size``.
+        """
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        ks = [int(k) for k in ks]
+
+        def _gen():
+            for i in range(0, len(ks), batch_size):
+                yield self.read_events(ks[i:i + batch_size], max_bytes=None)
+        return _gen()
+
+    def iter_stack(self, ks, det, field="raw", alg="raw",
+                   batch_size=DEFAULT_READ_BATCH):
+        """Stream a detector's stacked frames for ``ks`` in fixed-size batches.
+
+        Bounded-memory counterpart to :meth:`read_stack`.  Yields successive
+        ndarrays of shape ``(b, n_seg, *seg_shape)`` with ``b <= batch_size``
+        which together cover ``ks`` in order, so peak memory is
+        ``O(batch_size * frame)`` -- never the single ``(len(ks), *frame)``
+        buffer :meth:`read_stack` allocates whole (335 GB for K=10000 jungfrau).
+
+        Each yielded batch is produced by :meth:`read_stack`, so ``batch[j]`` is
+        byte-identical to ``read_event_at(k).stack(det, field, alg)`` for the
+        corresponding ``k``, and the same missing-segment ``ValueError`` policy
+        applies within each batch.
+
+        Parameters
+        ----------
+        ks : sequence[int]
+            Event positions (0-based); arbitrary order is fine.
+        det, field, alg :
+            As in :meth:`read_stack`.
+        batch_size : int
+            Maximum rows per yielded array.  Must be > 0.
+
+        Yields
+        ------
+        numpy.ndarray
+            Shape ``(b, n_seg, *seg_shape)`` with ``b <= batch_size``,
+            covering ``ks`` in order.
+        """
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        ks = [int(k) for k in ks]
+
+        def _gen():
+            for i in range(0, len(ks), batch_size):
+                yield self.read_stack(ks[i:i + batch_size], det,
+                                      field=field, alg=alg, max_bytes=None)
+        return _gen()
 
     # -- resource management ----------------------------------------------
     def close(self):
@@ -1448,7 +1635,8 @@ class RunIndex:
 # ==========================================================================
 # SMD scan: read one SMD file's L1Accept records, following the chunk roll
 # ==========================================================================
-def _scan_smd_stream(path, bd_c000_path, read_chunk, env_out=None):
+def _scan_smd_stream(path, bd_c000_path, read_chunk, env_out=None,
+                     tolerate_truncation=False):
     """Scan one SMD file and return ``(records, bytes_read, chunk_paths)``.
 
     If ``env_out`` (a dict) is given, the env (slow-data) transitions found in
@@ -1480,6 +1668,19 @@ def _scan_smd_stream(path, bd_c000_path, read_chunk, env_out=None):
     the bigdata path -- and EOB L1Accepts (``SERVICE_L1ACCEPT_EOB``, service 11,
     which ``stream.py``'s ``_EVENT_SERVICES`` does yield while streaming) are NOT
     indexed; revisit if EOB-event random access is needed.
+
+    Truncation (FAIL-04).  A well-formed stream ends on a dgram boundary: the
+    last dgram finishes exactly at the file end.  A file cut mid-stream (a
+    partial transfer, an aborted DAQ) instead ends with an *incomplete* dgram --
+    a header declaring an extent that runs past EOF, or trailing bytes too few
+    to be even a 24-byte header.  Silently stopping at the last complete dgram
+    would return a short index that drops this and every following event with no
+    word -- while the forward *streaming* path raises on the same bytes, so the
+    two read paths would disagree.  This scan therefore FAILS CLOSED by default:
+    it raises ``RuntimeError`` naming the file, the byte offset of the
+    truncation, and the last complete event index (mirroring the streaming
+    path).  Pass ``tolerate_truncation=True`` to instead index the intact prefix
+    deliberately and stop (the old silent behavior, now explicit and opt-in).
     """
     bd_dir = os.path.dirname(bd_c000_path) if bd_c000_path else None
     cur_chunk_id = 0
@@ -1488,6 +1689,7 @@ def _scan_smd_stream(path, bd_c000_path, read_chunk, env_out=None):
 
     fd = os.open(path, os.O_RDONLY)
     try:
+        filesize = os.fstat(fd).st_size
         # Configure sits at offset 0; read enough to parse it, then grow.
         buf = bytearray(os.pread(fd, max(read_chunk, _f._CONFIG_READ), 0))
         bytes_read = len(buf)
@@ -1504,11 +1706,34 @@ def _scan_smd_stream(path, bd_c000_path, read_chunk, env_out=None):
             for t in tables.values())
 
         records = []
+
+        def _truncated(trunc_off, detail):
+            """Fail-closed truncation error (FAIL-04): a file cut mid-stream
+            must not yield a silently short index -- name the file, the byte
+            offset, and the last complete event, mirroring the streaming path."""
+            return RuntimeError(
+                f"truncated xtc file {path!r}: {detail} at byte offset "
+                f"{trunc_off} (file size {filesize}). {len(records)} complete "
+                f"L1Accept event(s) scanned (last complete event index "
+                f"{len(records) - 1}); the file was cut mid-stream (a partial "
+                f"transfer or an aborted DAQ). Refusing to return a silently "
+                f"short index that drops this and every following event -- the "
+                f"streaming path fails closed here too. Pass "
+                f"tolerate_truncation=True to index the intact prefix and stop.")
+
         off = cfg_end
         while True:
             if off + _f.DGRAM_HDR > len(buf):
                 more = os.pread(fd, read_chunk, len(buf))
                 if not more:
+                    # No more bytes on disk.  off == filesize is a CLEAN end
+                    # (the last dgram finished exactly at the file boundary);
+                    # any leftover bytes are too few for even a dgram header
+                    # -> the file is truncated mid-stream (FAIL-04).
+                    if off < filesize and not tolerate_truncation:
+                        raise _truncated(
+                            off, f"trailing {filesize - off} byte(s) too few "
+                            f"for a {_f.DGRAM_HDR}-byte dgram header")
                     break
                 buf.extend(more)
                 bytes_read += len(more)
@@ -1518,7 +1743,14 @@ def _scan_smd_stream(path, bd_c000_path, read_chunk, env_out=None):
             if off + total > len(buf):
                 more = os.pread(fd, max(read_chunk, total), len(buf))
                 if not more:
-                    break   # truncated final dgram -> stop (clean EOF)
+                    # The dgram header at `off` declares an on-disk size that
+                    # runs past EOF: the file was cut inside this dgram, not a
+                    # clean end (FAIL-04).
+                    if not tolerate_truncation:
+                        raise _truncated(
+                            off, f"dgram header declares size {total} (ending "
+                            f"at {off + total}) past the file end")
+                    break   # tolerate: index the intact prefix, stop here
                 buf.extend(more)
                 bytes_read += len(more)
                 continue
@@ -1646,7 +1878,7 @@ def _enumerate_bd_chunks(bd_c000_path):
             for cid in range(hi + 1)]
 
 
-def _scan_bigdata_stream(bd_c000_path, env_out=None):
+def _scan_bigdata_stream(bd_c000_path, env_out=None, tolerate_truncation=False):
     """Build one stream's L1Accept ``(ts, chunk_path, intOffset, intDgramSize)``
     records by walking the BIGDATA chunk files directly -- no SMD file needed.
 
@@ -1675,10 +1907,35 @@ def _scan_bigdata_stream(bd_c000_path, env_out=None):
     the SMD path -- and EOB L1Accepts (``SERVICE_L1ACCEPT_EOB``, service 11,
     which ``stream.py``'s ``_EVENT_SERVICES`` does yield while streaming) are NOT
     indexed; revisit if EOB-event random access is needed.
+
+    Truncation (FAIL-04).  A well-formed chunk ends on a dgram boundary.  A
+    chunk cut mid-stream (a partial transfer, an aborted DAQ) ends with an
+    *incomplete* dgram -- a header declaring an extent past EOF, or trailing
+    bytes too few for even a 24-byte header.  Rather than silently stopping at
+    the last complete dgram (a short index that drops this and every following
+    event, while the forward streaming path raises on the same bytes), this scan
+    FAILS CLOSED by default: it raises ``RuntimeError`` naming the file, the
+    truncation offset, and the last complete event index.  Pass
+    ``tolerate_truncation=True`` to instead index the intact prefix and stop.
     """
     records = []
     chunk_paths = []
     bytes_read = 0
+
+    def _truncated(chunk, trunc_off, fsize, detail):
+        """Fail-closed truncation error (FAIL-04): see :func:`_scan_smd_stream`;
+        name the file, the byte offset, and the last complete event so the
+        index path agrees with the streaming path instead of losing data."""
+        return RuntimeError(
+            f"truncated xtc file {chunk!r}: {detail} at byte offset "
+            f"{trunc_off} (file size {fsize}). {len(records)} complete "
+            f"L1Accept event(s) scanned (last complete event index "
+            f"{len(records) - 1}); the file was cut mid-stream (a partial "
+            f"transfer or an aborted DAQ). Refusing to return a silently short "
+            f"index that drops this and every following event -- the streaming "
+            f"path fails closed here too. Pass tolerate_truncation=True to "
+            f"index the intact prefix and stop.")
+
     for chunk_path in _enumerate_bd_chunks(bd_c000_path):
         chunk_paths.append(chunk_path)
         fd = os.open(chunk_path, os.O_RDONLY)
@@ -1689,11 +1946,25 @@ def _scan_bigdata_stream(bd_c000_path, env_out=None):
                 hdr = os.pread(fd, _f.DGRAM_HDR, cursor)
                 bytes_read += len(hdr)
                 if len(hdr) < _f.DGRAM_HDR:
-                    break                       # truncated tail -> clean stop
+                    # fstat said these bytes existed but the read came up short:
+                    # the file shrank under us -> a partial header, truncation.
+                    if not tolerate_truncation:
+                        raise _truncated(
+                            chunk_path, cursor, filesize,
+                            f"only {len(hdr)} byte(s) readable where a "
+                            f"{_f.DGRAM_HDR}-byte dgram header was expected")
+                    break
                 h = _f.parse_dgram_header(hdr, 0)
                 total = _f.XTC_HDR + h["extent"]
                 if cursor + total > filesize:
-                    break                       # truncated final dgram
+                    # Header at `cursor` declares an on-disk size running past
+                    # EOF: the file was cut inside this dgram (FAIL-04).
+                    if not tolerate_truncation:
+                        raise _truncated(
+                            chunk_path, cursor, filesize,
+                            f"dgram header declares size {total} (ending at "
+                            f"{cursor + total}) past the file end")
+                    break                       # tolerate: keep intact prefix
                 if h["service"] == _f.SERVICE_L1ACCEPT:
                     records.append((h["ts"], chunk_path, cursor, total))
                 elif env_out is not None and h["service"] in _ENV_SERVICE_STORE:
@@ -1704,6 +1975,16 @@ def _scan_bigdata_stream(bd_c000_path, env_out=None):
                     env_out.setdefault(store, []).append(
                         (h["ts"], chunk_path, cursor, total))
                 cursor += total
+            else:
+                # Loop ended on the while-condition (not a break): fewer than a
+                # header's worth of bytes remain at `cursor`.  cursor == filesize
+                # is a CLEAN end; leftover bytes are a partial header ->
+                # truncation (FAIL-04).
+                if cursor < filesize and not tolerate_truncation:
+                    raise _truncated(
+                        chunk_path, cursor, filesize,
+                        f"trailing {filesize - cursor} byte(s) too few for a "
+                        f"{_f.DGRAM_HDR}-byte dgram header")
         finally:
             os.close(fd)
     return records, bytes_read, chunk_paths
