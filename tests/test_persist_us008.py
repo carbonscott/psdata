@@ -150,7 +150,7 @@ def test_persist_state_fields_exact():
             "timestamps", "entries", "env_records", "bd_files", "chunk_files",
             "multichunk_streams", "run_config", "build_seconds",
             "smd_bytes_read", "scan_source", "scan_bytes_read",
-            "include_shutdown_tail",
+            "include_shutdown_tail", "file_fingerprints",
         }
         assert set(state) == expected, \
             f"persisted fields {set(state)} != required {expected}"
