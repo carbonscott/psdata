@@ -367,10 +367,10 @@ class Event:
     """
 
     __slots__ = ("timestamp", "service", "_run_config", "_seg_index",
-                 "_pulseid_cache", "_dropped_streams")
+                 "_pulseid_cache", "_dropped_streams", "_stream_damage")
 
     def __init__(self, timestamp, service, run_config, seg_index,
-                 dropped_streams=frozenset()):
+                 dropped_streams=frozenset(), stream_damage=None):
         self.timestamp = timestamp
         self.service = service
         self._run_config = run_config
@@ -378,6 +378,16 @@ class Event:
         #                                          table)}}
         self._seg_index = seg_index
         self._pulseid_cache = None
+        # WRITE-02: the DGRAM-TOP ``Xtc.damage`` word of every stream that
+        # contributed a dgram to this event, keyed by stream index
+        # ({stream: damage_word}).  This is the damage psana reports as
+        # ``{stream: DroppedContribution}`` -- the DAQ sets it on the top-level
+        # dgram Xtc (e.g. a dropped detector contribution), NOT on the nested
+        # ShapesData Xtc, which it leaves 0.  ``damage()`` reads the (always-0)
+        # ShapesData level; the dgram-top word is threaded here so the event can
+        # report the damage that is actually present.  A pure side-channel: the
+        # frame VALUES returned by ``raw``/``stack`` are byte-unchanged.
+        self._stream_damage = dict(stream_damage) if stream_damage else {}
         # STR-02: stream indices that were producing dgrams earlier in the run
         # but had stopped (hit EOF) by the time this event was assembled from
         # the streams still live.  Empty on the canonical (gated) event set of a
@@ -573,9 +583,12 @@ class Event:
         :meth:`raw`/:meth:`stack`; damage is surfaced here, not silently
         dropped.  ``None`` if the detector/alg did not contribute this event.
 
-        Note the per-segment damage is read from the ShapesData (alg-level) Xtc,
-        matching psana's ``segment._xtc.damage`` (it exposes damage only at the
-        alg level -- ``detector/damage.py`` docstring).
+        This reads the per-segment damage from the ShapesData (alg-level) Xtc,
+        matching psana's ``segment._xtc.damage``.  The DAQ leaves this level 0
+        even on runs that ARE damaged: a dropped detector contribution is flagged
+        on the **dgram-top** Xtc, not here.  For that (the common, real damage)
+        use :meth:`is_damaged` / :meth:`is_detector_damaged` /
+        :meth:`damage_by_stream`, which read the dgram-top word (WRITE-02).
         """
         key = (det_name, alg)
         captured = self._seg_index.get(key)
@@ -586,10 +599,61 @@ class Event:
             out[seg] = _f.decode_damage(hdr["damage"])
         return out
 
-    def is_damaged(self, det_name, alg="raw"):
-        """True if any contributing segment of ``(det_name, alg)`` has a nonzero
-        damage id this event.  ``False`` if undamaged; ``None`` if the
-        detector/alg is absent this event."""
+    # -- dgram-top damage (WRITE-02) ---------------------------------------
+    def damage_by_stream(self):
+        """Return ``{stream: (damage_id, userbits)}`` -- the DGRAM-TOP
+        ``Xtc.damage`` of every stream that contributed a dgram to this event,
+        decoded the same way :func:`psdata.format.decode_damage` splits it
+        (``damage_id`` = low 12 bits, ``userbits`` = high 4 bits).
+
+        This is the damage level the DAQ actually writes: when a stream's
+        detector contribution is dropped, psana reports it as
+        ``{stream: DroppedContribution}`` on the top-level dgram Xtc -- while the
+        nested ShapesData Xtc (what :meth:`damage` reads) stays 0.  The damaged
+        subset is ``{s: v for s, v in evt.damage_by_stream().items()
+        if v[0] != 0}`` -- exactly psana's ``{16: DroppedContribution}`` dict.
+        A pure side-channel: the frame VALUES are byte-unchanged."""
+        return {s: _f.decode_damage(d) for s, d in self._stream_damage.items()}
+
+    def is_detector_damaged(self, det_name, alg="raw"):
+        """True if the DGRAM-TOP damage of any stream that OWNS
+        ``(det_name, alg)`` is nonzero this event -- i.e. this detector's
+        contribution was flagged damaged (e.g. dropped).  Damage is per
+        CONTRIBUTION, so it is attributed to the owning stream: a nonzero
+        dgram-top word on stream 16 damages every detector carried on stream 16
+        (matching psana's ``{16: DroppedContribution}`` for exactly those
+        detectors).  ``False`` if this detector's streams are all undamaged;
+        ``None`` if ``det_name``/``alg`` is not a detector in the run config."""
+        det = self._run_config.detectors.get(det_name)
+        if det is None or alg not in det.segments:
+            return None
+        for s in det.streams_for(alg):
+            d = self._stream_damage.get(s)
+            if d is not None and _f.decode_damage(d)[0] != 0:
+                return True
+        return False
+
+    def is_damaged(self, det_name=None, alg="raw"):
+        """Whole-event DGRAM-TOP damage verdict (WRITE-02).
+
+        Called with **no detector** (``evt.is_damaged()``): ``True`` if ANY
+        contributing stream's dgram-top ``Xtc.damage`` is nonzero this event (a
+        dropped/damaged contribution somewhere), else ``False``.  This is the
+        accessor that was blind before the fix -- it read only the nested
+        ShapesData damage, which the DAQ leaves 0, so it reported every event
+        undamaged even when the dgram-top word was set (e.g. a dropped detector
+        contribution flagged as ``DroppedContribution``).
+
+        Called with a **detector** (``evt.is_damaged(det)``): the legacy
+        SHAPESDATA-level per-detector query is preserved for backward
+        compatibility -- ``True`` iff any contributing segment of
+        ``(det_name, alg)`` has a nonzero ShapesData damage id, ``None`` if that
+        detector/alg is absent this event.  For the dgram-top (real) damage of a
+        specific detector use :meth:`is_detector_damaged`.
+        """
+        if det_name is None:
+            return any(_f.decode_damage(d)[0] != 0
+                       for d in self._stream_damage.values())
         dmg = self.damage(det_name, alg=alg)
         if dmg is None:
             return None
@@ -734,6 +798,12 @@ def events(stream_files, run_config=None):
 
             # --- collect matching heads; consume only those ----------------
             seg_index = {}
+            # WRITE-02: capture each contributing stream's DGRAM-TOP Xtc.damage
+            # word (h["damage"], already parsed by parse_dgram_header) keyed by
+            # stream, for EVERY stream that joins this event -- including one
+            # whose contribution was dropped (its dgram carries the damage word
+            # but may hold no ShapesData, so seg_index alone would miss it).
+            stream_damage = {}
             for cur in cursors:
                 hv = cur.head_view()
                 if hv is None:
@@ -751,11 +821,13 @@ def events(stream_files, run_config=None):
                     snap_h["_off"] = 0
                     tables = rc.raw_tables[cur.stream]
                     _index_dgram(snap, 0, snap_h, tables, seg_index)
+                    stream_damage[cur.stream] = h["damage"]
                 cur.advance()
 
             if is_event:
                 yield Event(min_ts, service, rc, seg_index,
-                            dropped_streams=frozenset(dropped))
+                            dropped_streams=frozenset(dropped),
+                            stream_damage=stream_damage)
             # else: a transition (Configure/BeginRun/Enable/SlowUpdate/...) --
             # consumed across all matching streams above, but not yielded.
     finally:
