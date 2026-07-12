@@ -49,11 +49,15 @@ diagnosis is confirmed on the same harness, same node, same bytes.
 
 The node ceiling is MEASURED here too (not quoted): the same worker counts, the
 same bigdata files, but a dumb 8 MiB-block sequential ``os.pread`` loop over
-disjoint byte ranges.  Each ceiling slot draws an EQUAL SHARE from EVERY chunk
-file (see ceiling_segments), so the ceiling exercises the same interleaved
-5-file set psdata does -- a ceiling that read only stream 0 would be a
-1-file sequential number graded against psdata's 5-file interleaved one.  That is
-the bandwidth psdata is being graded against.
+disjoint byte ranges.  Each ceiling slot draws a share of EVERY (data-carrying)
+chunk file, PROPORTIONAL to that file's size (see ceiling_alloc /
+ceiling_segments), so the ceiling exercises the same interleaved multi-stream
+file set psdata does, in the same proportions -- a ceiling that read only stream 0
+would be a 1-file sequential number graded against psdata's interleaved one, and
+an EQUAL share of every file cannot even be allocated on a real run (the streams
+are wildly heterogeneous: 132 GB of detector data in one, 10 MB of control/timing
+in another).  Files below CEIL_MIN_FILE are excluded outright (see
+ceiling_files).  That is the bandwidth psdata is being graded against.
 
 Correctness / discipline
 ------------------------
@@ -193,6 +197,16 @@ READ_EVENTS_HARD_CAP = 1536 * 1024 ** 2  # 1.5 GiB: our OWN cap on one read_even
 # Node-ceiling phase (raw 8 MiB preads over the same bigdata files).
 CEIL_BLOCK = 8 * 1024 ** 2               # one pread
 CEIL_SLOT = 2 * 1024 ** 3                # bytes each ceiling worker reads per rep
+CEIL_MIN_FILE = 128 * CEIL_BLOCK         # = 1 GiB: the ceiling ignores any chunk
+#   file smaller than this.  A run's streams are WILDLY heterogeneous -- the
+#   flagship jungfrau run has 132 GB detector streams alongside 0.16 GB / 0.01 GB /
+#   0.00 GB control+timing streams -- and a file that cannot even sustain 128
+#   back-to-back 8 MiB preads measures open()/close()/first-byte LATENCY, not
+#   BANDWIDTH.  Including it would drag the ceiling DOWN (the number psdata is
+#   graded against must not be deflated by streams psdata barely reads either), and
+#   demanding a share of it is what made the equal-share allocator impossible to
+#   satisfy at all.  The threshold is expressed in CEIL_BLOCKs on purpose: it is a
+#   statement about the read pattern, not a round decimal number.
 
 # Cold-discipline proof (see prime_page_cache / fadvise_dontneed): bytes read on
 # purpose, from the TAIL of the chunk files, so the first DONTNEED has a KNOWN
@@ -897,37 +911,141 @@ def partition(ks, n_parts):
     return slices
 
 
-def ceiling_share(slot_bytes, n_files):
-    """Bytes one ceiling slot draws from EACH chunk file (see ceiling_segments)."""
-    return slot_bytes // max(1, n_files)
+def ceiling_files(chunk_sizes):
+    """Split ``[(path, size), ...]`` into (included, skipped) for the ceiling phase.
+
+    A chunk file smaller than CEIL_MIN_FILE (1 GiB = 128 x CEIL_BLOCK) is EXCLUDED:
+    see the CEIL_MIN_FILE comment.  On the flagship jungfrau run this keeps the 7
+    detector streams (19.3 .. 132.0 GB, 644.3 GB together) and drops the 3
+    control/timing streams (0.16, 0.01, 0.00 GB, 0.17 GB together) -- 0.03% of the
+    bytes, and the only reason the phase could not be allocated at all.
+
+    Both lists are returned so main() can PRINT the denominator: a ceiling is a
+    number other numbers are divided by, and which bytes went into it must be
+    auditable from the log alone, not inferred from the source."""
+    inc = [(p, sz) for p, sz in chunk_sizes if sz >= CEIL_MIN_FILE]
+    skip = [(p, sz) for p, sz in chunk_sizes if sz < CEIL_MIN_FILE]
+    return inc, skip
 
 
-def ceiling_segments(files, slot_index, slot_bytes):
+def ceiling_alloc(files, slot_bytes=CEIL_SLOT):
+    """Bytes ONE ceiling slot draws from EACH included file, PROPORTIONAL to size.
+
+    ``files`` is the INCLUDED list from ceiling_files(); returns a list parallel to
+    it.  File f gets ``slot_bytes * size_f / total`` -- so a 132 GB stream
+    contributes ~20x what a 6.6 GB one does, and the ceiling's read mix matches the
+    file-size mix psdata itself is forced to read.  The old allocator gave every
+    file an EQUAL ``slot_bytes // n_files``, which on a real run is not merely
+    unrepresentative but IMPOSSIBLE: it demands 18.7 GB of a 0.01 GB control stream.
+
+    THE ARITHMETIC -- does each slot still get exactly CEIL_SLOT (2 GiB) in total?
+    YES, exactly, by construction.  Naively rounding each share independently
+    (``slot_bytes * size_f // total``) would lose up to one byte per file, so slots
+    would do UNEQUAL work and the aggregate GB/s would be an average of different
+    workloads.  Instead the shares are the DIFFERENCES OF A CUMULATIVE FLOOR:
+
+        cum_f  = size_1 + ... + size_f            (cum_0 = 0, cum_n = total)
+        hi_f   = floor(slot_bytes * cum_f / total)
+        alloc_f = hi_f - hi_{f-1}
+
+    The sum TELESCOPES:
+
+        sum_f alloc_f = hi_n - hi_0
+                      = floor(slot_bytes * total / total) - floor(0)
+                      = slot_bytes - 0
+                      = slot_bytes                                    (EXACTLY)
+
+    Each alloc_f is within 1 byte of the exact proportional share
+    (slot_bytes * size_f / total), and every alloc_f >= 0 because cum_f is
+    non-decreasing.  Worked, on the real jungfrau run (7 included files,
+    total = 644.3 GB, slot_bytes = 2 GiB = 2147483648 B):
+
+        s005 (132.00 GB) -> 2147483648 * 132.00/644.3 = 439.96 MB
+        s006 ( 19.33 GB) -> 2147483648 *  19.33/644.3 =  64.43 MB
+                            ratio 6.829 == the size ratio 132.00/19.33 = 6.829,
+                            where the equal-share allocator gave 1.000
+        ...  and the 7 shares sum to 2147483648 B on the nose, so all 87 slots
+             (REPS=3 x sum([1,4,8,16])=29) do IDENTICAL work: 87 x 2 GiB = 186.8 GB,
+             29.0% of each included file and 29.0% of the 644.3 GB total -- it fits.
+
+    Note alloc_f depends ONLY on the file list, never on the slot index -- which is
+    what makes slot i's range in file f simply ``[i*alloc_f, (i+1)*alloc_f)`` and
+    disjointness across slots a triviality rather than a hope (see ceiling_segments).
+    """
+    total = sum(sz for _, sz in files)
+    if total <= 0:
+        return [0] * len(files)
+    alloc, cum, prev_hi = [], 0, 0
+    for _, sz in files:
+        cum += sz
+        hi = (slot_bytes * cum) // total       # cumulative floor
+        alloc.append(hi - prev_hi)             # ... differenced
+        prev_hi = hi
+    return alloc
+
+
+def ceiling_capacity(files, alloc, n_slots):
+    """(ok, why). Can ``n_slots`` DISJOINT slots be cut from ``files``?
+
+    Slot i owns ``[i*alloc_f, (i+1)*alloc_f)`` in file f, so the phase needs
+    ``n_slots * alloc_f`` bytes of file f -- and no byte is ever read twice, by any
+    worker or any rep, PROVIDED that stays inside the file.  If it did not, the old
+    code would WRAP, two slots would overlap, and the second would be served from
+    page cache -- inflating the very ceiling psdata is graded against.  So we refuse
+    instead of wrapping.
+
+    Both checks are made, because they are not quite the same statement:
+      (a) the GLOBAL one the caller thinks in -- total requested bytes
+          (n_slots * CEIL_SLOT) must not exceed the total INCLUDED bytes;
+      (b) the PER-FILE one that is actually load-bearing.  Proportional allocation
+          makes (b) follow from (a) up to the <=1 byte of cumulative-floor rounding,
+          but "up to rounding" is not a safety property, so it is checked directly.
+    """
+    total = sum(sz for _, sz in files)
+    want = n_slots * CEIL_SLOT
+    if want > total:
+        return False, (f"{n_slots} disjoint slots x {CEIL_SLOT / 1024 ** 3:.2f} GiB "
+                       f"= {want / 1e9:.1f} GB requested, but the {len(files)} "
+                       f"included chunk files hold only {total / 1e9:.1f} GB")
+    for (p, sz), a in zip(files, alloc):
+        need = n_slots * a
+        if need > sz:
+            return False, (f"file {os.path.basename(p)} ({sz / 1e9:.2f} GB) would "
+                           f"have to give {n_slots} x {a / 1e6:.1f} MB = "
+                           f"{need / 1e9:.2f} GB")
+    return True, (f"{n_slots} slots x {CEIL_SLOT / 1024 ** 3:.2f} GiB = "
+                  f"{want / 1e9:.1f} GB of {total / 1e9:.1f} GB available "
+                  f"({want / total:.1%} of the included bytes)")
+
+
+def ceiling_segments(files, alloc, slot_index):
     """Map ceiling slot ``slot_index`` onto ``[(path, offset, length), ...]``.
 
-    Every slot draws an EQUAL SHARE (``slot_bytes // n_files``) from EVERY chunk
-    file, so a ceiling worker reads exactly the file set a psdata worker reads: all
-    5 streams, interleaved.  Mapping the slot into the CONCATENATED space of
-    ``sorted(chunks)`` instead (the old behaviour) meant the whole ceiling phase
-    read stream 0 and part of stream 1 and NEVER touched streams 2/3/4 -- a 1-2
-    file sequential number, presented as the interleaved bandwidth psdata is graded
-    against.  It is the WRONG DENOMINATOR.
+    Slot i takes byte range ``[i * alloc_f, (i + 1) * alloc_f)`` in EVERY included
+    file f -- a size-PROPORTIONAL share of each (ceiling_alloc), summing to exactly
+    CEIL_SLOT.  Mapping the slot into the CONCATENATED space of ``sorted(chunks)``
+    instead (the original behaviour) meant the whole ceiling phase read stream 0 and
+    part of stream 1 and NEVER touched the rest -- a 1-2 file sequential number,
+    presented as the interleaved bandwidth psdata is graded against.  It is the
+    WRONG DENOMINATOR.
 
-    Slot ``i`` takes byte range ``[i * share, (i + 1) * share)`` in each file, and
-    VISITS the files round-robin from ``files[i % len(files)]`` so the workers of a
-    cell do not all queue on file 0 first.  Distinct slots therefore read DISJOINT
-    bytes, and nothing WRAPS: a wrap would make two slots overlap and inflate the
-    ceiling with cache hits, so main() REFUSES up front (see the ceiling-capacity
-    check) if the requested slots would run past the end of a chunk file."""
+    The files are VISITED round-robin from ``files[i % len(files)]`` so the workers
+    of a cell do not all queue on file 0 first; the visiting ORDER changes nothing
+    about WHICH bytes a slot owns, so distinct slots still read DISJOINT bytes.
+    Nothing WRAPS: main() REFUSES up front (ceiling_capacity) if the slots would run
+    past the end of any included file.
+
+    Only os.open/os.pread reach these segments (_worker_ceiling) -- no psdata API --
+    so the ceiling phase is arm-independent (BEFORE/AFTER) by construction.
+    """
     n = len(files)
-    share = ceiling_share(slot_bytes, n)
-    off = slot_index * share
     segs = []
     for j in range(n):
-        path, sz = files[(slot_index + j) % n]
-        take = min(share, max(0, sz - off))        # 0 only if the guard was skipped
-        if take > 0:
-            segs.append((path, off, take))
+        i = (slot_index + j) % n               # round-robin START, same bytes
+        path, _sz = files[i]
+        length = alloc[i]
+        if length > 0:
+            segs.append((path, slot_index * length, length))
     return segs
 
 
@@ -1048,30 +1166,65 @@ def main():
     per_worker_bytes, agg_bytes, budget = memory_bound(b_e, max(WORKERS))
 
     # ---- the node ceiling must FIT, or it re-reads its own bytes ------------
-    # Every ceiling slot takes `share` bytes from EVERY chunk file (ceiling_segments),
-    # so the phase needs n_slots x share bytes of EACH file.  If that runs past the
-    # end of a file the old code WRAPPED, two slots would overlap, and the second
-    # would be served from page cache -- inflating the very ceiling psdata is graded
-    # against.  Refuse instead.
+    # Each ceiling slot takes a SIZE-PROPORTIONAL share alloc_f of every INCLUDED
+    # chunk file (ceiling_alloc), so the phase needs n_slots x alloc_f bytes of file
+    # f.  If that ran past the end of a file the slots would WRAP and overlap, and
+    # the second reader of a byte would be served from page cache -- inflating the
+    # very ceiling psdata is graded against.  Refuse instead (never wrap).
+    #
+    # Files below CEIL_MIN_FILE (1 GiB) are EXCLUDED: on this run three streams are
+    # control/timing (0.16 / 0.01 / 0.00 GB) and an equal share of every file was
+    # therefore not merely wrong but unsatisfiable.  The included/skipped split is
+    # printed so the denominator is auditable from the log.
     n_slots = REPS * sum(WORKERS)
-    ceil_share = ceiling_share(CEIL_SLOT, len(chunk_sizes))
-    ceil_need = n_slots * ceil_share
-    smallest = min(sz for _, sz in chunk_sizes)
-    if not SKIP_CEILING and ceil_need > smallest:
-        print(f"REFUSE: the ceiling phase needs {n_slots} disjoint slots x "
-              f"{ceil_share / 1e9:.2f} GB per chunk file = {ceil_need / 1e9:.1f} GB "
-              f"of EACH of the {len(chunk_sizes)} chunk files, but the smallest is "
-              f"only {smallest / 1e9:.1f} GB. Slots would WRAP and overlap, so a "
-              f"later slot would re-read a warm slot's bytes and the 'ceiling' "
-              f"would be a page-cache artefact -- the one number psdata is graded "
-              f"against. Lower BENCH_REPS/BENCH_WORKERS, or set "
-              f"BENCH_SKIP_CEILING=1.")
-        sys.exit(2)
+    ceil_inc, ceil_skip = ceiling_files(chunk_sizes)
+    ceil_alloc = ceiling_alloc(ceil_inc, CEIL_SLOT)
     if not SKIP_CEILING:
-        print(f"#### Ceiling capacity: {n_slots} slots x {ceil_share / 1e6:.0f} MB "
-              f"per file = {ceil_need / 1e9:.1f} GB of each chunk file "
-              f"(smallest chunk {smallest / 1e9:.1f} GB) -- disjoint, no wrap\n",
+        if not ceil_inc:
+            print(f"REFUSE: not one of the {len(chunk_sizes)} chunk files reaches "
+                  f"the {CEIL_MIN_FILE / 1e9:.2f} GB CEIL_MIN_FILE floor, so the "
+                  f"ceiling phase has nothing to read that would measure BANDWIDTH "
+                  f"rather than open/close latency -- and psdata's GB/s would be "
+                  f"graded against nothing. Set BENCH_SKIP_CEILING=1 to run "
+                  f"PHASE 1 alone (its GB/s is then UNGRADED).")
+            sys.exit(2)
+        inc_total = sum(sz for _, sz in ceil_inc)
+        print("#### Ceiling denominator: which files the ceiling is measured over",
               flush=True)
+        for (p, sz), a in zip(ceil_inc, ceil_alloc):
+            print(f"  include {os.path.basename(p):<32s} {sz / 1e9:8.2f} GB  "
+                  f"slot_share={a / 1e6:7.1f} MB  "
+                  f"phase_reads={n_slots * a / 1e9:6.2f} GB "
+                  f"({n_slots * a / max(sz, 1):.1%} of the file)")
+        for p, sz in ceil_skip:
+            print(f"  SKIP    {os.path.basename(p):<32s} {sz / 1e9:8.2f} GB  "
+                  f"< CEIL_MIN_FILE ({CEIL_MIN_FILE / 1e9:.2f} GB): a control/timing "
+                  f"stream, too small to measure bandwidth (open/close latency only)")
+        # Each slot's shares sum to CEIL_SLOT EXACTLY (cumulative-floor telescoping,
+        # see ceiling_alloc) -- assert it, because unequal slots would mean the
+        # ceiling workers do unequal work and the aggregate GB/s is meaningless.
+        slot_sum = sum(ceil_alloc)
+        assert slot_sum == CEIL_SLOT, (
+            f"ceiling slot draws {slot_sum} B, not CEIL_SLOT={CEIL_SLOT} B -- the "
+            f"ceiling workers would do UNEQUAL work and the aggregate would be an "
+            f"average over different workloads")
+        print(f"CEILFILES included={len(ceil_inc)} skipped={len(ceil_skip)} "
+              f"total_GB={inc_total / 1e9:.1f} "
+              f"smallest_included_GB={min(sz for _, sz in ceil_inc) / 1e9:.1f} "
+              f"skipped_GB={sum(sz for _, sz in ceil_skip) / 1e9:.2f} "
+              f"min_file_GB={CEIL_MIN_FILE / 1e9:.2f} "
+              f"slot_GiB={slot_sum / 1024 ** 3:.2f} slots={n_slots}", flush=True)
+        ok, why = ceiling_capacity(ceil_inc, ceil_alloc, n_slots)
+        if not ok:
+            print(f"REFUSE: the ceiling phase does not FIT: {why}. Slots would WRAP "
+                  f"and overlap, so a later slot would re-read a warm slot's bytes "
+                  f"and the 'ceiling' would be a page-cache artefact -- the one "
+                  f"number psdata is graded against. Lower BENCH_REPS/BENCH_WORKERS, "
+                  f"or set BENCH_SKIP_CEILING=1.")
+            sys.exit(2)
+        print(f"#### Ceiling capacity: {why} -- DISJOINT, no wrap "
+              f"(slot i owns [i*share_f, (i+1)*share_f) in file f; no two workers "
+              f"and no two reps share a byte)\n", flush=True)
 
     # ---- disjoint contiguous window per cell -------------------------------
     windows = {cell: i * EVENTS for i, cell in enumerate(cells)}
@@ -1160,14 +1313,18 @@ def main():
         print("=" * 78)
         print(f"PHASE 2 -- node read-bandwidth CEILING (raw {CEIL_BLOCK // 1024**2} "
               f"MiB preads over the same bigdata files, {CEIL_SLOT // 1024**3} GiB "
-              f"per worker per rep)")
+              f"per worker per rep, drawn from the {len(ceil_inc)} included files in "
+              f"proportion to their size)")
         print("=" * 78, flush=True)
-        slot = 0
+        slot = 0                  # slot index is GLOBAL across reps and worker
+        #                           counts -- that is what keeps every slot of the
+        #                           whole phase disjoint from every other, not just
+        #                           the workers within one cell.
         for rep in range(REPS):
             for W in WORKERS:
                 args = []
                 for _ in range(W):
-                    args.append((ceiling_segments(chunk_sizes, slot, CEIL_SLOT),))
+                    args.append((ceiling_segments(ceil_inc, ceil_alloc, slot),))
                     slot += 1
                 fadvise_dontneed(chunks)
                 wall, res = run_parallel(ctx, _worker_ceiling, args)
