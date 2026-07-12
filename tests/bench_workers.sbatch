@@ -11,14 +11,25 @@
 #   BENCH_END=after   -> psdata 15caa3a1695aabc5d148a2efda4ec8aff9fbd582
 #                        (read_events: PERF-01 coalesced merge)
 #
+# HARNESS != LIBRARY.  The harness is run from $BENCH_HARNESS (this checkout, i.e.
+# $SLURM_SUBMIT_DIR), NEVER from $BENCH_PSDATA: bench_workers.py does not exist at
+# the BEFORE SHA, so running $BENCH_PSDATA/tests/bench_workers.py could not run the
+# BEFORE arm at all -- and copying the harness into that checkout would make it
+# DIRTY, which the preflight below rightly kills the job for.  $BENCH_PSDATA
+# contributes exactly one thing: src/ on PYTHONPATH.  That is what makes "the same
+# unmodified harness runs against both ends" literally true.
+#
 # Submit (one node each; run them SERIALLY, never on a shared node):
 #   sbatch --job-name=bw_after  --export=ALL,BENCH_END=after  tests/bench_workers.sbatch
 #   sbatch --job-name=bw_before --export=ALL,BENCH_END=before tests/bench_workers.sbatch
 #
 # Overrides:
-#   BENCH_PSDATA      absolute path to the psdata checkout for this end
+#   BENCH_PSDATA      absolute path to the psdata checkout for this end -- the
+#                     LIBRARY under test, used ONLY as a PYTHONPATH entry
 #                     (default: $BENCH_ROOT/psdata-$BENCH_END)
 #   BENCH_PSDATA_SHA  the SHA that checkout MUST be at (default: the pin above)
+#   BENCH_HARNESS     absolute path to the checkout the HARNESS is run from
+#                     (default: $SLURM_SUBMIT_DIR -- where you sbatch'd from)
 #   BENCH_ROOT        where the two checkouts live
 #   plus every BENCH_* knob bench_workers.py documents (WORKERS/REPS/EVENTS/...)
 #
@@ -62,12 +73,27 @@ esac
 
 BENCH_PSDATA=${BENCH_PSDATA:-$BENCH_ROOT/psdata-$BENCH_END}
 BENCH_PSDATA_SHA=${BENCH_PSDATA_SHA:-$DEFAULT_SHA}
-export BENCH_END BENCH_PSDATA BENCH_PSDATA_SHA
+# The HARNESS lives in the checkout you submitted from -- decoupled from the
+# LIBRARY checkout on purpose (see the header): the BEFORE SHA predates
+# bench_workers.py, and copying the harness in would make that checkout DIRTY and
+# trip the preflight.  $BENCH_PSDATA is PYTHONPATH-only.
+BENCH_HARNESS=${BENCH_HARNESS:-${SLURM_SUBMIT_DIR:-$PWD}}
+export BENCH_END BENCH_PSDATA BENCH_PSDATA_SHA BENCH_HARNESS
 
 if [ ! -d "$BENCH_PSDATA/src/psdata" ]; then
   echo "FATAL: no psdata at $BENCH_PSDATA/src/psdata (set BENCH_PSDATA/BENCH_ROOT)" >&2
   exit 2
 fi
+
+if [ ! -f "$BENCH_HARNESS/tests/bench_workers.py" ]; then
+  echo "FATAL: no harness at $BENCH_HARNESS/tests/bench_workers.py (set BENCH_HARNESS" >&2
+  echo "       -- it is NOT expected inside \$BENCH_PSDATA: the BEFORE SHA has no" >&2
+  echo "       tests/bench_workers.py, which is the whole point of the split)" >&2
+  exit 2
+fi
+
+echo "library (PYTHONPATH only): $BENCH_PSDATA"
+echo "harness (the script run):  $BENCH_HARNESS/tests/bench_workers.py"
 
 # The campaign forbids the non-batch override outright.
 if [ -n "${BENCH_ALLOW_NONBATCH:-}" ]; then
@@ -154,7 +180,10 @@ if [ $rc -ne 0 ]; then
 fi
 
 # ------------------------------------------------------------------- 3. RUN
-python "$BENCH_PSDATA/tests/bench_workers.py"
+# The HARNESS comes from $BENCH_HARNESS (unchanged between the two arms); the
+# LIBRARY comes from $BENCH_PSDATA/src via the PYTHONPATH prepend above.  ONE
+# variable between the jobs: the library.
+python "$BENCH_HARNESS/tests/bench_workers.py"
 rc=$?
 echo "exit: $rc  end: $(date)"
 exit $rc        # propagate python's exit code so sacct ExitCode reflects a refusal

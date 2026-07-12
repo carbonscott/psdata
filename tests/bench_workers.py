@@ -49,7 +49,11 @@ diagnosis is confirmed on the same harness, same node, same bytes.
 
 The node ceiling is MEASURED here too (not quoted): the same worker counts, the
 same bigdata files, but a dumb 8 MiB-block sequential ``os.pread`` loop over
-disjoint byte ranges.  That is the bandwidth psdata is being graded against.
+disjoint byte ranges.  Each ceiling slot draws an EQUAL SHARE from EVERY chunk
+file (see ceiling_segments), so the ceiling exercises the same interleaved
+5-file set psdata does -- a ceiling that read only stream 0 would be a
+1-file sequential number graded against psdata's 5-file interleaved one.  That is
+the bandwidth psdata is being graded against.
 
 Correctness / discipline
 ------------------------
@@ -59,16 +63,27 @@ Correctness / discipline
     that variable is itself a hard refusal, so nobody can smuggle a shared-node
     number into the campaign.  Exclusivity is additionally attested from
     ``scontrol`` / the Slurm CPU+memory allocation.
-  * COLD.  Every (worker-count, rep) cell reads a DISJOINT contiguous window of
-    events -- no cell ever re-reads a byte another cell read -- and every chunk
-    file is ``posix_fadvise(DONTNEED)``-evicted before each cell (the same cold
-    discipline as bench_index).  A hard check refuses a configuration whose cells
-    would overlap.
+  * COLD -- and PROVEN cold, not asserted.  Every (worker-count, rep) cell reads a
+    DISJOINT contiguous window of events -- no cell ever re-reads a byte another
+    cell read -- and every chunk file is ``posix_fadvise(DONTNEED)``-evicted before
+    each cell (the same cold discipline as bench_index).  A hard check refuses a
+    configuration whose cells would overlap.  Because DONTNEED is only advice and,
+    on Weka, reaches only the kernel page cache, the FIRST eviction is preceded by
+    a deliberate prime of a KNOWN number of bytes (read from the TAIL of each chunk
+    file, a region neither phase ever times) and the resulting drop in
+    /proc/meminfo ``Cached`` is printed as a greppable ``COLDPROOF`` line.  A drop
+    smaller than half the primed bytes is a loud WARNING (not a refusal): the
+    numbers still stand, they are simply WARM numbers.
+  * BALANCED CELL ORDER.  The worker order is ROTATED per rep (Latin-square style),
+    so no worker count is pinned to a fixed position in the run and a
+    position-in-run effect (warm-up, drift) cannot land entirely on the worker-count
+    axis -- i.e. straight into speedup/efficiency.  The windows stay disjoint.
   * MEMORY BOUND (modelled on MEM-01 / bench_index's SUBBATCH guardrail).  Reads
     walk each worker's slice in <= SUBBATCH (32) event sub-batches, read-and-
     discard.  The bound is stated, PREDICTED before the clock starts (refuse if it
     exceeds the node budget), and then VERIFIED against each worker's measured peak
-    RSS (``VmHWM``).  See memory_bound().
+    RSS (``VmHWM``): the FAIL gate is the node budget, and the model is printed
+    beside it so a model that under-states reality is visible.  See memory_bound().
 
 Env overrides (bench_index style; CONFIG is otherwise hardcoded):
     BENCH_WORKERS   -- comma list overriding {1,4,8,16}
@@ -179,6 +194,13 @@ READ_EVENTS_HARD_CAP = 1536 * 1024 ** 2  # 1.5 GiB: our OWN cap on one read_even
 CEIL_BLOCK = 8 * 1024 ** 2               # one pread
 CEIL_SLOT = 2 * 1024 ** 3                # bytes each ceiling worker reads per rep
 
+# Cold-discipline proof (see prime_page_cache / fadvise_dontneed): bytes read on
+# purpose, from the TAIL of the chunk files, so the first DONTNEED has a KNOWN
+# quantity to evict.  The tail is read by NEITHER timed phase (phase 1 walks the
+# first `need` events, phase 2 the head of each file), so priming it cannot warm a
+# byte either phase times.
+COLDPROOF_BYTES = 2 * 1024 ** 3
+
 BARRIER_TIMEOUT = 1800.0                 # s; 16 spawned workers + index load
 
 
@@ -208,11 +230,24 @@ def exclusivity():
     number measured while a neighbour job shares the node's cores, page cache and
     Weka client is not a number at all.
 
-    Primary evidence: Slurm's own view (`scontrol show job -o`) reporting
-    OverSubscribe=EXCLUSIVE / Shared=0.  Fallback (scontrol absent or terse): the
-    job holds effectively every CPU on the node AND took all its memory
-    (--mem=0 => SLURM_MEM_PER_NODE=0), which is what --exclusive --mem=0 grants."""
+    TWO independent pieces of evidence; EITHER one attests exclusivity:
+
+      (1) Slurm's own view (`scontrol show job -o`) reporting
+          OverSubscribe=EXCLUSIVE / Shared=0.  POSITIVE PROOF -- but scontrol's
+          OverSubscribe field is only ADVISORY here: on THIS cluster (S3DF milano)
+          a genuinely --exclusive job reports OverSubscribe=NO (verified: job
+          31394378 was submitted --exclusive --mem=0, got AllocCPUS=120 and mem=480G
+          -- the whole node -- while scontrol said OverSubscribe=NO).  So anything
+          other than EXCLUSIVE/Shared=0 is NOT evidence of sharing: fall through.
+      (2) RESOURCE ATTESTATION: the job holds effectively every CPU on the node AND
+          took all its memory (--mem=0 => SLURM_MEM_PER_NODE=0), which is exactly
+          what --exclusive --mem=0 grants.  (os.cpu_count() may report 128 SMT
+          threads where SLURM_CPUS_ON_NODE says 120 cores, hence the >= ncpu//2.)
+
+    Only when BOTH fail is the job refused -- and then loudly.
+    """
     jid = os.environ.get("SLURM_JOB_ID", "")
+    scon = "(scontrol unavailable)"
     try:
         p = subprocess.run(["scontrol", "show", "job", "-o", jid],
                            capture_output=True, text=True, timeout=30)
@@ -220,10 +255,10 @@ def exclusivity():
             out = p.stdout
             if "OverSubscribe=EXCLUSIVE" in out or "Shared=0" in out:
                 return True, "scontrol: OverSubscribe=EXCLUSIVE"
-            if "OverSubscribe=" in out or "Shared=" in out:
-                tok = [t for t in out.split()
-                       if t.startswith(("OverSubscribe=", "Shared="))]
-                return False, f"scontrol says {' '.join(tok)} (job is NOT exclusive)"
+            tok = [t for t in out.split()
+                   if t.startswith(("OverSubscribe=", "Shared="))]
+            scon = (" ".join(tok) if tok
+                    else "(scontrol reports no OverSubscribe/Shared field)")
     except Exception:                      # noqa: BLE001  (scontrol not on PATH)
         pass
     ncpu = os.cpu_count() or 0
@@ -233,9 +268,12 @@ def exclusivity():
     # os.cpu_count() so an SMT-vs-core accounting difference cannot false-fail.
     if ncpu and scpu >= max(1, ncpu // 2) and (smem in (None, "", "0")):
         return True, (f"SLURM_CPUS_ON_NODE={scpu} of {ncpu} cpus, "
-                      f"SLURM_MEM_PER_NODE={smem!r} (whole node)")
-    return False, (f"cannot attest exclusivity: SLURM_CPUS_ON_NODE={scpu!r} of "
-                   f"{ncpu} cpus, SLURM_MEM_PER_NODE={smem!r}")
+                      f"SLURM_MEM_PER_NODE={smem!r} (whole node); scontrol says "
+                      f"{scon} -- ADVISORY only on this cluster, the CPU+memory "
+                      f"allocation is the attestation")
+    return False, (f"cannot attest exclusivity: scontrol says {scon} AND the "
+                   f"allocation is not the whole node: SLURM_CPUS_ON_NODE={scpu!r} "
+                   f"of {ncpu} cpus, SLURM_MEM_PER_NODE={smem!r}")
 
 
 def require_exclusive_batch_node():
@@ -279,6 +317,15 @@ def proc_io():
       * read_bytes -- bytes fetched at the block layer.  Typically 0 on Weka/NFS
                       (no block device in the path) -- reported for completeness,
                       never used as a denominator.
+
+    THE INSTRUMENT IS NOT FREE: reading /proc/self/io is itself read(2), so the
+    closing proc_io() call lands INSIDE the io1-io0 window it measures.  Measured:
+    two back-to-back calls with zero work between them yield syscr_delta=2,
+    rchar_delta=98.  That is noise at BEFORE (~320 preads/worker) but +10% at
+    AFTER/W=16 (~20 preads/worker) -- enough to make AFTER's syscr_per_evt appear
+    to RISE with worker count, i.e. to fake a coalescing regression out of the
+    instrument.  So the overhead is CALIBRATED once at startup (below) and
+    SUBTRACTED from every reported delta.
     """
     out = {k: 0 for k in _IO_KEYS}
     try:
@@ -290,6 +337,28 @@ def proc_io():
     except OSError:
         pass
     return out
+
+
+def _calibrate_io_probe():
+    """Cost of ONE proc_io() call, in (read syscalls, bytes) -- see proc_io().
+    Runs at import, so a spawned worker (which re-imports this module) calibrates
+    its own probe in its own process, exactly like the one it will subtract."""
+    a = proc_io()
+    b = proc_io()
+    return (max(0, b["syscr"] - a["syscr"]), max(0, b["rchar"] - a["rchar"]))
+
+
+IO_PROBE_SYSCR, IO_PROBE_RCHAR = _calibrate_io_probe()
+
+
+def io_delta(io0, io1):
+    """``io1 - io0`` with the cost of the CLOSING proc_io() call removed (clamped
+    at 0).  ``read_bytes`` is untouched: /proc is not a block device."""
+    return dict(
+        rchar=max(0, io1["rchar"] - io0["rchar"] - IO_PROBE_RCHAR),
+        syscr=max(0, io1["syscr"] - io0["syscr"] - IO_PROBE_SYSCR),
+        read_bytes=max(0, io1["read_bytes"] - io0["read_bytes"]),
+    )
 
 
 def peak_rss_bytes():
@@ -305,15 +374,22 @@ def peak_rss_bytes():
     return 0
 
 
-def mem_total_bytes():
+def meminfo_bytes(field):
+    """One /proc/meminfo field ("MemTotal", "Cached", "MemAvailable", ...) in
+    bytes, or 0.  ``Cached`` is what makes the cold discipline auditable: it is the
+    page cache DONTNEED is supposed to drop."""
     try:
         with open("/proc/meminfo") as f:
             for line in f:
-                if line.startswith("MemTotal:"):
+                if line.startswith(field + ":"):
                     return int(line.split()[1]) * 1024
     except OSError:
         pass
     return 0
+
+
+def mem_total_bytes():
+    return meminfo_bytes("MemTotal")
 
 
 def cpu_model():
@@ -342,11 +418,34 @@ def all_chunk_paths(ridx):
     return sorted(set(p for p in paths if p))
 
 
-def fadvise_dontneed(paths):
+_COLDPROOF_PENDING = True
+
+
+def fadvise_dontneed(paths, expect_drop=0):
     """Best-effort page-cache eviction (POSIX_FADV_DONTNEED) for each path, so a
     re-read starts cold.  'only advice the kernel may decline' -- combined with
     --exclusive and DISJOINT windows (no cell re-reads another cell's bytes) this
-    is the cold discipline."""
+    is the cold discipline.
+
+    AND IT IS PROVEN, NOT ASSUMED.  Swallowing every OSError and printing nothing
+    is how a benchmark ships warm numbers labelled cold: on Weka, DONTNEED reaches
+    only the KERNEL page cache, and if it silently no-ops, nothing in the output
+    would say so.  This is not hypothetical -- in a paired job with both arms
+    back-to-back on one node, the arm that ran SECOND was ~14% faster at K=1000 on
+    all three nodes, in BOTH orders: the cache was demonstrably not cold across
+    arms.  So: any OSError is reported, and the FIRST call samples /proc/meminfo
+    ``Cached`` / ``MemAvailable`` on both sides of the eviction and prints a
+    greppable COLDPROOF line.  ``expect_drop`` is the number of bytes the caller
+    has just deliberately pulled into the cache (see prime_page_cache); a drop of
+    less than half of it is a loud WARNING -- never an exit, because the numbers
+    still stand, they are simply WARM numbers and must be read as such.
+    """
+    global _COLDPROOF_PENDING
+    proof = _COLDPROOF_PENDING
+    if proof:
+        _COLDPROOF_PENDING = False
+        c0, a0 = meminfo_bytes("Cached"), meminfo_bytes("MemAvailable")
+    errs, last = 0, ""
     for p in paths:
         try:
             fd = os.open(p, os.O_RDONLY)
@@ -354,18 +453,78 @@ def fadvise_dontneed(paths):
                 os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
             finally:
                 os.close(fd)
+        except OSError as e:
+            errs += 1
+            last = f"{p}: {e}"
+    if errs:
+        print(f"WARNING: posix_fadvise(DONTNEED) FAILED on {errs} of {len(paths)} "
+              f"chunk files (last: {last}) -- those files were NOT evicted, so the "
+              f"numbers that follow are WARM, not cold.", flush=True)
+    if proof:
+        c1, a1 = meminfo_bytes("Cached"), meminfo_bytes("MemAvailable")
+        dropped = c0 - c1
+        want = 0.5 * expect_drop
+        ok = (errs == 0) and (dropped >= want)
+        print(f"COLDPROOF cached_before={c0 / 1e6:.0f}MB "
+              f"cached_after={c1 / 1e6:.0f}MB dropped_MB={dropped / 1e6:.0f} "
+              f"primed_MB={expect_drop / 1e6:.0f} "
+              f"expect_drop_MB={want / 1e6:.0f} "
+              f"memavail_before_MB={a0 / 1e6:.0f} "
+              f"memavail_after_MB={a1 / 1e6:.0f} fadvise_errors={errs} "
+              f"verdict={'OK' if ok else 'SUSPECT'}", flush=True)
+        if not ok:
+            print(f"WARNING: COLDPROOF is SUSPECT -- DONTNEED dropped only "
+                  f"{dropped / 1e6:.0f} MB of page cache after "
+                  f"{expect_drop / 1e6:.0f} MB were just read from these very "
+                  f"files. On Weka, DONTNEED reaches only the kernel page cache; "
+                  f"if it no-ops, EVERY number below is a WARM number. The numbers "
+                  f"still stand -- they are just not cold, and a BEFORE/AFTER "
+                  f"comparison must then be run on SEPARATE nodes (or separate "
+                  f"jobs), never back-to-back on one node.", flush=True)
+
+
+def prime_page_cache(chunk_sizes, nbytes=COLDPROOF_BYTES):
+    """Deliberately pull ``nbytes`` (split evenly) into the page cache, read from
+    the TAIL of each chunk file -- the one region NEITHER timed phase touches, so
+    this cannot warm a byte that is later measured.  Returns the bytes actually
+    read: that is the KNOWN quantity the next fadvise_dontneed() must be able to
+    drop, and without it 'the cache is cold' is a claim with no evidence."""
+    per = nbytes // max(1, len(chunk_sizes))
+    got = 0
+    for path, sz in chunk_sizes:
+        want = min(per, sz)
+        start = sz - want                  # the TAIL
+        try:
+            fd = os.open(path, os.O_RDONLY)
         except OSError:
-            pass
+            continue
+        try:
+            done = 0
+            while done < want:
+                b = os.pread(fd, min(CEIL_BLOCK, want - done), start + done)
+                if not b:
+                    break
+                done += len(b)
+            got += done
+        finally:
+            os.close(fd)
+    return got
 
 
 # ==========================================================================
 # Provenance
 # ==========================================================================
 def git_sha(start_path):
-    """(sha, dirty) of the git repo containing ``start_path``, or (None, None)."""
+    """(sha, dirty) of the git repo containing ``start_path``, or (None, None).
+
+    ``.git`` is tested with os.path.exists, NOT isdir: in a git WORKTREE (and a
+    submodule) ``.git`` is a FILE, and isdir would walk straight past it and return
+    (None, None) -- which would name the persisted index artifact
+    ``...-nosha-<jid>.idx`` for BOTH library ends, so two arms sharing one job would
+    COLLIDE on the same path (and one end would load the other's index file)."""
     d = os.path.dirname(os.path.abspath(start_path))
     for _ in range(8):
-        if os.path.isdir(os.path.join(d, ".git")):
+        if os.path.exists(os.path.join(d, ".git")):
             try:
                 sha = subprocess.run(["git", "-C", d, "rev-parse", "HEAD"],
                                      capture_output=True, text=True,
@@ -395,7 +554,7 @@ try:
     d = os.path.dirname(os.path.abspath(psana.__file__))
     sha = None
     for _ in range(8):
-        if os.path.isdir(os.path.join(d, ".git")):
+        if os.path.exists(os.path.join(d, ".git")):   # a worktree's .git is a FILE
             sha = subprocess.run(["git", "-C", d, "rev-parse", "HEAD"],
                                  capture_output=True, text=True).stdout.strip()
             break
@@ -444,6 +603,10 @@ def print_provenance(host, xwhy, psdata_mod, spec):
     print(f"  cores             : os.cpu_count()={os.cpu_count()} "
           f"SLURM_CPUS_ON_NODE={os.environ.get('SLURM_CPUS_ON_NODE')}")
     print(f"  exclusivity       : {xwhy}")
+    print(f"  io probe overhead : syscr={IO_PROBE_SYSCR} rchar={IO_PROBE_RCHAR} B "
+          f"per proc_io() call (calibrated at startup; SUBTRACTED from every "
+          f"worker's reported syscr/rchar delta -- the closing proc_io() otherwise "
+          f"lands inside its own measurement window)")
     print(f"  MemTotal          : {mt / 1024 ** 3:.1f} GiB")
     print(f"  slurm job         : {os.environ.get('SLURM_JOB_ID')} "
           f"account={os.environ.get('SLURM_JOB_ACCOUNT')!r}")
@@ -463,7 +626,9 @@ def print_provenance(host, xwhy, psdata_mod, spec):
           f"psdata_dirty={lib_dirty} psana_sha={ps.get('sha')} "
           f"psana_version={ps.get('version')} host={host} "
           f"partition={os.environ.get('SLURM_JOB_PARTITION')} "
-          f"cores={os.cpu_count()} mem_GiB={mt / 1024 ** 3:.1f}", flush=True)
+          f"cores={os.cpu_count()} mem_GiB={mt / 1024 ** 3:.1f} "
+          f"io_probe_syscr={IO_PROBE_SYSCR} io_probe_rchar={IO_PROBE_RCHAR} "
+          f"harness={os.path.abspath(__file__)}", flush=True)
     if not ps.get("importable"):
         print(f"REFUSE: psana is NOT importable in this environment "
               f"({ps.get('error')}). The campaign requires the real psana2 "
@@ -519,8 +684,13 @@ def memory_bound(b_e, max_workers):
           ``read_events`` call NEVER trips AFTER's MEM-01 guard while sailing
           through at BEFORE.  The two ends must run the identical code path.
       (b) the aggregate must stay under MEM_FRACTION (25%) of the node's MemTotal.
-    Afterwards the bound is VERIFIED: the sum of the workers' measured peak RSS
-    (VmHWM) must not exceed it, or the run fails closed.
+    Afterwards the bound is VERIFIED against the BUDGET -- the sum of the workers'
+    measured peak RSS (VmHWM) must not exceed MEM_FRACTION x MemTotal, or the run
+    fails closed (exit 1).  The BUDGET, not the model, is the gate: the model is a
+    prediction, and a prediction is not something a measurement can violate.  The
+    verdict line therefore prints BOTH (measured vs model AND measured vs budget),
+    so a per-worker model that under-states reality is visible even when the run
+    passes.
     """
     per_worker = SUBBATCH * b_e + b_e + COALESCE_SPAN_BYTES + WORKER_BASE_BYTES
     agg = per_worker * max_workers
@@ -583,17 +753,22 @@ def _worker_read(wid, idx_path, det, ks, subbatch, barrier, q):
             for evt in ridx.read_events(sub):      # POSITIONAL: no max_bytes=
                 st = evt.stack(det)
                 if st is not None:
-                    acc += float(st.shape[0])      # touch -> force the decode
+                    # The bytes are already off the disk and already decoded: the
+                    # read is done by read_events and Event.raw COPIES out of the
+                    # dgram buffer.  `.shape` touches no pixel -- this is just a
+                    # cheap liveness use of the stack so it cannot be optimised
+                    # away or left unbuilt.
+                    acc += float(st.shape[0])
                     n += 1
             # `sub` and its events drop out of scope here (read-and-discard)
         t1 = time.monotonic()
         io1 = proc_io()
         ridx.close()
+        d = io_delta(io0, io1)                     # probe overhead subtracted
         q.put(dict(wid=wid, ok=True, t0=t0, t1=t1, secs=t1 - t0,
                    n_delivered=n, n_requested=len(ks),
-                   rchar=io1["rchar"] - io0["rchar"],
-                   syscr=io1["syscr"] - io0["syscr"],
-                   read_bytes=io1["read_bytes"] - io0["read_bytes"],
+                   rchar=d["rchar"], syscr=d["syscr"],
+                   read_bytes=d["read_bytes"],
                    peak_rss=peak_rss_bytes(), acc=acc,
                    psdata_file=psdata.__file__))
     except BaseException:                          # noqa: BLE001
@@ -631,10 +806,10 @@ def _worker_ceiling(wid, segments, barrier, q):
                 os.close(fd)
         t1 = time.monotonic()
         io1 = proc_io()
+        d = io_delta(io0, io1)                     # probe overhead subtracted
         q.put(dict(wid=wid, ok=True, t0=t0, t1=t1, secs=t1 - t0, nbytes=total,
-                   rchar=io1["rchar"] - io0["rchar"],
-                   syscr=io1["syscr"] - io0["syscr"],
-                   read_bytes=io1["read_bytes"] - io0["read_bytes"],
+                   rchar=d["rchar"], syscr=d["syscr"],
+                   read_bytes=d["read_bytes"],
                    peak_rss=peak_rss_bytes()))
     except BaseException:                          # noqa: BLE001
         try:
@@ -704,38 +879,55 @@ def partition(ks, n_parts):
 
     Contiguity is load-bearing for the hypothesis: consecutive events of one
     stream are adjacent on disk, so a contiguous slice is precisely the case
-    PERF-01's coalescing can merge and the case PAR-03 measured."""
+    PERF-01's coalescing can merge and the case PAR-03 measured.
+
+    EXACTLY ``n_parts`` NON-EMPTY slices, or nothing: silently dropping an empty
+    slice would let a cell labelled wc=16 actually run 15 workers, and the whole
+    point of the harness is the number in that label."""
     n = len(ks)
-    n_parts = max(1, min(n_parts, n))
+    if not 1 <= n_parts <= n:
+        raise ValueError(f"cannot split {n} events into {n_parts} non-empty "
+                         f"slices -- a cell labelled wc={n_parts} would not run "
+                         f"{n_parts} workers")
     edges = [round(i * n / n_parts) for i in range(n_parts + 1)]
-    return [ks[edges[i]:edges[i + 1]] for i in range(n_parts)
-            if edges[i + 1] > edges[i]]
+    slices = [ks[edges[i]:edges[i + 1]] for i in range(n_parts)]
+    assert len(slices) == n_parts and all(slices), (
+        f"partition({n}, {n_parts}) produced {len([s for s in slices if s])} "
+        f"non-empty slices, not {n_parts}")
+    return slices
+
+
+def ceiling_share(slot_bytes, n_files):
+    """Bytes one ceiling slot draws from EACH chunk file (see ceiling_segments)."""
+    return slot_bytes // max(1, n_files)
 
 
 def ceiling_segments(files, slot_index, slot_bytes):
-    """Map ceiling slot ``slot_index`` onto ``[(path, offset, length), ...]`` in
-    the CONCATENATED byte space of the bigdata chunk files, wrapping if the run is
-    smaller than the requested slots.  Distinct slot indices => disjoint byte
-    ranges (until wrap), so no ceiling worker or rep re-reads another's bytes."""
-    total = sum(sz for _, sz in files)
-    start = (slot_index * slot_bytes) % max(1, total)
-    want = min(slot_bytes, total)
+    """Map ceiling slot ``slot_index`` onto ``[(path, offset, length), ...]``.
+
+    Every slot draws an EQUAL SHARE (``slot_bytes // n_files``) from EVERY chunk
+    file, so a ceiling worker reads exactly the file set a psdata worker reads: all
+    5 streams, interleaved.  Mapping the slot into the CONCATENATED space of
+    ``sorted(chunks)`` instead (the old behaviour) meant the whole ceiling phase
+    read stream 0 and part of stream 1 and NEVER touched streams 2/3/4 -- a 1-2
+    file sequential number, presented as the interleaved bandwidth psdata is graded
+    against.  It is the WRONG DENOMINATOR.
+
+    Slot ``i`` takes byte range ``[i * share, (i + 1) * share)`` in each file, and
+    VISITS the files round-robin from ``files[i % len(files)]`` so the workers of a
+    cell do not all queue on file 0 first.  Distinct slots therefore read DISJOINT
+    bytes, and nothing WRAPS: a wrap would make two slots overlap and inflate the
+    ceiling with cache hits, so main() REFUSES up front (see the ceiling-capacity
+    check) if the requested slots would run past the end of a chunk file."""
+    n = len(files)
+    share = ceiling_share(slot_bytes, n)
+    off = slot_index * share
     segs = []
-    pos = 0
-    # walk the concatenated space twice so a range crossing the end wraps once
-    for path, sz in files + files:
-        if want <= 0:
-            break
-        if pos + sz <= start:
-            pos += sz
-            continue
-        off = max(0, start - pos)
-        take = min(sz - off, want)
+    for j in range(n):
+        path, sz = files[(slot_index + j) % n]
+        take = min(share, max(0, sz - off))        # 0 only if the guard was skipped
         if take > 0:
             segs.append((path, off, take))
-            want -= take
-        pos += sz
-        start = pos          # subsequent files start at 0 offset
     return segs
 
 
@@ -781,8 +973,26 @@ def main():
     print("=" * 78, flush=True)
     lib_sha = print_provenance(host, xwhy, psdata, spec)
 
-    # ---- disjointness of the cells (the cold discipline) -------------------
-    cells = [(W, r) for r in range(REPS) for W in WORKERS]   # rep-major
+    # ---- cell ORDER (Latin square) and disjointness (the cold discipline) ---
+    # The worker order ROTATES by rep.  With a fixed order, cell i's window is
+    # pinned to offset i*EVENTS forever, so every worker count sits at the SAME
+    # position within each rep block -- and any position-in-run effect (client
+    # warm-up, drift, a slow region of the run) lands entirely on the worker-count
+    # axis, i.e. straight into speedup and efficiency.  Worse, W=1 -- the speedup
+    # BASELINE -- would always be the FIRST cell of a block, so a per-block warm-up
+    # would penalise the baseline and INFLATE every speedup above it.  Rotating
+    # makes each worker count visit early/middle/late windows across the reps; the
+    # windows stay disjoint because the (W, rep) cells are still distinct.
+    cells = []
+    for r in range(REPS):
+        k = r % len(WORKERS)
+        cells.extend((W, r) for W in WORKERS[k:] + WORKERS[:k])   # rep-major
+    if EVENTS < max(WORKERS):
+        print(f"REFUSE: BENCH_EVENTS={EVENTS} < max(BENCH_WORKERS)="
+              f"{max(WORKERS)}: a cell labelled wc={max(WORKERS)} could not give "
+              f"every worker a non-empty slice, so it would not be a "
+              f"{max(WORKERS)}-worker point at all.")
+        sys.exit(2)
     need = len(cells) * EVENTS
     if need > spec["N"]:
         print(f"REFUSE: {len(WORKERS)} worker-counts x {REPS} reps x {EVENTS} "
@@ -823,6 +1033,11 @@ def main():
 
     chunks = all_chunk_paths(ridx)
     chunk_sizes = [(p, os.path.getsize(p)) for p in chunks]
+    if not chunk_sizes:
+        print("REFUSE: the index exposes no chunk files (chunk_files/bd_files), so "
+              "nothing can be evicted and no ceiling can be measured -- every "
+              "number below would be silently WARM and ungraded.")
+        sys.exit(2)
     n_streams = len(ridx.entries[0])
     b_e = bytes_per_event(ridx, range(min(512, ridx.n_events)))
     print(f"  streams/event    : {n_streams}   bytes/event: {b_e / 1e6:.2f} MB   "
@@ -832,11 +1047,39 @@ def main():
     # ---- the memory bound, stated and enforced BEFORE the clock starts ------
     per_worker_bytes, agg_bytes, budget = memory_bound(b_e, max(WORKERS))
 
+    # ---- the node ceiling must FIT, or it re-reads its own bytes ------------
+    # Every ceiling slot takes `share` bytes from EVERY chunk file (ceiling_segments),
+    # so the phase needs n_slots x share bytes of EACH file.  If that runs past the
+    # end of a file the old code WRAPPED, two slots would overlap, and the second
+    # would be served from page cache -- inflating the very ceiling psdata is graded
+    # against.  Refuse instead.
+    n_slots = REPS * sum(WORKERS)
+    ceil_share = ceiling_share(CEIL_SLOT, len(chunk_sizes))
+    ceil_need = n_slots * ceil_share
+    smallest = min(sz for _, sz in chunk_sizes)
+    if not SKIP_CEILING and ceil_need > smallest:
+        print(f"REFUSE: the ceiling phase needs {n_slots} disjoint slots x "
+              f"{ceil_share / 1e9:.2f} GB per chunk file = {ceil_need / 1e9:.1f} GB "
+              f"of EACH of the {len(chunk_sizes)} chunk files, but the smallest is "
+              f"only {smallest / 1e9:.1f} GB. Slots would WRAP and overlap, so a "
+              f"later slot would re-read a warm slot's bytes and the 'ceiling' "
+              f"would be a page-cache artefact -- the one number psdata is graded "
+              f"against. Lower BENCH_REPS/BENCH_WORKERS, or set "
+              f"BENCH_SKIP_CEILING=1.")
+        sys.exit(2)
+    if not SKIP_CEILING:
+        print(f"#### Ceiling capacity: {n_slots} slots x {ceil_share / 1e6:.0f} MB "
+              f"per file = {ceil_need / 1e9:.1f} GB of each chunk file "
+              f"(smallest chunk {smallest / 1e9:.1f} GB) -- disjoint, no wrap\n",
+              flush=True)
+
     # ---- disjoint contiguous window per cell -------------------------------
     windows = {cell: i * EVENTS for i, cell in enumerate(cells)}
     print(f"#### Cells: {len(cells)} disjoint contiguous windows of {EVENTS} "
           f"events ({EVENTS * b_e / 1e9:.1f} GB each; "
-          f"{need * b_e / 1e9:.0f} GB total, none re-read)\n", flush=True)
+          f"{need * b_e / 1e9:.0f} GB total, none re-read); worker order ROTATED "
+          f"per rep (Latin square), so no worker count is pinned to a fixed "
+          f"position in the run\n", flush=True)
 
     ctx = mp.get_context("spawn")     # a FRESH worker: no inherited fds, no
     #                                   inherited index object, no forked state --
@@ -844,6 +1087,18 @@ def main():
     ridx_entries = ridx.entries       # keep for the useful-bytes accounting
     ridx.close()
     r.close()
+
+    # ---- COLDPROOF: prove DONTNEED actually evicts, before phase 1 ----------
+    # Prime a KNOWN number of bytes from the TAIL of the chunk files (a region no
+    # cell and no ceiling slot ever reads), then evict.  If Cached does not fall by
+    # at least half of what we just read, DONTNEED is a no-op on this filesystem and
+    # every number below is a WARM number -- which the COLDPROOF line then says out
+    # loud instead of leaving the reader to assume otherwise.
+    print("#### Cold discipline, PROVEN (prime a known volume, then evict)",
+          flush=True)
+    primed = prime_page_cache(chunk_sizes)
+    fadvise_dontneed(chunks, expect_drop=primed)   # <-- the FIRST fadvise call
+    print(flush=True)
 
     # ======================================================================
     # PHASE 1 -- psdata multi-worker scaling
@@ -934,36 +1189,57 @@ def main():
     # The scaling baseline is the SMALLEST worker count actually measured (1 in
     # the default grid), so speedup/efficiency mean what they say even if the
     # grid is overridden with BENCH_WORKERS.
+    #
+    # speedup is PAIRED, rep by rep: rep r of W is divided by rep r of the BASELINE,
+    # giving REPS speedup samples that carry a spread of their own.  A ratio of two
+    # medians over INDEPENDENT cells is the one number everybody quotes, and printed
+    # bare it hides exactly the variance that decides whether it means anything.
     base_W = min(WORKERS)
-    base = statistics.median([per_cell[(base_W, rep)]["evt_s"]
-                              for rep in range(REPS)])
+    base_evt = [per_cell[(base_W, rep)]["evt_s"] for rep in range(REPS)]
     rows = []
+    shortfall = []
     for W in WORKERS:
         cs = [per_cell[(W, rep)] for rep in range(REPS)]
         e_med, e_sd, e_lo, e_hi = spread([c["evt_s"] for c in cs])
         g_med, g_sd, g_lo, g_hi = spread([c["GB_s"] for c in cs])
+        sp = [cs[r]["evt_s"] / base_evt[r] for r in range(REPS)]     # PAIRED
+        s_med, s_sd, s_lo, s_hi = spread(sp)
+        f_med, f_sd, f_lo, f_hi = spread([x / (W / base_W) for x in sp])
         syscr = sum(c["syscr"] for c in cs)
         n_del = sum(c["n_delivered"] for c in cs)
+        n_req = sum(c["n_requested"] for c in cs)
         rchar = sum(c["rchar"] for c in cs)
         useful = sum(c["useful"] for c in cs)
         rss = max(c["peak_rss"] for c in cs)
-        speedup = e_med / base
-        eff = speedup / (W / base_W)
+        deliv = n_del / max(n_req, 1)
+        if deliv < 0.99:
+            shortfall.append((W, n_del, n_req, deliv))
         cg = None
         if W in ceil:
             cg = statistics.median([c["GB_s"] for c in ceil[W]])
         rows.append(dict(W=W, e_med=e_med, e_sd=e_sd, e_lo=e_lo, e_hi=e_hi,
                          g_med=g_med, g_sd=g_sd, g_lo=g_lo, g_hi=g_hi,
-                         syscr=syscr, n_del=n_del, rchar=rchar, useful=useful,
-                         rss=rss, ceil=cg, speedup=speedup, eff=eff))
+                         syscr=syscr, n_del=n_del, n_req=n_req, rchar=rchar,
+                         useful=useful, rss=rss, ceil=cg,
+                         s_med=s_med, s_sd=s_sd, s_lo=s_lo, s_hi=s_hi,
+                         f_med=f_med, f_sd=f_sd, f_lo=f_lo, f_hi=f_hi))
+        # delivered=/requested= travel WITH the number: evt/s divides by the
+        # DELIVERED count while wall covers reading ALL the REQUESTED bytes, so a
+        # shortfall silently flatters evt/s -- and it must not be invisible in the
+        # one line that gets grepped and published.
         print(f"WORKERS={W} evt_s={e_med:.1f} GB_s={g_med:.3f} "
               f"stdev_evt_s={e_sd:.1f} min={e_lo:.1f} max={e_hi:.1f} "
               f"reps={REPS} "
               f"stdev_GB_s={g_sd:.3f} GB_s_min={g_lo:.3f} GB_s_max={g_hi:.3f} "
+              f"delivered={n_del} requested={n_req} "
+              f"delivered_frac={deliv:.4f} "
               f"syscr={syscr} syscr_per_evt={syscr / max(n_del, 1):.3f} "
               f"MB_per_read={rchar / max(syscr, 1) / 1e6:.1f} "
               f"read_amp={rchar / max(useful, 1):.4f} "
-              f"speedup={speedup:.2f} eff={eff:.3f} base_workers={base_W} "
+              f"speedup={s_med:.2f} stdev_speedup={s_sd:.2f} "
+              f"speedup_min={s_lo:.2f} speedup_max={s_hi:.2f} "
+              f"eff={f_med:.3f} stdev_eff={f_sd:.3f} eff_min={f_lo:.3f} "
+              f"eff_max={f_hi:.3f} base_workers={base_W} "
               f"peak_rss_GB={rss / 1e9:.1f} "
               f"psdata_sha={(lib_sha or 'nosha')[:12]}", flush=True)
 
@@ -981,29 +1257,42 @@ def main():
     print("\n### Table W -- aggregate read scaling "
           f"({spec['name']}, {EVENTS} events/cell, {REPS} reps, "
           f"psdata {(lib_sha or 'nosha')[:12]})\n")
-    print("| workers | evt/s (med) | stdev | min | max | GB/s (med) | stdev | "
-          "min | max | syscr/evt | MB/read | read amp | speedup | eff | "
+    print("| workers | delivered | requested | evt/s (med) | stdev | min | max | "
+          "GB/s (med) | stdev | min | max | syscr/evt | MB/read | read amp | "
+          "speedup (med) | stdev | min | max | eff (med) | stdev | min | max | "
           "ceiling GB/s | % of ceiling |")
-    print("|--------:|------------:|------:|----:|----:|-----------:|------:|"
-          "----:|----:|----------:|--------:|---------:|--------:|----:|"
+    print("|--------:|----------:|----------:|------------:|------:|----:|----:|"
+          "-----------:|------:|----:|----:|----------:|--------:|---------:|"
+          "-------------:|------:|----:|----:|----------:|------:|----:|----:|"
           "-------------:|-------------:|")
     for x in rows:
         cg = "n/a" if x["ceil"] is None else f"{x['ceil']:.3f}"
         pc = "n/a" if x["ceil"] is None else f"{x['g_med'] / x['ceil']:.1%}"
-        print(f"| {x['W']} | {x['e_med']:.1f} | {x['e_sd']:.1f} | {x['e_lo']:.1f} "
+        print(f"| {x['W']} | {x['n_del']} | {x['n_req']} | "
+              f"{x['e_med']:.1f} | {x['e_sd']:.1f} | {x['e_lo']:.1f} "
               f"| {x['e_hi']:.1f} | {x['g_med']:.3f} | {x['g_sd']:.3f} | "
               f"{x['g_lo']:.3f} | {x['g_hi']:.3f} | "
               f"{x['syscr'] / max(x['n_del'], 1):.3f} | "
               f"{x['rchar'] / max(x['syscr'], 1) / 1e6:.1f} | "
               f"{x['rchar'] / max(x['useful'], 1):.4f} | "
-              f"{x['speedup']:.2f}x | {x['eff']:.2f} | "
+              f"{x['s_med']:.2f}x | {x['s_sd']:.2f} | {x['s_lo']:.2f}x | "
+              f"{x['s_hi']:.2f}x | {x['f_med']:.2f} | {x['f_sd']:.2f} | "
+              f"{x['f_lo']:.2f} | {x['f_hi']:.2f} | "
               f"{cg} | {pc} |")
     print()
 
     # ---- the memory bound, VERIFIED ----------------------------------------
+    # The GATE is the node budget (25% of MemTotal); the MODEL is a prediction and
+    # is reported beside it, so a model that under-states the real peak is visible
+    # even in a run that passes.  Both numbers, both verdicts, one line.
+    vs_model = "OK" if max_seen_rss <= agg_bytes else "OVER"
+    vs_budget = "OK" if max_seen_rss <= budget else "VIOLATED"
     print(f"MEMBOUND measured peak_rss_sum={max_seen_rss / 1e9:.2f} GB "
-          f"model={agg_bytes / 1e9:.2f} GB budget={budget / 1e9:.1f} GB "
-          f"verdict={'OK' if max_seen_rss <= budget else 'VIOLATED'}", flush=True)
+          f"model={agg_bytes / 1e9:.2f} GB vs_model={vs_model} "
+          f"budget={budget / 1e9:.1f} GB ({MEM_FRACTION:.0%} of MemTotal) "
+          f"vs_budget={vs_budget} verdict={vs_budget} "
+          f"(the FAIL gate is the budget; the model is reported, not gated)",
+          flush=True)
 
     # ---- purity: this harness never imported psana / mpi4py ----------------
     impure = [m for m in ("psana", "mpi4py") if m in sys.modules]
@@ -1015,6 +1304,13 @@ def main():
     if max_seen_rss > budget:
         print("FAIL: the memory bound was VIOLATED -- the numbers above stand, "
               "but the configuration is not safe to repeat.")
+        sys.exit(1)
+    if shortfall:
+        for (W, d, rq, fr) in shortfall:
+            print(f"FAIL: WORKERS={W} DELIVERED only {d} of {rq} requested events "
+                  f"({fr:.2%} < 99%). evt/s divides by the DELIVERED count while "
+                  f"wall covers reading ALL the REQUESTED bytes, so this point "
+                  f"OVERSTATES throughput and must not be published.")
         sys.exit(1)
     if impure:
         print(f"FAIL: the benchmark process imported {impure} -- it must stay "
